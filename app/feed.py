@@ -32,6 +32,13 @@ class FeedManager:
         self.on_candle = on_candle
         self.on_signal = on_signal
         self.pairs: dict[str, PairState] = {}
+        # When any pair last produced a real tick. A dead session token
+        # doesn't raise anything — the websocket just goes quiet — so
+        # this silence is the only signal the watchdog has to work with.
+        self.last_tick_at = time.monotonic()
+
+    def seconds_since_last_tick(self) -> float:
+        return time.monotonic() - self.last_tick_at
 
     async def start(self) -> None:
         resolved = await resolve_asset_codes()
@@ -135,6 +142,9 @@ class FeedManager:
             try:
                 ticks = client.api.realtime_price.get(state.asset_code, [])
                 new_ticks = [t for t in ticks if t["time"] > state.last_tick_time]
+
+                if new_ticks:
+                    self.last_tick_at = time.monotonic()
 
                 for t in new_ticks:
                     finalized = self._apply_tick(state, t["time"], t["price"])

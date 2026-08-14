@@ -18,11 +18,13 @@ from typing import Any
 
 import httpx
 
-from app import config
+from app import config, db
 
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT_SECONDS = 20
+
+_STATE_LAST_REDEPLOY = "railway_last_redeploy_at"
 
 _VARIABLE_UPSERT_MUTATION = """
 mutation variableCollectionUpsert($input: VariableCollectionUpsertInput!) {
@@ -73,6 +75,26 @@ def status() -> dict[str, Any]:
 def _record(ok: bool | None, detail: str) -> None:
     global _last_result
     _last_result = {"attempted_at": int(time.time()), "ok": ok, "detail": detail}
+
+
+async def _seconds_since_last_redeploy() -> float | None:
+    """How long ago this app last asked Railway to redeploy, or None if
+    it never has. Persisted, because the whole point is to remember
+    across the restart the redeploy itself caused."""
+    try:
+        state = await db.get_state(_STATE_LAST_REDEPLOY)
+    except Exception:
+        logger.exception("Could not read the last redeploy time — treating it as never")
+        return None
+    stored = state.get(_STATE_LAST_REDEPLOY)
+    return time.time() - float(stored) if stored else None
+
+
+async def _mark_redeployed() -> None:
+    try:
+        await db.set_state({_STATE_LAST_REDEPLOY: str(int(time.time()))})
+    except Exception:
+        logger.exception("Could not record the redeploy time — the next one may not be rate-limited")
 
 
 def _headers() -> dict[str, str]:
@@ -155,6 +177,17 @@ async def persist_session(token: str, cookies: str, user_agent: str) -> bool:
                 _record(True, "variables updated (redeploy disabled)")
                 return True
 
+            since_last = await _seconds_since_last_redeploy()
+            if since_last is not None and since_last < config.RAILWAY_REDEPLOY_MIN_INTERVAL_SECONDS:
+                # If a stored token doesn't work, redeploying on every
+                # capture turns into a loop that spends a password login
+                # per cycle. Let this boot keep the connection it just
+                # made instead.
+                detail = f"variables updated, redeploy skipped ({int(since_last)}s since the last one)"
+                logger.info("Not redeploying: %s", detail)
+                _record(True, detail)
+                return True
+
             try:
                 await _graphql(
                     client,
@@ -171,6 +204,7 @@ async def persist_session(token: str, cookies: str, user_agent: str) -> bool:
                 _record(True, f"variables updated, redeploy failed: {e}")
                 return True
 
+            await _mark_redeployed()
             logger.info("Requested Railway redeploy so the persisted session is verified on a clean boot")
             _record(True, "variables updated, redeploy requested")
             return True

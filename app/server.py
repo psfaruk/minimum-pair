@@ -111,11 +111,49 @@ async def _restart_feed() -> None:
     app_state["bootstrap_task"] = asyncio.create_task(_bootstrap_feed())
 
 
+async def _connection_watchdog() -> None:
+    """Rebuilds the connection when the feed goes silent.
+
+    A session token that expires mid-run doesn't announce itself: no
+    exception, no disconnect callback, the websocket just stops
+    delivering ticks. Nothing else in the app would ever notice, so the
+    app would sit there "connected" and signal-less until someone
+    restarted it. OTC pairs trade around the clock, so silence across
+    *every* pair means the connection is gone, not that the market is
+    closed. The restart goes through get_client(), which tries the token
+    first and only falls back to a password login (under its backoff) if
+    the token really is dead.
+    """
+    while True:
+        await asyncio.sleep(config.CONNECTION_WATCHDOG_SECONDS)
+        manager = app_state.get("feed_manager")
+        if manager is None:
+            continue  # the bootstrap loop already owns the reconnect
+
+        stale_for = manager.seconds_since_last_tick()
+        connected = await quotex_client.is_connected()
+        if connected and stale_for < config.STALE_FEED_SECONDS:
+            continue
+
+        logger.warning(
+            "Connection looks dead (authenticated=%s, no ticks for %.0fs) — rebuilding it",
+            connected,
+            stale_for,
+        )
+        app_state["reconnects"] = app_state.get("reconnects", 0) + 1
+        await _restart_feed()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await db.init_db()
+    # Must run before the first connect: it restores the login backoff a
+    # previous boot was serving (Railway restarts would otherwise reset
+    # it) and any session token captured earlier.
+    await quotex_client.load_persisted_state()
     app_state["bootstrap_task"] = asyncio.create_task(_bootstrap_feed())
     asyncio.create_task(run_evaluator(_on_graded))
+    asyncio.create_task(_connection_watchdog())
     yield
 
 
@@ -135,6 +173,11 @@ async def status():
         "auth_mode": quotex_client.auth_mode(),
         "password_failure_count": quotex_client.password_failure_count(),
         "login_backoff_seconds_remaining": quotex_client.login_backoff_seconds_remaining(),
+        "last_login_failure": quotex_client.last_failure_kind(),
+        "reconnects": app_state.get("reconnects", 0),
+        "feed_stale_seconds": (
+            int(app_state["feed_manager"].seconds_since_last_tick()) if app_state.get("feed_manager") else None
+        ),
         "session_persistence": railway_control.status(),
     }
 
@@ -154,9 +197,7 @@ async def update_session(payload: SessionUpdate):
     if not session_token:
         raise HTTPException(status_code=400, detail="session_token is required")
 
-    config.QUOTEX_SESSION_TOKEN = session_token
-    config.QUOTEX_SESSION_COOKIES = payload.session_cookies.strip()
-    quotex_client.reset_session_failures()
+    await quotex_client.set_manual_session(session_token, payload.session_cookies.strip())
 
     asyncio.create_task(_restart_feed())
     return {"ok": True, "message": "Session updated — reconnecting in the background"}
