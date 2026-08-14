@@ -65,10 +65,31 @@ App.tabs.settings = {
     document.getElementById("settingsError").textContent = s.error || "";
     document.getElementById("settingsAuthMode").textContent =
       s.auth_mode === "session_token" ? "session token" : "email/password";
+    document.getElementById("settingsLoginBackoff").textContent = this.describeBackoff(s);
+    document.getElementById("settingsPersistence").textContent = this.describePersistence(s.session_persistence);
     document.getElementById("settingsMinConf").textContent = (s.min_confidence * 100).toFixed(0) + "%";
     document.getElementById("settingsAlwaysSignal").textContent = s.always_signal ? "on" : "off";
     this._active = s.active_pairs || [];
     this.renderPairs();
+  },
+
+  describeBackoff(s) {
+    const remaining = s.login_backoff_seconds_remaining || 0;
+    const failures = s.password_failure_count || 0;
+    if (!remaining) return failures ? `none (${failures} past failures)` : "none";
+    const mins = Math.floor(remaining / 60);
+    const secs = remaining % 60;
+    const left = mins ? `${mins}m ${secs}s` : `${secs}s`;
+    return `${left} left after ${failures} failed login${failures === 1 ? "" : "s"}`;
+  },
+
+  describePersistence(p) {
+    if (!p) return "--";
+    if (!p.configured) {
+      const missing = (p.missing_settings || []).join(", ");
+      return missing ? `off (set ${missing})` : "off";
+    }
+    return p.attempted_at ? `on — ${p.detail}` : "on — nothing to store yet";
   },
 
   renderPairs() {

@@ -41,6 +41,38 @@ QUOTEX_USER_AGENT = os.getenv("QUOTEX_USER_AGENT", "")
 # email/password login automatically (see quotex_client.auth_mode()).
 QUOTEX_SESSION_FAILURE_THRESHOLD = int(os.getenv("QUOTEX_SESSION_FAILURE_THRESHOLD", "3"))
 
+# A failed email/password login must NOT be retried on the same tight
+# loop as a flaky-network failure: every attempt hits the
+# Cloudflare-guarded sign-in page, and from Railway's shared egress IPs a
+# fast retry loop is exactly what gets the app blocked. So each
+# consecutive password-login failure doubles the wait before the next
+# attempt, starting at the base and capping at the max.
+LOGIN_BACKOFF_BASE_SECONDS = _int("LOGIN_BACKOFF_BASE_SECONDS", 300)
+LOGIN_BACKOFF_MAX_SECONDS = _int("LOGIN_BACKOFF_MAX_SECONDS", 3600)
+
+# --- Railway self-persistence -------------------------------------------
+# When a password login succeeds, the freshly captured session is written
+# back into this service's own Railway variables so the next boot reuses
+# the token instead of re-triggering the Cloudflare-guarded login page.
+# See app/railway_control.py. Without RAILWAY_API_TOKEN the app still
+# works, it just loses the token on redeploy.
+RAILWAY_API_TOKEN = os.getenv("RAILWAY_API_TOKEN", "")
+# "account" (personal/team token -> Authorization: Bearer) or "project"
+# (project-scoped token -> Project-Access-Token header). Project tokens
+# are read-only on Railway's public API, so writing variables needs an
+# account/team token.
+RAILWAY_TOKEN_TYPE = os.getenv("RAILWAY_TOKEN_TYPE", "account").strip().lower()
+RAILWAY_API_URL = os.getenv("RAILWAY_API_URL", "https://backboard.railway.com/graphql/v2")
+# Railway injects these three into every deployment — they only need to
+# be set by hand when running this code somewhere else.
+RAILWAY_PROJECT_ID = os.getenv("RAILWAY_PROJECT_ID", "")
+RAILWAY_ENVIRONMENT_ID = os.getenv("RAILWAY_ENVIRONMENT_ID", "")
+RAILWAY_SERVICE_ID = os.getenv("RAILWAY_SERVICE_ID", "")
+# Redeploy after persisting so a clean boot proves the stored token
+# works end-to-end. Railway may already redeploy on a variable change;
+# set this to 0 if you'd rather not stack a second deploy on top.
+RAILWAY_REDEPLOY_AFTER_LOGIN = _bool("RAILWAY_REDEPLOY_AFTER_LOGIN", True)
+
 # Required passcode to hit POST /api/session (paste a fresh token from the
 # frontend without redeploying). The app is publicly reachable once
 # deployed, so this endpoint must not be left open to anyone who finds

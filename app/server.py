@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app import config, db, quotex_client
+from app import config, db, quotex_client, railway_control
 from app.evaluator import run_evaluator
 from app.feed import FeedManager
 
@@ -67,11 +67,23 @@ async def _bootstrap_feed() -> None:
             app_state["feed_manager"] = manager
             logger.info("Feed manager started for %d pairs (attempt %d)", len(manager.pairs), attempt)
             return
+        except quotex_client.LoginBackoffError as e:
+            # Expected, self-clearing state rather than a fault: the app is
+            # deliberately sitting out the Cloudflare-avoiding login backoff.
+            app_state["quotex_connected"] = False
+            app_state["error"] = str(e)
+            delay = quotex_client.retry_delay_seconds(RETRY_BACKOFF_SECONDS)
+            logger.info("Waiting %ds before the next login attempt (attempt %d): %s", delay, attempt, e)
+            await asyncio.sleep(delay)
         except Exception as e:
             app_state["quotex_connected"] = False
             app_state["error"] = str(e)
-            logger.exception("Failed to start Quotex feed (attempt %d), retrying in %ds", attempt, RETRY_BACKOFF_SECONDS)
-            await asyncio.sleep(RETRY_BACKOFF_SECONDS)
+            # A failed password login sets a backoff far longer than
+            # RETRY_BACKOFF_SECONDS — retrying sooner would just hammer the
+            # Cloudflare-guarded login page again.
+            delay = quotex_client.retry_delay_seconds(RETRY_BACKOFF_SECONDS)
+            logger.exception("Failed to start Quotex feed (attempt %d), retrying in %ds", attempt, delay)
+            await asyncio.sleep(delay)
 
 
 async def _restart_feed() -> None:
@@ -121,6 +133,9 @@ async def status():
         "always_signal": config.ALWAYS_SIGNAL,
         "account_mode": config.QUOTEX_ACCOUNT_MODE,
         "auth_mode": quotex_client.auth_mode(),
+        "password_failure_count": quotex_client.password_failure_count(),
+        "login_backoff_seconds_remaining": quotex_client.login_backoff_seconds_remaining(),
+        "session_persistence": railway_control.status(),
     }
 
 
