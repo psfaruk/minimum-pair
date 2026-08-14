@@ -53,11 +53,6 @@ def _is_confidently_losing(source: str) -> bool:
     return (wins / total) <= LEARN_SUPPRESS_BELOW
 
 
-async def _drop_learned_losers(votes: list[Vote]) -> list[Vote]:
-    await _refresh_pattern_perf_cache()
-    return [v for v in votes if not _is_confidently_losing(v.source)]
-
-
 @dataclass
 class Vote:
     direction: str  # "CALL" or "PUT"
@@ -71,6 +66,11 @@ class Decision:
     confidence: float
     confirmations: int
     sources: list[str]
+
+
+async def _drop_learned_losers(votes: list[Vote]) -> list[Vote]:
+    await _refresh_pattern_perf_cache()
+    return [v for v in votes if not _is_confidently_losing(v.source)]
 
 
 def _prior_to_weight(prior: float) -> float:
