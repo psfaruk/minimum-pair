@@ -1,0 +1,641 @@
+<title>Signal Engine Diagnosis</title>
+<style>
+  :root {
+    --ground: #f4f6f8;
+    --surface: #ffffff;
+    --surface-sunk: #eceff3;
+    --ink: #161a20;
+    --ink-soft: #58626f;
+    --ink-faint: #808b99;
+    --rule: #dbe0e6;
+    --rule-strong: #c3cad3;
+    --accent: #1b4b73;
+    --accent-soft: #e3ecf4;
+    --measure: #8a5d12;
+    --measure-soft: #f6eddc;
+    --bad: #a3352a;
+    --bad-soft: #f7e4e1;
+    --good: #26624f;
+    --good-soft: #e0efe9;
+
+    --serif: ui-serif, Georgia, "Iowan Old Style", "Times New Roman", serif;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+    --measure-width: 68ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #11141a;
+      --surface: #181c23;
+      --surface-sunk: #1f242c;
+      --ink: #e7eaef;
+      --ink-soft: #9ba5b3;
+      --ink-faint: #737e8c;
+      --rule: #2a303a;
+      --rule-strong: #3a4250;
+      --accent: #79aed8;
+      --accent-soft: #1c2b39;
+      --measure: #d7a34c;
+      --measure-soft: #2c2517;
+      --bad: #dd7a68;
+      --bad-soft: #33201d;
+      --good: #66ac90;
+      --good-soft: #182a24;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #11141a;
+    --surface: #181c23;
+    --surface-sunk: #1f242c;
+    --ink: #e7eaef;
+    --ink-soft: #9ba5b3;
+    --ink-faint: #737e8c;
+    --rule: #2a303a;
+    --rule-strong: #3a4250;
+    --accent: #79aed8;
+    --accent-soft: #1c2b39;
+    --measure: #d7a34c;
+    --measure-soft: #2c2517;
+    --bad: #dd7a68;
+    --bad-soft: #33201d;
+    --good: #66ac90;
+    --good-soft: #182a24;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16.5px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 940px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+    display: flex;
+    flex-direction: column;
+    gap: 44px;
+  }
+
+  .prose { max-width: var(--measure-width); }
+
+  h1, h2, h3 { font-family: var(--serif); font-weight: 600; text-wrap: balance; margin: 0; }
+
+  /* ---------- masthead ---------- */
+  .masthead {
+    padding-top: 64px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: 28px;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .masthead h1 { font-size: clamp(34px, 5.5vw, 52px); line-height: 1.1; letter-spacing: -0.015em; }
+  .standfirst { font-size: 19px; color: var(--ink-soft); max-width: var(--measure-width); margin: 0; }
+
+  /* ---------- headline metrics ---------- */
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+  }
+  .metric { background: var(--surface); padding: 22px 20px; display: flex; flex-direction: column; gap: 6px; }
+  .metric .value {
+    font-family: var(--mono);
+    font-size: 40px;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+  }
+  .metric .label { font-size: 13.5px; color: var(--ink-soft); }
+  .metric .note { font-size: 12.5px; color: var(--ink-faint); font-family: var(--mono); }
+  .metric.is-bad .value { color: var(--bad); }
+  .metric.is-good .value { color: var(--good); }
+  .metric.is-flat .value { color: var(--ink-soft); }
+
+  /* ---------- sections ---------- */
+  section { display: flex; flex-direction: column; gap: 20px; }
+  .section-head { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--rule-strong); padding-top: 18px; }
+  .section-head h2 { font-size: 27px; letter-spacing: -0.01em; }
+  p { margin: 0 0 14px; }
+  p:last-child { margin-bottom: 0; }
+
+  /* ---------- findings ---------- */
+  .findings { display: flex; flex-direction: column; gap: 26px; }
+  .finding { background: var(--surface); border: 1px solid var(--rule); display: flex; flex-direction: column; }
+  .finding-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--rule);
+    flex-wrap: wrap;
+  }
+  .rank {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--ink-faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .finding-head h3 { font-size: 20px; flex: 1 1 320px; line-height: 1.3; }
+  .chip {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 4px 9px;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .chip-critical { background: var(--bad-soft); color: var(--bad); }
+  .chip-high { background: var(--measure-soft); color: var(--measure); }
+  .chip-medium { background: var(--accent-soft); color: var(--accent); }
+  .chip-clear { background: var(--good-soft); color: var(--good); }
+
+  .finding-body { padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; }
+  .finding-body > p { max-width: var(--measure-width); }
+
+  .evidence {
+    background: var(--surface-sunk);
+    border-left: 3px solid var(--measure);
+    padding: 14px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .evidence .tag {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--measure);
+  }
+  .evidence p { font-size: 15px; margin: 0; }
+  .evidence .fig { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  .fix { display: flex; gap: 10px; align-items: flex-start; font-size: 15.5px; }
+  .fix .tag {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--good);
+    padding-top: 4px;
+    white-space: nowrap;
+  }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.88em;
+    background: var(--surface-sunk);
+    padding: 1px 5px;
+    border-radius: 2px;
+  }
+  .finding-body code { background: var(--ground); }
+
+  /* ---------- tables ---------- */
+  .table-scroll { overflow-x: auto; border: 1px solid var(--rule); background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+  caption {
+    caption-side: top;
+    text-align: left;
+    padding: 14px 16px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  th, td { padding: 9px 16px; text-align: left; border-bottom: 1px solid var(--rule); }
+  th { font-weight: 600; font-size: 12.5px; letter-spacing: 0.04em; color: var(--ink-soft); }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+  tr:last-child td { border-bottom: none; }
+  td.killed { color: var(--bad); }
+  .src { font-family: var(--mono); font-size: 13px; }
+
+  /* ---------- code block ---------- */
+  pre {
+    margin: 0;
+    background: var(--surface-sunk);
+    border: 1px solid var(--rule);
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+
+  /* ---------- cleared list ---------- */
+  .cleared { display: flex; flex-direction: column; gap: 14px; }
+  .cleared-item {
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--good);
+    padding: 14px 18px;
+  }
+  .cleared-item div { max-width: var(--measure-width); }
+  .cleared-item strong { display: block; font-family: var(--serif); font-size: 17px; margin-bottom: 3px; }
+  .cleared-item p { font-size: 15px; color: var(--ink-soft); }
+
+  /* ---------- priority ---------- */
+  ol.priority { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 12px; max-width: var(--measure-width); }
+  ol.priority li { padding-left: 4px; }
+  ol.priority strong { font-weight: 600; }
+
+  .closing {
+    background: var(--accent-soft);
+    border: 1px solid var(--rule);
+    padding: 24px 26px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .closing h2 { font-size: 22px; }
+  .closing p { max-width: var(--measure-width); }
+
+  footer {
+    border-top: 1px solid var(--rule);
+    padding-top: 18px;
+    font-size: 13.5px;
+    color: var(--ink-faint);
+    max-width: var(--measure-width);
+  }
+
+  a { color: var(--accent); }
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  @media (max-width: 620px) {
+    .metric .value { font-size: 32px; }
+    .wrap { padding: 0 18px 64px; gap: 36px; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">Forensic report · app/decision.py · app/feed.py · app/evaluator.py</div>
+    <h1>প্রেডিকশন কেন ভুল হচ্ছে</h1>
+    <p class="standfirst">
+      আসল ইঞ্জিন, আসল ডেটাবেস আর আসল গ্রেডিং কোড চালানো হয়েছে এমন সিন্থেটিক দামের ডেটার উপর
+      যেখানে কোনো এজ নেই — অর্থাৎ সৎ উত্তর হওয়া উচিত ঠিক ৫০%। যতটুকু ৫০% থেকে সরে গেছে,
+      ততটুকুই পাইপলাইনের ত্রুটি, মার্কেট পড়ার ভুল নয়।
+    </p>
+  </header>
+
+  <div class="metrics">
+    <div class="metric is-bad">
+      <div class="value">33.6%</div>
+      <div class="label">OTC-সদৃশ স্পার্স ফিডে অ্যাপের নিজের হিসাবে উইন রেট</div>
+      <div class="note">227W / 449L</div>
+    </div>
+    <div class="metric is-flat">
+      <div class="value">48.8%</div>
+      <div class="label">ঠিক সেই একই ডেটা, শুধু টাই-এর নিয়ম সৎ করলে</div>
+      <div class="note">১৫ পয়েন্টের ফারাক = মাপার বাগ</div>
+    </div>
+    <div class="metric is-flat">
+      <div class="value">49.1%</div>
+      <div class="label">ঘন ফিডে উইন রেট — অর্থাৎ ইঞ্জিনের কোনো এজ নেই</div>
+      <div class="note">850 signals</div>
+    </div>
+  </div>
+
+  <section>
+    <div class="section-head">
+      <h2>মূল কথা: এখানে দুটো আলাদা সমস্যা আছে</h2>
+    </div>
+    <div class="prose">
+      <p>
+        <strong>এক — মাপার বাগ।</strong> অ্যাপ যে উইন রেট দেখাচ্ছে সেটা বাস্তবের চেয়ে অনেক খারাপ।
+        স্পার্স ফিডে ৩৩.৬% বনাম ৪৮.৮% — পুরো ১৫ পয়েন্ট ফারাক, শুধু একটা লাইনের যুক্তির কারণে।
+        এটা শুধু রিপোর্টকে ভুল দেখায় না, অ্যাপের <em>শেখার</em> ব্যবস্থাকেও বিষিয়ে দেয়, কারণ
+        সেই ভুল সংখ্যা দেখেই সোর্সগুলোকে চিরতরে বন্ধ করে দেওয়া হয়।
+      </p>
+      <p>
+        <strong>দুই — স্থাপত্যগত সমস্যা।</strong> বাগগুলো সব ঠিক করলেও ৪৯–৫০%-এই থামবে।
+        কারণ ইঞ্জিনে পরিমাপযোগ্য কোনো এজ নেই, আর <code>ALWAYS_SIGNAL</code> ইচ্ছাকৃতভাবে
+        প্রতি ক্যান্ডেলে একটা করে সিগন্যাল বানাতে বাধ্য — যার দুই-তৃতীয়াংশই স্বীকৃতভাবে নয়েজ।
+        আপনি "টিক বলতে পারছেন না" কারণ যা দেখছেন তার বেশিরভাগ আসলে ভবিষ্যদ্বাণীই নয়।
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>যা পাওয়া গেল, প্রভাব অনুসারে সাজানো</h2>
+      <p class="prose" style="color:var(--ink-soft);font-size:15px">
+        ক্রমটা অগ্রাধিকারের — উপরেরটা ঠিক করলে সবচেয়ে বেশি লাভ।
+      </p>
+    </div>
+
+    <div class="findings">
+
+      <article class="finding">
+        <div class="finding-head">
+          <span class="rank">01</span>
+          <h3>টাই মানেই হার — এবং OTC ফিডে টাই ভয়ংকর রকম বেশি</h3>
+          <span class="chip chip-critical">Critical</span>
+        </div>
+        <div class="finding-body">
+          <p>
+            <code>evaluator.py</code>-তে CALL জেতে যদি <code>close &gt; entry</code>, PUT জেতে যদি
+            <code>close &lt; entry</code>। দাম যদি ঠিক সমান থাকে, দুটোর একটাও সত্য নয় — তাই
+            ফলাফল লেখা হয় <strong>LOSS</strong>। বাস্তবে ব্রোকার টাই-তে স্টেক ফেরত দেয়, হার ধরে না।
+          </p>
+          <div class="evidence">
+            <div class="tag">Measured</div>
+            <p>স্পার্স ফিডে গ্রেড হওয়া ৬৭৬টি সিগন্যালের মধ্যে <span class="fig">২১১টি (৩১.২%)</span> ছিল টাই — প্রতিটিই LOSS লেখা হয়েছে। টাই বাদ দিলে উইন রেট <span class="fig">৩৩.৬% → ৪৮.৮%</span>।</p>
+          </div>
+          <div class="fix"><span class="tag">Fix</span><div>তৃতীয় একটা ফলাফল <code>DRAW</code> যোগ করুন। উইন রেটের হিসাব থেকে বাদ দিন, শেখার পরিসংখ্যানেও গুনবেন না।</div></div>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-head">
+          <span class="rank">02</span>
+          <h3>অ্যাপ নিজেই নকল ফ্ল্যাট ক্যান্ডেল বানায়, তারপর তার উপর ট্রেড করে</h3>
+          <span class="chip chip-critical">Critical</span>
+        </div>
+        <div class="finding-body">
+          <p>
+            <code>feed.py</code>-এর টাইমার-ফলব্যাক: এক মিনিটে কোনো টিক না এলে সে
+            <code>open = high = low = close = শেষ দাম</code> দিয়ে একটা ক্যান্ডেল তৈরি করে ফেলে।
+            এটা মার্কেট ডেটা নয় — এটা প্লেসহোল্ডার। কিন্তু এই নকল ক্যান্ডেল ডেটাবেসে সেভ হয়,
+            প্যাটার্ন মাইনার এটা থেকে শেখে, আর সিগন্যাল এর উপরেই গ্রেড হয়। ফ্ল্যাট ক্যান্ডেল মানেই
+            <code>close == entry</code> — অর্থাৎ ফাইন্ডিং ০১ অনুযায়ী <strong>নিশ্চিত হার</strong>।
+          </p>
+          <div class="evidence">
+            <div class="tag">Measured</div>
+            <p>স্পার্স সিমুলেশনে ১৪০১টি ক্যান্ডেলের মধ্যে <span class="fig">৪৮১টি</span> ছিল বানানো ফ্ল্যাট ক্যান্ডেল। আপনার USD/BDT, USD/DZD, USD/PKR-এর মতো পাতলা OTC পেয়ারগুলোই ঠিক এই অবস্থায় পড়ে।</p>
+          </div>
+          <div class="fix"><span class="tag">Fix</span><div>নকল ক্যান্ডেলে সিগন্যাল ফায়ার করবেন না, আর ওগুলোতে গ্রেডও করবেন না। ক্যান্ডেলে একটা <code>synthetic</code> ফ্ল্যাগ রাখুন — অথবা টিক না এলে ওই মিনিটটা বাদ দিন।</div></div>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-head">
+          <span class="rank">03</span>
+          <h3>শেখার ব্যবস্থাটা একমুখী — একবার বন্ধ হলে আর কখনো ফিরতে পারে না</h3>
+          <span class="chip chip-critical">Critical</span>
+        </div>
+        <div class="finding-body">
+          <p>
+            <code>decision.py</code> কোনো সোর্সকে ১৫টি স্যাম্পলের পর ৪২%-এর নিচে দেখলে চিরতরে বাদ দেয়।
+            কিন্তু ১৫টা কয়েন-টসেও ৬টা বা তার কম হেড আসা খুবই স্বাভাবিক। আর একবার বাদ পড়লে সোর্সটা
+            আর ফায়ার করে না, তাই নতুন কোনো ডেটাও জমা হয় না — নিজেকে শুধরে নেওয়ার কোনো পথই থাকে না।
+            ফাইন্ডিং ০১-এর ভুল সংখ্যা এই ছাঁটাইকে আরও ত্বরান্বিত করে।
+          </p>
+          <div class="evidence">
+            <div class="tag">Measured</div>
+            <p>নিখুঁত ৫০% সোর্সেরও <span class="fig">৩০.৪%</span> সম্ভাবনা আছে n=15-এ চিরতরে মারা পড়ার। স্পার্স রানে <span class="fig">১২টির মধ্যে ১০টি</span> সোর্স বাদ পড়ে যেত — শেষে টিকে থাকে মূলত <code>fallback_color</code>, যা ফ্ল্যাট ক্যান্ডেলে আক্ষরিক অর্থেই <code>random.choice</code>।</p>
+          </div>
+          <div class="fix"><span class="tag">Fix</span><div>Wilson lower bound ব্যবহার করুন (মাইনারে যেটা আছে), স্যাম্পল ফ্লোর অনেক বাড়ান, আর বাদ দেওয়াটা স্থায়ী না করে ওজন কমানোর মতো করুন যাতে ফিরে আসার পথ থাকে।</div></div>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-head">
+          <span class="rank">04</span>
+          <h3>সিগন্যালের দুই-তৃতীয়াংশই ডিজাইন অনুযায়ী নয়েজ</h3>
+          <span class="chip chip-high">High</span>
+        </div>
+        <div class="finding-body">
+          <p>
+            যখন কোনো নিশ্চিত সোর্স নেই, <code>ALWAYS_SIGNAL</code> তবু একটা দিক বের করতে বাধ্য —
+            microstructure স্কোর, নয়তো শেষ ক্যান্ডেলের রং, নয়তো ফ্ল্যাট হলে সরাসরি
+            <code>random.choice</code>। কোয়ালিটি গেট, কনফিডেন্স ফ্লোর, ভেটো — কোনোটাই এই পথে খাটে না।
+          </p>
+          <div class="evidence">
+            <div class="tag">Measured</div>
+            <p>ঘন ফিডে গ্রেড হওয়া সিগন্যালের <span class="fig">৬৫%</span> এসেছে এই ফলব্যাক পথ থেকে (স্পার্সে <span class="fig">৬৮%</span>)। এদের উইন রেট <span class="fig">৪৯.০%</span> — অর্থাৎ ঠিক যতটা এলোমেলো হওয়ার কথা।</p>
+          </div>
+          <div class="fix"><span class="tag">Fix</span><div>ফলব্যাক সিগন্যালগুলোকে API আর UI-তে আলাদা করে চিহ্নিত করুন (<code>tier: "noise"</code>), অথবা ট্রেড করার জন্য <code>ALWAYS_SIGNAL=0</code> রাখুন। দুটো জিনিসকে এক তালিকায় মেশানোই আসল ক্ষতি।</div></div>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-head">
+          <span class="rank">05</span>
+          <h3><code>confidence</code> সংখ্যাটা ফলাফলের সাথে সম্পর্কহীন</h3>
+          <span class="chip chip-high">High</span>
+        </div>
+        <div class="finding-body">
+          <p>
+            কনফিডেন্স = ৬০% measured + ৪০% structural weight। কিন্তু measured অংশটা একই ট্রেডে থাকা
+            পারস্পরিক সম্পর্কিত সোর্সগুলোর জয়-পরাজয় যোগ করে বানানো, আর structural weight শুধু বলে
+            ভোটগুলো কতটা একমত — কে ঠিক ছিল তা নয়। প্যাটার্নের প্রায়োরগুলোও (০.৫২, ০.৫৭, ০.৭৫)
+            মাপা নয়, ধরে নেওয়া।
+          </p>
+          <div class="table-scroll">
+            <table>
+              <caption>ঘন ফিড — কনফিডেন্স বনাম বাস্তব উইন রেট</caption>
+              <thead><tr><th>Confidence</th><th>n</th><th>Win rate</th></tr></thead>
+              <tbody>
+                <tr><td class="num">0.3</td><td class="num">93</td><td class="num">55.9%</td></tr>
+                <tr><td class="num">0.4</td><td class="num">289</td><td class="num">50.2%</td></tr>
+                <tr><td class="num">0.5</td><td class="num">105</td><td class="num">39.0%</td></tr>
+                <tr><td class="num">0.6</td><td class="num">107</td><td class="num">45.8%</td></tr>
+                <tr><td class="num">0.7</td><td class="num">163</td><td class="num">53.4%</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="font-size:15px;color:var(--ink-soft)">
+            উঁচু কনফিডেন্স মানে বেশি জেতা নয় — সবচেয়ে খারাপ বাকেটটাই মাঝখানে। ৭০% কনফিডেন্স দেখে
+            ট্রেড করলে আসলে ৩০% কনফিডেন্সের চেয়ে খারাপ ফল পেতেন।
+          </p>
+          <div class="fix"><span class="tag">Fix</span><div>প্রায়োরগুলো ফেলে দিন। কনফিডেন্স সরাসরি মাপা ফ্রিকোয়েন্সি থেকে আসুক, প্রতি (সোর্স × পেয়ার)-এ আলাদা করে, এবং যথেষ্ট স্যাম্পল না হওয়া পর্যন্ত কোনো সংখ্যা দেখাবেনই না।</div></div>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-head">
+          <span class="rank">06</span>
+          <h3>কমেন্ট বলে "প্রতি ক্যান্ডেলে ফায়ার করে" — বাস্তবে ৪৩% ক্যান্ডেল চুপচাপ বাদ যায়</h3>
+          <span class="chip chip-medium">Medium</span>
+        </div>
+        <div class="finding-body">
+          <p>
+            <code>decision.py</code>-তে দুটো ভেটো (বিপরীত microstructure, আর wick-rejection)
+            <code>ALWAYS_SIGNAL</code> চালু থাকলেও <code>None</code> ফেরত দেয়। ফলে যেই ক্যান্ডেলগুলোতে
+            আসল কনফার্মেশন ছিল, ঠিক সেগুলোতেই কিছু ফায়ার না করে চুপ থাকা হয় — আর
+            <code>/api/live</code> তখন পুরনো সিগন্যাল দেখাতে থাকে, যেটা দেখে মনে হয় "এখনকার কল"।
+          </p>
+          <div class="evidence">
+            <div class="tag">Measured</div>
+            <p>১৩৩৯টি ক্যান্ডেলের মধ্যে ফায়ার হয়েছে <span class="fig">৭৫৭টিতে (৫৬.৫%)</span>, চুপচাপ ভেটো হয়েছে <span class="fig">৫৮২টিতে (৪৩.৫%)</span>।</p>
+          </div>
+          <div class="fix"><span class="tag">Fix</span><div>হয় ভেটোর পরেও ফলব্যাকে নামুন, নয়তো কমেন্ট আর ডকুমেন্টেশন ঠিক করুন। <code>/api/live</code>-তে সিগন্যালের বয়স যোগ করুন যাতে বাসি কল চেনা যায়।</div></div>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-head">
+          <span class="rank">07</span>
+          <h3>মাইনার যা শেখে আর যেটা গ্রেড হয় — দুটো এক জিনিস নয়</h3>
+          <span class="chip chip-medium">Medium</span>
+        </div>
+        <div class="finding-body">
+          <p>
+            <code>pattern_miner.py</code> শেখে "পরের ক্যান্ডেল বুলিশ বন্ধ হবে কিনা"
+            (<code>close &gt; open</code>)। কিন্তু গ্রেডিং জিজ্ঞেস করে "পরের ক্লোজ কি আগের ক্লোজের
+            চেয়ে বেশি" (<code>close[t+1] &gt; close[t]</code>)। দুটো এক হয় কেবল তখনই যখন
+            <code>open[t+1] == close[t]</code>। একই সমস্যা <code>fallback_color</code> আর
+            ক্যান্ডেল-রং নির্ভর সব সোর্সের।
+          </p>
+          <div class="evidence">
+            <div class="tag">Measured</div>
+            <p>ঘন ফিডে দুটো লেবেল <span class="fig">৫.৪%</span> ক্ষেত্রে একমত হয় না — অর্থাৎ মাইনার যা অপ্টিমাইজ করছে তার সাথে যা স্কোর হচ্ছে তার মধ্যে স্থায়ী ফাঁক।</p>
+          </div>
+          <div class="fix"><span class="tag">Fix</span><div>মাইনারের আউটকাম লেবেল বদলে <code>close[t+1] &gt; close[t]</code> করুন — অর্থাৎ ঠিক যেটার উপর টাকা যাচ্ছে সেটাই শেখান।</div></div>
+        </div>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>স্পার্স ফিডে সোর্সগুলোর অবস্থা</h2>
+      <p class="prose" style="color:var(--ink-soft);font-size:15px">
+        একই এজ-বিহীন ডেটা। এই সংখ্যাগুলো সোর্সগুলোর দোষ নয় — এগুলো ফাইন্ডিং ০১ আর ০২-এর ছাপ।
+      </p>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <caption>Sparse feed — per-source, as the app itself would score them</caption>
+        <thead><tr><th>Source</th><th>n</th><th>Win rate</th><th>শেখার ব্যবস্থার রায়</th></tr></thead>
+        <tbody>
+          <tr><td class="src">microstructure</td><td class="num">404</td><td class="num">34.7%</td><td class="killed">চিরতরে বন্ধ</td></tr>
+          <tr><td class="src">ema_trend_down</td><td class="num">135</td><td class="num">27.4%</td><td class="killed">চিরতরে বন্ধ</td></tr>
+          <tr><td class="src">marubozu</td><td class="num">101</td><td class="num">33.7%</td><td class="killed">চিরতরে বন্ধ</td></tr>
+          <tr><td class="src">fallback_color</td><td class="num">55</td><td class="num">36.4%</td><td class="killed">চিরতরে বন্ধ</td></tr>
+          <tr><td class="src">doji_reversal</td><td class="num">55</td><td class="num">34.5%</td><td class="killed">চিরতরে বন্ধ</td></tr>
+          <tr><td class="src">ema_trend_up</td><td class="num">52</td><td class="num">42.3%</td><td>টিকে গেল</td></tr>
+          <tr><td class="src">wickwall</td><td class="num">28</td><td class="num">25.0%</td><td class="killed">চিরতরে বন্ধ</td></tr>
+          <tr><td class="src">near_resistance</td><td class="num">27</td><td class="num">40.7%</td><td class="killed">চিরতরে বন্ধ</td></tr>
+          <tr><td class="src">candle_reaction</td><td class="num">16</td><td class="num">25.0%</td><td class="killed">চিরতরে বন্ধ</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="prose" style="font-size:15px;color:var(--ink-soft)">
+      লক্ষ করুন <code>candle_reaction</code> — যেটাকে কোডে "সবচেয়ে শক্তিশালী সোর্স, ~৭৫% প্রায়োর"
+      বলা হয়েছে — সেও ২৫%-এ নেমে বন্ধ হয়ে যেত। এটাই প্রমাণ করে সংখ্যাগুলো সোর্সের গুণ মাপছে না,
+      মাপছে পাইপলাইনের ত্রুটি।
+    </p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>যে দুটো সন্দেহ পরীক্ষায় টেকেনি</h2>
+      <p class="prose" style="color:var(--ink-soft);font-size:15px">
+        এগুলো আমি ধরে নিয়েছিলাম সমস্যা — মেপে দেখা গেল সমস্যা নয়। এখানে সময় নষ্ট করবেন না।
+      </p>
+    </div>
+    <div class="cleared">
+      <div class="cleared-item">
+        <span class="chip chip-clear">Clear</span>
+        <div>
+          <strong>look-ahead bias নেই</strong>
+          <p>ইন্ডিকেটর, প্যাটার্ন, ফ্র্যাক্টাল — সবই কেবল বন্ধ হয়ে যাওয়া ক্যান্ডেল ব্যবহার করে। ঘন ফিডে ফল ৪৯.১%, অর্থাৎ ভবিষ্যৎ দেখে ফেলার কোনো লক্ষণ নেই। ইঞ্জিন প্রতারণা করছে না — তার কেবল কোনো এজ নেই।</p>
+        </div>
+      </div>
+      <div class="cleared-item">
+        <span class="chip chip-clear">Clear</span>
+        <div>
+          <strong>এন্ট্রি প্রাইস নিয়ে দুশ্চিন্তার কিছু নেই</strong>
+          <p>অ্যাপ ধরে <code>close[t]</code>, বাস্তব ট্রেড ভরে <code>open[t+1]</code>-এ। মেপে দেখা গেল পার্থক্য মাত্র ০.৭ পয়েন্ট (৪৯.৪% বনাম ৫০.১%) — এটা আপনার সমস্যার কারণ নয়।</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>নিজের আসল ডেটায় যাচাই করুন</h2>
+      <p class="prose" style="color:var(--ink-soft);font-size:15px">
+        উপরের সংখ্যাগুলো সিমুলেশন থেকে। আপনার সত্যিকারের টাই-রেট নির্ভর করে আপনার ফিড আসলে কত ঘন
+        তার উপর — তাই মেকানিজম নয়, মাত্রাটা নিজে মেপে নিন। Railway ভলিউমের ডেটাবেসে চালান:
+      </p>
+    </div>
+    <pre><code>-- ফাইন্ডিং ০১: কত শতাংশ "হার" আসলে টাই ছিল?
+SELECT COUNT(*) AS graded,
+       SUM(close_price = entry_price) AS ties,
+       ROUND(100.0 * SUM(result = 'WIN') / COUNT(*), 1) AS win_pct,
+       ROUND(100.0 * SUM(result = 'WIN')
+             / NULLIF(COUNT(*) - SUM(close_price = entry_price), 0), 1) AS win_pct_excl_ties
+FROM signals WHERE result != 'PENDING';
+
+-- ফাইন্ডিং ০২: কোন পেয়ারে নকল ফ্ল্যাট ক্যান্ডেল সবচেয়ে বেশি?
+SELECT pair, COUNT(*) AS candles,
+       SUM(high = low) AS flat,
+       ROUND(100.0 * SUM(high = low) / COUNT(*), 1) AS flat_pct
+FROM candles GROUP BY pair ORDER BY flat_pct DESC;
+
+-- ফাইন্ডিং ০৪: কত অংশ সিগন্যাল ফলব্যাক পথ থেকে?
+SELECT source, COUNT(*) AS n,
+       ROUND(100.0 * SUM(result = 'WIN') / NULLIF(SUM(result != 'PENDING'), 0), 1) AS win_pct
+FROM signals GROUP BY source ORDER BY n DESC LIMIT 15;
+
+-- কখনো গ্রেড না হওয়া সিগন্যাল জমে আছে কিনা (প্রতি ৫ সেকেন্ডে পুনরায় কোয়েরি হয়)
+SELECT COUNT(*) FROM signals
+WHERE result = 'PENDING' AND target_close_ts &lt; strftime('%s','now') - 600;</code></pre>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>কী আগে করবেন</h2>
+    </div>
+    <ol class="priority">
+      <li><strong>টাই আলাদা করুন।</strong> <code>DRAW</code> ফলাফল যোগ করুন, উইন রেট আর শেখার হিসাব থেকে বাদ দিন। একটা পরিবর্তনেই OTC পেয়ারের রিপোর্টিং ঠিক হয়ে যাবে।</li>
+      <li><strong>নকল ক্যান্ডেল আলাদা করুন।</strong> ওগুলোতে সিগন্যাল ফায়ার বা গ্রেড — কোনোটাই করবেন না।</li>
+      <li><strong>সাপ্রেশন ঠিক করুন</strong> এবং <em>আগের সব pattern_stats মুছে ফেলুন</em> — বর্তমান পরিসংখ্যান দূষিত ডেটা দিয়ে তৈরি, ওগুলোর উপর ভিত্তি করে শেখা মানে ভুলকেই পাকা করা।</li>
+      <li><strong>নয়েজ আর সিগন্যাল আলাদা করে দেখান।</strong> ফলব্যাক সিগন্যালে আলাদা টিয়ার বসান, নয়তো ট্রেডিংয়ের জন্য <code>ALWAYS_SIGNAL=0</code>।</li>
+      <li><strong>এরপরই কেবল</strong> এজ খোঁজার কাজে হাত দিন — এবং তখন পরিষ্কার ডেটা হাতে থাকবে যা দিয়ে সত্যিই মাপা যাবে।</li>
+    </ol>
+  </section>
+
+  <div class="closing">
+    <h2>সবচেয়ে জরুরি কথাটা</h2>
+    <p>
+      ১ থেকে ৭ পর্যন্ত সব ঠিক করলে আপনি ৩৩% থেকে <strong>প্রায় ৫০%</strong>-এ পৌঁছাবেন — লাভে নয়।
+      এজ-বিহীন ডেটায় ঘন ফিডের ফল ৪৯.১%, আর কনফার্মড পথের ফল ৪৯.২% — অর্থাৎ কোয়ালিটি গেটগুলো
+      নয়েজ থেকে সিগন্যাল আলাদা করতে পারছে না।
+    </p>
+    <p>
+      এর মানে এই নয় যে কাজটা বৃথা। এর মানে হলো, বাগগুলো ঠিক না হওয়া পর্যন্ত আপনি জানতেই পারবেন না
+      কোন থিওরি সত্যি কাজ করে — কারণ মাপার যন্ত্রটাই নষ্ট। আগে যন্ত্র সারান, তারপর এজ খুঁজুন।
+    </p>
+  </div>
+
+  <footer>
+    পদ্ধতি: <code>app/decision.py</code>, <code>app/indicators.py</code>, <code>app/evaluator.py</code>
+    আর <code>app/feed.py</code>-এর আসল কোড চালানো হয়েছে driftless random-walk থেকে বানানো
+    ১৪০০টি ক্যান্ডেলের উপর, feed.py-এর নিজস্ব টিক-অ্যাগ্রিগেশন লজিক দিয়ে, আসল SQLite ডেটাবেস আর
+    আসল গ্রেডিং কোড ব্যবহার করে। দুটো রান: ঘন ফিড (৪০ টিক/মিনিট) আর স্পার্স ফিড (৩ টিক/মিনিট, ফাঁকসহ)।
+    কোনো লাইভ Quotex সংযোগ ব্যবহার করা হয়নি।
+  </footer>
+
+</div>
