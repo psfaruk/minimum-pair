@@ -1,0 +1,84 @@
+App.tabs.settings = {
+  patternPairFilter: "",
+
+  onInit() {
+    const select = document.getElementById("patternPerfPairFilter");
+    App.allPairNames().forEach((p) => {
+      const opt = document.createElement("option");
+      opt.value = p;
+      opt.textContent = p;
+      select.appendChild(opt);
+    });
+    select.addEventListener("change", () => {
+      this.patternPairFilter = select.value;
+      this.loadPatternPerformance();
+    });
+    this.loadPatternPerformance();
+  },
+
+  onShow() {
+    this.renderPairs();
+    this.loadPatternPerformance();
+  },
+
+  onStatus(s) {
+    const conn = document.getElementById("settingsConn");
+    conn.textContent = s.quotex_connected
+      ? `Connected (${s.account_mode} account)`
+      : (s.error ? "Failed to connect" : "Connecting…");
+    document.getElementById("settingsError").textContent = s.error || "";
+    document.getElementById("settingsAuthMode").textContent =
+      s.auth_mode === "session_token" ? "session token" : "email/password";
+    document.getElementById("settingsMinConf").textContent = (s.min_confidence * 100).toFixed(0) + "%";
+    document.getElementById("settingsAlwaysSignal").textContent = s.always_signal ? "on" : "off";
+    this._active = s.active_pairs || [];
+    this.renderPairs();
+  },
+
+  renderPairs() {
+    const list = document.getElementById("settingsPairs");
+    const names = App.allPairNames();
+    const active = new Set(this._active || []);
+    list.innerHTML = names.map((name) => `
+      <div class="pair-row">
+        <span class="name">${name}</span>
+        <span class="result-badge ${active.has(name) ? "WIN" : "PENDING"}">${active.has(name) ? "streaming" : "waiting"}</span>
+      </div>`).join("");
+  },
+
+  async loadPatternPerformance() {
+    const q = this.patternPairFilter ? `?pair=${encodeURIComponent(this.patternPairFilter)}` : "";
+    const rows = await App.api(`/api/patterns${q}`);
+    this.renderPatternPerformance(rows);
+  },
+
+  renderPatternPerformance(rows) {
+    const list = document.getElementById("patternPerfList");
+    if (!rows.length) {
+      const scope = this.patternPairFilter ? `for ${this.patternPairFilter}` : "yet";
+      list.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0">No signals ${scope}</div>`;
+      return;
+    }
+    list.innerHTML = rows.map((r) => {
+      const rate = r.win_rate;
+      const rateClass = rate === null ? "" : rate >= 0.55 ? "rate-good" : rate <= 0.45 ? "rate-bad" : "rate-mid";
+      const pendingNote = r.pending ? ` (${r.pending} pending)` : "";
+      return `<div class="pair-row">
+        <span class="name">${r.pattern}</span>
+        <span><span class="signal-count">${r.total} signals</span>
+        <span class="rate ${rateClass}">${App.fmtPct(rate)}</span>
+        <span class="counts">${r.wins}W / ${r.losses}L${pendingNote}</span></span>
+      </div>`;
+    }).join("");
+  },
+
+  onGraded() {
+    this.loadPatternPerformance();
+  },
+
+  onSignal(msg) {
+    if (!this.patternPairFilter || msg.pair === this.patternPairFilter) {
+      this.loadPatternPerformance();
+    }
+  },
+};

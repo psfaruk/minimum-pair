@@ -1,0 +1,10 @@
+.env
+.claude/
+session.json
+settings/
+*.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+pyquotex_src/
