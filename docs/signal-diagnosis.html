@@ -169,6 +169,24 @@
   .chip-high { background: var(--measure-soft); color: var(--measure); }
   .chip-medium { background: var(--accent-soft); color: var(--accent); }
   .chip-clear { background: var(--good-soft); color: var(--good); }
+  .chip-fixed { background: var(--good-soft); color: var(--good); }
+
+  .resolution {
+    background: var(--good-soft);
+    border-left: 3px solid var(--good);
+    padding: 14px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .resolution .tag {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--good);
+  }
+  .resolution p { font-size: 15px; margin: 0; }
 
   .finding-body { padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; }
   .finding-body > p { max-width: var(--measure-width); }
@@ -308,19 +326,33 @@
   <div class="metrics">
     <div class="metric is-bad">
       <div class="value">33.6%</div>
-      <div class="label">OTC-সদৃশ স্পার্স ফিডে অ্যাপের নিজের হিসাবে উইন রেট</div>
+      <div class="label">স্পার্স (OTC-সদৃশ) ফিডে অ্যাপের নিজের হিসাব — <strong>ফিক্সের আগে</strong></div>
       <div class="note">227W / 449L</div>
     </div>
-    <div class="metric is-flat">
-      <div class="value">48.8%</div>
-      <div class="label">ঠিক সেই একই ডেটা, শুধু টাই-এর নিয়ম সৎ করলে</div>
-      <div class="note">১৫ পয়েন্টের ফারাক = মাপার বাগ</div>
+    <div class="metric is-good">
+      <div class="value">50.0%</div>
+      <div class="label">ঠিক সেই একই ডেটা — <strong>ফিক্সের পরে</strong></div>
+      <div class="note">209W / 209L · ৪৭৫টি draw বাদ</div>
     </div>
     <div class="metric is-flat">
-      <div class="value">49.1%</div>
-      <div class="label">ঘন ফিডে উইন রেট — অর্থাৎ ইঞ্জিনের কোনো এজ নেই</div>
-      <div class="note">850 signals</div>
+      <div class="value">49.4%</div>
+      <div class="label">ঘন ফিড, ফিক্সের পরে — অর্থাৎ ইঞ্জিনের এখনো কোনো এজ নেই</div>
+      <div class="note">1317 signals</div>
     </div>
+  </div>
+
+  <div class="closing" style="background:var(--good-soft)">
+    <h2>সব সাতটি ফিক্স হয়ে গেছে</h2>
+    <p>
+      এজ-বিহীন ডেটায় স্পার্স ফিডের ফল <strong>৩৩.৬% → ৫০.০%</strong>। ঠিক এটাই হওয়ার কথা ছিল:
+      যে ডেটায় কোনো এজ নেই সেখানে সৎ পাইপলাইন ঠিক ৫০% দেখাবে — বেশিও না, কমও না।
+      নিচের প্রতিটি ফাইন্ডিংয়ে কী বদলেছে তা লেখা আছে। <strong>মাপার যন্ত্রটা এখন কাজ করছে।</strong>
+    </p>
+    <p>
+      পুরনো ডেটাবেসও মেরামত হয়ে যাবে — অ্যাপ চালু হওয়ার সময় স্কিমা মাইগ্রেশন চলে: ভুলভাবে "হার"
+      লেখা টাইগুলো <code>DRAW</code>-তে বদলে যায়, নকল ফ্ল্যাট ক্যান্ডেলগুলো চিহ্নিত হয়, আর
+      <code>pattern_stats</code> মেরামত করা ইতিহাস থেকে নতুন করে গোনা হয়। কিছু হারাবে না।
+    </p>
   </div>
 
   <section>
@@ -357,6 +389,7 @@
         <div class="finding-head">
           <span class="rank">01</span>
           <h3>টাই মানেই হার — এবং OTC ফিডে টাই ভয়ংকর রকম বেশি</h3>
+          <span class="chip chip-fixed">Fixed</span>
           <span class="chip chip-critical">Critical</span>
         </div>
         <div class="finding-body">
@@ -370,6 +403,7 @@
             <p>স্পার্স ফিডে গ্রেড হওয়া ৬৭৬টি সিগন্যালের মধ্যে <span class="fig">২১১টি (৩১.২%)</span> ছিল টাই — প্রতিটিই LOSS লেখা হয়েছে। টাই বাদ দিলে উইন রেট <span class="fig">৩৩.৬% → ৪৮.৮%</span>।</p>
           </div>
           <div class="fix"><span class="tag">Fix</span><div>তৃতীয় একটা ফলাফল <code>DRAW</code> যোগ করুন। উইন রেটের হিসাব থেকে বাদ দিন, শেখার পরিসংখ্যানেও গুনবেন না।</div></div>
+          <div class="resolution"><div class="tag">Done</div><p><code>DRAW</code> ফলাফল যোগ হয়েছে। উইন রেট, per-source পরিসংখ্যান আর শেখা — সব জায়গা থেকে বাদ। পুরনো ভুল-স্কোর করা টাইগুলোও মাইগ্রেশনে মেরামত হয়।</p></div>
         </div>
       </article>
 
@@ -377,6 +411,7 @@
         <div class="finding-head">
           <span class="rank">02</span>
           <h3>অ্যাপ নিজেই নকল ফ্ল্যাট ক্যান্ডেল বানায়, তারপর তার উপর ট্রেড করে</h3>
+          <span class="chip chip-fixed">Fixed</span>
           <span class="chip chip-critical">Critical</span>
         </div>
         <div class="finding-body">
@@ -392,6 +427,7 @@
             <p>স্পার্স সিমুলেশনে ১৪০১টি ক্যান্ডেলের মধ্যে <span class="fig">৪৮১টি</span> ছিল বানানো ফ্ল্যাট ক্যান্ডেল। আপনার USD/BDT, USD/DZD, USD/PKR-এর মতো পাতলা OTC পেয়ারগুলোই ঠিক এই অবস্থায় পড়ে।</p>
           </div>
           <div class="fix"><span class="tag">Fix</span><div>নকল ক্যান্ডেলে সিগন্যাল ফায়ার করবেন না, আর ওগুলোতে গ্রেডও করবেন না। ক্যান্ডেলে একটা <code>synthetic</code> ফ্ল্যাগ রাখুন — অথবা টিক না এলে ওই মিনিটটা বাদ দিন।</div></div>
+          <div class="resolution"><div class="tag">Done</div><p>ক্যান্ডেলে <code>synthetic</code> কলাম যোগ হয়েছে। নকল ক্যান্ডেলে সিগন্যাল ফায়ার হয় না, গ্রেড হলে <code>DRAW</code>, আর মাইনারের ট্রেনিং থেকেও বাদ। আসল টিক এলে ফ্ল্যাগ নিজে থেকেই মুছে যায়।</p></div>
         </div>
       </article>
 
@@ -399,6 +435,7 @@
         <div class="finding-head">
           <span class="rank">03</span>
           <h3>শেখার ব্যবস্থাটা একমুখী — একবার বন্ধ হলে আর কখনো ফিরতে পারে না</h3>
+          <span class="chip chip-fixed">Fixed</span>
           <span class="chip chip-critical">Critical</span>
         </div>
         <div class="finding-body">
@@ -413,6 +450,7 @@
             <p>নিখুঁত ৫০% সোর্সেরও <span class="fig">৩০.৪%</span> সম্ভাবনা আছে n=15-এ চিরতরে মারা পড়ার। স্পার্স রানে <span class="fig">১২টির মধ্যে ১০টি</span> সোর্স বাদ পড়ে যেত — শেষে টিকে থাকে মূলত <code>fallback_color</code>, যা ফ্ল্যাট ক্যান্ডেলে আক্ষরিক অর্থেই <code>random.choice</code>।</p>
           </div>
           <div class="fix"><span class="tag">Fix</span><div>Wilson lower bound ব্যবহার করুন (মাইনারে যেটা আছে), স্যাম্পল ফ্লোর অনেক বাড়ান, আর বাদ দেওয়াটা স্থায়ী না করে ওজন কমানোর মতো করুন যাতে ফিরে আসার পথ থাকে।</div></div>
+          <div class="resolution"><div class="tag">Done</div><p>এখন শর্ত: n ≥ ৪০ <em>এবং</em> ৯৫% ব্যবধানের উপরের প্রান্তও ৫০%-এর নিচে। শাস্তি স্থায়ী বাদ নয়, ওজন ×০.২৫ — তাই সোর্স ফায়ার করতে থাকে আর নিজেকে প্রমাণ করে ফিরতে পারে। পরীক্ষায়: ৬/১৫ কয়েন-টস টেকে, ১২/৬০ সত্যিকারের লুজার নামে।</p></div>
         </div>
       </article>
 
@@ -420,6 +458,7 @@
         <div class="finding-head">
           <span class="rank">04</span>
           <h3>সিগন্যালের দুই-তৃতীয়াংশই ডিজাইন অনুযায়ী নয়েজ</h3>
+          <span class="chip chip-fixed">Fixed</span>
           <span class="chip chip-high">High</span>
         </div>
         <div class="finding-body">
@@ -433,6 +472,7 @@
             <p>ঘন ফিডে গ্রেড হওয়া সিগন্যালের <span class="fig">৬৫%</span> এসেছে এই ফলব্যাক পথ থেকে (স্পার্সে <span class="fig">৬৮%</span>)। এদের উইন রেট <span class="fig">৪৯.০%</span> — অর্থাৎ ঠিক যতটা এলোমেলো হওয়ার কথা।</p>
           </div>
           <div class="fix"><span class="tag">Fix</span><div>ফলব্যাক সিগন্যালগুলোকে API আর UI-তে আলাদা করে চিহ্নিত করুন (<code>tier: "noise"</code>), অথবা ট্রেড করার জন্য <code>ALWAYS_SIGNAL=0</code> রাখুন। দুটো জিনিসকে এক তালিকায় মেশানোই আসল ক্ষতি।</div></div>
+          <div class="resolution"><div class="tag">Done</div><p>প্রতিটি সিগন্যালে এখন <code>tier</code> আছে — <code>confirmed</code> বা <code>noise</code>। UI-তে noise ব্যাজ দেখায়, আর <code>/api/live?tier=confirmed</code> দিয়ে শুধু গেট-পাস করা সিগন্যাল নেওয়া যায়।</p></div>
         </div>
       </article>
 
@@ -440,6 +480,7 @@
         <div class="finding-head">
           <span class="rank">05</span>
           <h3><code>confidence</code> সংখ্যাটা ফলাফলের সাথে সম্পর্কহীন</h3>
+          <span class="chip chip-fixed">Fixed</span>
           <span class="chip chip-high">High</span>
         </div>
         <div class="finding-body">
@@ -467,6 +508,7 @@
             ট্রেড করলে আসলে ৩০% কনফিডেন্সের চেয়ে খারাপ ফল পেতেন।
           </p>
           <div class="fix"><span class="tag">Fix</span><div>প্রায়োরগুলো ফেলে দিন। কনফিডেন্স সরাসরি মাপা ফ্রিকোয়েন্সি থেকে আসুক, প্রতি (সোর্স × পেয়ার)-এ আলাদা করে, এবং যথেষ্ট স্যাম্পল না হওয়া পর্যন্ত কোনো সংখ্যা দেখাবেনই না।</div></div>
+          <div class="resolution"><div class="tag">Done</div><p>কনফিডেন্স এখন শুধু মাপা হিট রেট, ২৫টি গ্রেডেড স্যাম্পলের আগে <code>null</code> — UI-তে "conf —"। ০.৫৫ প্রায়োর আর structural weight মেশানো বন্ধ। পারস্পরিক সম্পর্কিত সোর্সের স্যাম্পল যোগ করাও বন্ধ।</p></div>
         </div>
       </article>
 
@@ -474,6 +516,7 @@
         <div class="finding-head">
           <span class="rank">06</span>
           <h3>কমেন্ট বলে "প্রতি ক্যান্ডেলে ফায়ার করে" — বাস্তবে ৪৩% ক্যান্ডেল চুপচাপ বাদ যায়</h3>
+          <span class="chip chip-fixed">Fixed</span>
           <span class="chip chip-medium">Medium</span>
         </div>
         <div class="finding-body">
@@ -488,6 +531,7 @@
             <p>১৩৩৯টি ক্যান্ডেলের মধ্যে ফায়ার হয়েছে <span class="fig">৭৫৭টিতে (৫৬.৫%)</span>, চুপচাপ ভেটো হয়েছে <span class="fig">৫৮২টিতে (৪৩.৫%)</span>।</p>
           </div>
           <div class="fix"><span class="tag">Fix</span><div>হয় ভেটোর পরেও ফলব্যাকে নামুন, নয়তো কমেন্ট আর ডকুমেন্টেশন ঠিক করুন। <code>/api/live</code>-তে সিগন্যালের বয়স যোগ করুন যাতে বাসি কল চেনা যায়।</div></div>
+          <div class="resolution"><div class="tag">Done</div><p>ভেটো এখন <code>None</code> ফেরত না দিয়ে noise-টিয়ারে নামে — <code>ALWAYS_SIGNAL</code>-এর প্রতিশ্রুতি সত্যি হলো (৫৬.৫% → ১০০%)। <code>/api/live</code>-তে <code>age_seconds</code> আর <code>stale</code> যোগ হয়েছে।</p></div>
         </div>
       </article>
 
@@ -495,6 +539,7 @@
         <div class="finding-head">
           <span class="rank">07</span>
           <h3>মাইনার যা শেখে আর যেটা গ্রেড হয় — দুটো এক জিনিস নয়</h3>
+          <span class="chip chip-fixed">Fixed</span>
           <span class="chip chip-medium">Medium</span>
         </div>
         <div class="finding-body">
@@ -510,6 +555,7 @@
             <p>ঘন ফিডে দুটো লেবেল <span class="fig">৫.৪%</span> ক্ষেত্রে একমত হয় না — অর্থাৎ মাইনার যা অপ্টিমাইজ করছে তার সাথে যা স্কোর হচ্ছে তার মধ্যে স্থায়ী ফাঁক।</p>
           </div>
           <div class="fix"><span class="tag">Fix</span><div>মাইনারের আউটকাম লেবেল বদলে <code>close[t+1] &gt; close[t]</code> করুন — অর্থাৎ ঠিক যেটার উপর টাকা যাচ্ছে সেটাই শেখান।</div></div>
+          <div class="resolution"><div class="tag">Done</div><p>মাইনার এখন <code>close[t+1] &gt; close[t]</code> শেখে — ঠিক যে ঘটনাটার উপর গ্রেডিং হয়। Wilson হিসাবটাও এখন <code>app/stats.py</code>-তে শেয়ার করা।</p></div>
         </div>
       </article>
 
@@ -606,27 +652,28 @@ WHERE result = 'PENDING' AND target_close_ts &lt; strftime('%s','now') - 600;</c
 
   <section>
     <div class="section-head">
-      <h2>কী আগে করবেন</h2>
+      <h2>কী করা হয়েছে</h2>
     </div>
     <ol class="priority">
-      <li><strong>টাই আলাদা করুন।</strong> <code>DRAW</code> ফলাফল যোগ করুন, উইন রেট আর শেখার হিসাব থেকে বাদ দিন। একটা পরিবর্তনেই OTC পেয়ারের রিপোর্টিং ঠিক হয়ে যাবে।</li>
-      <li><strong>নকল ক্যান্ডেল আলাদা করুন।</strong> ওগুলোতে সিগন্যাল ফায়ার বা গ্রেড — কোনোটাই করবেন না।</li>
-      <li><strong>সাপ্রেশন ঠিক করুন</strong> এবং <em>আগের সব pattern_stats মুছে ফেলুন</em> — বর্তমান পরিসংখ্যান দূষিত ডেটা দিয়ে তৈরি, ওগুলোর উপর ভিত্তি করে শেখা মানে ভুলকেই পাকা করা।</li>
-      <li><strong>নয়েজ আর সিগন্যাল আলাদা করে দেখান।</strong> ফলব্যাক সিগন্যালে আলাদা টিয়ার বসান, নয়তো ট্রেডিংয়ের জন্য <code>ALWAYS_SIGNAL=0</code>।</li>
-      <li><strong>এরপরই কেবল</strong> এজ খোঁজার কাজে হাত দিন — এবং তখন পরিষ্কার ডেটা হাতে থাকবে যা দিয়ে সত্যিই মাপা যাবে।</li>
+      <li><strong>টাই আলাদা হয়েছে।</strong> <code>DRAW</code> ফলাফল যোগ, উইন রেট আর শেখা — দুই জায়গা থেকেই বাদ।</li>
+      <li><strong>নকল ক্যান্ডেল আলাদা হয়েছে।</strong> ওগুলোতে সিগন্যালও ফায়ার হয় না, গ্রেডও হয় না, মাইনারও শেখে না।</li>
+      <li><strong>সাপ্রেশন ঠিক হয়েছে</strong> — Wilson উপরের প্রান্ত, n ≥ ৪০, আর স্থায়ী বাদের বদলে ওজন কমানো। পুরনো <code>pattern_stats</code> মোছার দরকার নেই: মাইগ্রেশন মেরামত করা ইতিহাস থেকে নতুন করে গুনে নেয়।</li>
+      <li><strong>নয়েজ আলাদা করে দেখানো হচ্ছে।</strong> প্রতিটি সিগন্যালে <code>tier</code>, UI-তে ব্যাজ, আর <code>/api/live?tier=confirmed</code>।</li>
+      <li><strong>এখন এজ খোঁজার পালা</strong> — এবং এবার হাতে পরিষ্কার ডেটা আছে যা দিয়ে সত্যিই মাপা যাবে।</li>
     </ol>
   </section>
 
   <div class="closing">
     <h2>সবচেয়ে জরুরি কথাটা</h2>
     <p>
-      ১ থেকে ৭ পর্যন্ত সব ঠিক করলে আপনি ৩৩% থেকে <strong>প্রায় ৫০%</strong>-এ পৌঁছাবেন — লাভে নয়।
-      এজ-বিহীন ডেটায় ঘন ফিডের ফল ৪৯.১%, আর কনফার্মড পথের ফল ৪৯.২% — অর্থাৎ কোয়ালিটি গেটগুলো
-      নয়েজ থেকে সিগন্যাল আলাদা করতে পারছে না।
+      ১ থেকে ৭ সব ঠিক হয়েছে, আর ফল ৩৩.৬% থেকে <strong>৫০.০%</strong>-এ উঠেছে — কিন্তু লাভে নয়।
+      এজ-বিহীন ডেটায় ৫০% মানেই "যন্ত্রটা সৎ", "কৌশলটা কাজ করে" নয়। ঘন ফিডে ফল এখনো ৪৯.৪%,
+      অর্থাৎ কোয়ালিটি গেটগুলো এখনো নয়েজ থেকে সিগন্যাল আলাদা করতে পারছে না।
     </p>
     <p>
-      এর মানে এই নয় যে কাজটা বৃথা। এর মানে হলো, বাগগুলো ঠিক না হওয়া পর্যন্ত আপনি জানতেই পারবেন না
-      কোন থিওরি সত্যি কাজ করে — কারণ মাপার যন্ত্রটাই নষ্ট। আগে যন্ত্র সারান, তারপর এজ খুঁজুন।
+      কিন্তু এটাই ছিল আসল বাধা: নষ্ট যন্ত্র দিয়ে কোনো থিওরি যাচাই করা যায় না। এখন আপনার প্রতিটি
+      সংখ্যা সত্যি কথা বলে — <code>confirmed</code> টিয়ারের উইন রেট, প্রতি সোর্সের হিসাব, প্রতিটি
+      কনফিডেন্স। এবার সত্যিকারের এজ খোঁজা শুরু করা যায়, কারণ এবার বোঝা যাবে কোনটা কাজ করছে।
     </p>
   </div>
 

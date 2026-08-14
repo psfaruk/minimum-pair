@@ -32,6 +32,18 @@ App.apiPost = async (path, body) => {
 
 App.allPairNames = () => [...App.state.pairs.forex, ...App.state.pairs.otc];
 
+// A confidence of null means the sources behind this signal don't have
+// enough graded history to state a rate yet. Showing "0%" (what the old
+// `confidence * 100` did with a null) reads as "certainly wrong", which
+// is the opposite of "not known".
+App.fmtConf = (c) => (c === null || c === undefined ? "conf —" : `conf ${(c * 100).toFixed(0)}%`);
+
+// Noise-tier signals exist so every pair always shows something. They
+// pass no quality gate and are no better than a coin flip, so they must
+// never look like the confirmed ones.
+App.tierBadge = (tier) =>
+  tier === "noise" ? '<span class="tier-badge noise" title="No confirmation — filler signal">noise</span>' : "";
+
 App.refreshWinRates = async () => {
   const rows = await App.api("/api/winrate");
   const map = {};

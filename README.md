@@ -89,3 +89,46 @@ connection, not the market). The rebuild tries the token first and only
 falls back to a password login, under the backoff rules above, if the
 token really is dead. `/api/status` reports `feed_stale_seconds` and
 `reconnects`.
+
+## Signal quality: what the numbers mean
+
+A measurement audit (`docs/signal-diagnosis.html`) ran the real engine over
+price data with no predictable edge, where an honest pipeline must score
+50%. It scored 33.6% on a thin OTC-style feed — the gap was measurement
+bugs, not market reads. What changed:
+
+- **`DRAW` is a real outcome.** When price finishes exactly where it
+  started the broker refunds the stake, so it is neither a win nor a
+  loss. These used to be recorded as losses; on a thin feed that was 31%
+  of all graded signals and dragged the measured win rate ~15 points
+  below reality, which then poisoned every source's learned statistics.
+- **Fabricated candles are marked and excluded.** When a minute passes
+  with no ticks the feed invents a flat candle so the series stays
+  continuous. It is a placeholder, not market data: `candles.synthetic`
+  marks it, nothing fires a signal on it, nothing is graded against it,
+  and the miner doesn't train on it.
+- **Every signal carries a `tier`.** `confirmed` passed the quality
+  gates; `noise` is the `ALWAYS_SIGNAL` filler that exists so each pair
+  always shows something, and is no better than a coin flip. Poll
+  `/api/live?tier=confirmed` to get only the gated ones. `age_seconds`
+  and `stale` on the same endpoint distinguish a fresh call from a
+  stalled pair's last one.
+- **`confidence` is a measurement or it is `null`.** It's the measured
+  hit rate of this signal's sources on this pair, and stays `null` until
+  there are at least 25 graded samples. The old score blended a
+  hard-coded 0.55 prior with a vote-agreement number and was
+  uncorrelated with actually being right.
+- **A losing source is demoted, not executed.** The old rule dropped any
+  source below 42% after 15 samples — which a fair coin flip trips 30% of
+  the time, and a dropped source never fires again, so it could never
+  earn its way back. Now it takes n >= 40 *and* a 95% interval whose
+  upper bound is still below breakeven, and the penalty is a weight
+  reduction.
+
+An existing database is migrated and repaired on boot: mis-scored ties
+become `DRAW`, flat candles are flagged, and `pattern_stats` is recounted
+from the corrected history. Nothing is discarded.
+
+These fixes make the reported numbers true; they do not create an edge.
+On edge-free data the engine now scores 50.0% — exactly what an honest
+pipeline should, and exactly what a strategy with no edge should.

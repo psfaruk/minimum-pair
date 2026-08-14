@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -209,17 +210,27 @@ async def pairs():
 
 
 @app.get("/api/live")
-async def live_signals():
+async def live_signals(tier: str | None = None):
     """Public, no-auth snapshot of the current CALL/PUT call for every
     pair — the latest signal each has fired, whether still pending or
     already graded. Meant for external scripts/bots to poll instead of
-    holding a WebSocket connection open."""
+    holding a WebSocket connection open.
+
+    `tier=confirmed` returns only signals that passed the quality gates.
+    Everything else is `tier=noise`: the ALWAYS_SIGNAL filler that exists
+    so each pair always shows *something*, and which is no better than a
+    coin flip. `age_seconds` is how long ago the call was made — a pair
+    whose stream has stalled will keep returning its last signal, and
+    without the age there's no way to tell that from a fresh one.
+    """
+    now = int(time.time())
     rows = await db.latest_signals()
     return [
         {
             "pair": r["pair"],
             "direction": r["direction"],
             "confidence": r["confidence"],
+            "tier": r["tier"],
             "result": r["result"],
             "entry_ts": r["entry_ts"],
             "target_close_ts": r["target_close_ts"],
@@ -227,8 +238,11 @@ async def live_signals():
             "close_price": r["close_price"],
             "source": r["source"],
             "created_at": r["created_at"],
+            "age_seconds": now - r["created_at"],
+            "stale": now - r["created_at"] > 3 * config.CANDLE_PERIOD_SECONDS,
         }
         for r in rows
+        if tier is None or r["tier"] == tier
     ]
 
 

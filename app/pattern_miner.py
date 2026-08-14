@@ -19,6 +19,7 @@ import math
 from typing import Any
 
 from app.candle_shape import body_ratio, is_bull
+from app.stats import wilson_lower_bound
 
 Candle = dict[str, Any]
 
@@ -36,7 +37,6 @@ MIN_SAMPLES = 8
 WILSON_THRESHOLD = 0.53
 FDR_ALPHA = 0.10
 RETRAIN_EVERY = 30
-Z_95 = 1.96
 
 _libraries: dict[str, dict[str, dict[str, Any]]] = {}
 _candles_since_retrain: dict[str, int] = {}
@@ -50,16 +50,6 @@ def _encode_candle(c: Candle) -> str:
 
 def _sequence_key(candles: list[Candle]) -> str:
     return "-".join(_encode_candle(c) for c in candles)
-
-
-def _wilson_lower_bound(wins: int, n: int, z: float = Z_95) -> float:
-    if n == 0:
-        return 0.0
-    phat = wins / n
-    denom = 1 + z * z / n
-    center = phat + z * z / (2 * n)
-    margin = z * math.sqrt(phat * (1 - phat) / n + z * z / (4 * n * n))
-    return (center - margin) / denom
 
 
 def _binom_p_value_one_sided(wins: int, n: int, p: float = 0.5) -> float:
@@ -86,22 +76,33 @@ def _fdr_pass_mask(p_values: list[float], alpha: float = FDR_ALPHA) -> list[bool
 
 
 def _mine(candles: list[Candle]) -> dict[str, dict[str, Any]]:
-    occurrences: dict[str, list[bool]] = {}  # key -> [True if next candle closed bullish]
+    occurrences: dict[str, list[bool]] = {}  # key -> [True if the graded outcome was CALL]
     for i in range(SEQUENCE_LENGTH - 1, len(candles) - 1):
         window = candles[i - SEQUENCE_LENGTH + 1 : i + 1]
+        # A fabricated candle carries no information — it's the last price
+        # repeated because the minute had no ticks. Training on it teaches
+        # the miner that quiet minutes are bearish (a flat candle encodes
+        # as "down"), which is an artefact of the feed, not the market.
+        if any(c.get("synthetic") for c in window) or candles[i + 1].get("synthetic"):
+            continue
         key = _sequence_key(window)
-        outcome_bull = is_bull(candles[i + 1])
-        occurrences.setdefault(key, []).append(outcome_bull)
+        # Learn the exact event the evaluator scores: did the next candle
+        # close above *this* candle's close. The old label was
+        # is_bull(next) — close above its own open — which is a different
+        # question whenever open[t+1] != close[t], and the two disagreed
+        # 5.4% of the time on measured data.
+        outcome_call = candles[i + 1]["close"] > candles[i]["close"]
+        occurrences.setdefault(key, []).append(outcome_call)
 
     candidates = []
     for key, outcomes in occurrences.items():
         n = len(outcomes)
         if n < MIN_SAMPLES:
             continue
-        bulls = sum(1 for o in outcomes if o)
-        bears = n - bulls
-        direction = "CALL" if bulls >= bears else "PUT"
-        wins = bulls if direction == "CALL" else bears
+        ups = sum(1 for o in outcomes if o)
+        downs = n - ups
+        direction = "CALL" if ups >= downs else "PUT"
+        wins = ups if direction == "CALL" else downs
         p_value = _binom_p_value_one_sided(wins, n)
         candidates.append({"key": key, "direction": direction, "wins": wins, "n": n, "p_value": p_value})
 
@@ -114,7 +115,7 @@ def _mine(candles: list[Candle]) -> dict[str, dict[str, Any]]:
     for candidate, passed in zip(candidates, passed_mask):
         if not passed:
             continue
-        lower = _wilson_lower_bound(candidate["wins"], candidate["n"])
+        lower = wilson_lower_bound(candidate["wins"], candidate["n"])
         if lower < WILSON_THRESHOLD:
             continue
         library[candidate["key"]] = {

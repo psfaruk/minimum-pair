@@ -83,8 +83,25 @@ class FeedManager:
     async def _finalize_candle(self, state: PairState, candle: dict[str, Any]) -> None:
         state.candles.append(candle)
         state.candles = state.candles[-IN_MEMORY_CANDLES:]
-        await db.save_candle(state.display_name, candle["ts"], candle["open"], candle["high"], candle["low"], candle["close"])
+        synthetic = bool(candle.get("synthetic"))
+        await db.save_candle(
+            state.display_name,
+            candle["ts"],
+            candle["open"],
+            candle["high"],
+            candle["low"],
+            candle["close"],
+            synthetic=synthetic,
+        )
         await self.on_candle(state.display_name, candle, True)
+
+        if synthetic:
+            # This candle is a placeholder for a minute that produced no
+            # ticks — every field is the last known price repeated. Firing
+            # a signal off it means predicting from data that doesn't
+            # exist, and it would be graded against another placeholder.
+            logger.debug("Skipping signal for %s: no ticks in this minute", state.display_name)
+            return
 
         ind = indicators.compute(state.candles)
         dec = await decision.evaluate(state.display_name, state.candles, ind)
@@ -99,6 +116,7 @@ class FeedManager:
                 confidence=dec.confidence,
                 source=",".join(dec.sources),
                 entry_price=candle["close"],
+                tier=dec.tier,
             )
             await self.on_signal(
                 state.display_name,
@@ -109,6 +127,7 @@ class FeedManager:
                     "confidence": dec.confidence,
                     "confirmations": dec.confirmations,
                     "sources": dec.sources,
+                    "tier": dec.tier,
                     "entry_ts": entry_ts,
                     "target_close_ts": target_close_ts,
                     "result": "PENDING",
@@ -132,6 +151,9 @@ class FeedManager:
             c["high"] = max(c["high"], price)
             c["low"] = min(c["low"], price)
             c["close"] = price
+            # A real tick landed in a minute the timer had already filled
+            # in: it's genuine market data from here on.
+            c.pop("synthetic", None)
 
         return finalized
 
@@ -160,12 +182,18 @@ class FeedManager:
                     if now >= boundary_end + 1:
                         finalized = state.current
                         last_price = finalized["close"]
+                        # The replacement is a placeholder for a minute
+                        # that hasn't produced a single tick yet. Flag it
+                        # as such — if ticks do arrive the flag is cleared
+                        # below, and if they never do, nothing downstream
+                        # will mistake it for market data.
                         state.current = {
                             "ts": boundary_end,
                             "open": last_price,
                             "high": last_price,
                             "low": last_price,
                             "close": last_price,
+                            "synthetic": True,
                         }
                         await self._finalize_candle(state, finalized)
                     else:
