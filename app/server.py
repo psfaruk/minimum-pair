@@ -152,6 +152,30 @@ async def pairs():
     return {"otc": list(config.OTC_PAIRS.keys()), "forex": list(config.FOREX_PAIRS.keys())}
 
 
+@app.get("/api/live")
+async def live_signals():
+    """Public, no-auth snapshot of the current CALL/PUT call for every
+    pair — the latest signal each has fired, whether still pending or
+    already graded. Meant for external scripts/bots to poll instead of
+    holding a WebSocket connection open."""
+    rows = await db.latest_signals()
+    return [
+        {
+            "pair": r["pair"],
+            "direction": r["direction"],
+            "confidence": r["confidence"],
+            "result": r["result"],
+            "entry_ts": r["entry_ts"],
+            "target_close_ts": r["target_close_ts"],
+            "entry_price": r["entry_price"],
+            "close_price": r["close_price"],
+            "source": r["source"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
 @app.get("/api/patterns")
 async def patterns(pair: str | None = None):
     return await db.pattern_performance(pair)

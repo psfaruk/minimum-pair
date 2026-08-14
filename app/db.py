@@ -341,3 +341,21 @@ def _history_sync(pair: str | None, limit: int) -> list[dict[str, Any]]:
 
 async def history(pair: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
     return await asyncio.to_thread(_history_sync, pair, limit)
+
+
+def _latest_signals_sync() -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.* FROM signals s
+            INNER JOIN (
+                SELECT pair, MAX(id) AS latest_id FROM signals GROUP BY pair
+            ) latest ON s.pair = latest.pair AND s.id = latest.latest_id
+            ORDER BY s.pair
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def latest_signals() -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_latest_signals_sync)
