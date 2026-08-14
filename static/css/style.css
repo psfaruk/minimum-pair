@@ -266,6 +266,31 @@ select {
 }
 .settings-note { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
 .settings-note-tight { margin: 0 0 8px; }
+
+.session-input {
+  width: 100%;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  margin-bottom: 8px;
+  font-family: inherit;
+}
+.session-textarea { min-height: 64px; resize: vertical; }
+.session-submit {
+  width: 100%;
+  background: var(--accent);
+  color: #071018;
+  border: none;
+  border-radius: 8px;
+  padding: 11px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.session-submit:disabled { opacity: 0.6; cursor: default; }
 .settings-select { width: 100%; margin-bottom: 10px; }
 
 .signal-count { color: var(--text-dim); font-size: 12px; margin-right: 8px; }

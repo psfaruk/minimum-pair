@@ -43,6 +43,13 @@ def auth_mode() -> str:
     return "password"
 
 
+def reset_session_failures() -> None:
+    """Called after a fresh token is pasted in via /api/session — give it
+    a clean slate instead of inheriting an old failure streak."""
+    global _session_failure_count
+    _session_failure_count = 0
+
+
 async def get_client() -> Quotex:
     """Returns a connected singleton Quotex client, connecting on first use.
 

@@ -14,6 +14,42 @@ App.tabs.settings = {
       this.loadPatternPerformance();
     });
     this.loadPatternPerformance();
+
+    document.getElementById("sessionUpdateBtn").addEventListener("click", () => this.submitSessionUpdate());
+  },
+
+  async submitSessionUpdate() {
+    const btn = document.getElementById("sessionUpdateBtn");
+    const statusEl = document.getElementById("sessionUpdateStatus");
+    const adminToken = document.getElementById("sessionAdminToken").value;
+    const sessionToken = document.getElementById("sessionToken").value.trim();
+    const sessionCookies = document.getElementById("sessionCookies").value.trim();
+
+    if (!sessionToken) {
+      statusEl.textContent = "Session token is required.";
+      statusEl.className = "settings-note error-text";
+      return;
+    }
+
+    btn.disabled = true;
+    statusEl.textContent = "Updating…";
+    statusEl.className = "settings-note";
+    try {
+      const res = await App.apiPost("/api/session", {
+        admin_token: adminToken,
+        session_token: sessionToken,
+        session_cookies: sessionCookies,
+      });
+      statusEl.textContent = res.message || "Updated, reconnecting…";
+      document.getElementById("sessionToken").value = "";
+      document.getElementById("sessionCookies").value = "";
+      document.getElementById("sessionAdminToken").value = "";
+    } catch (e) {
+      statusEl.textContent = e.message || "Update failed";
+      statusEl.className = "settings-note error-text";
+    } finally {
+      btn.disabled = false;
+    }
   },
 
   onShow() {

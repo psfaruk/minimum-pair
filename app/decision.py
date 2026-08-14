@@ -1,10 +1,8 @@
-import time
+import random
 from dataclasses import dataclass
 from typing import Any
 
 from app import candle_reaction, config, db, microstructure, pattern_miner, patterns
-
-_last_signal_ts: dict[str, float] = {}
 
 # Structural-prior patterns/sources get scaled into a vote weight the same
 # way: (prior_win_rate - 0.5) * 4, floored at 0.1. A 0.75 prior (candle
@@ -92,14 +90,16 @@ def _pattern_miner_vote(pair: str, candles: list[dict[str, Any]]) -> Vote | None
     return Vote(direction, _prior_to_weight(win_rate), name)
 
 
-def _fallback_vote(candles: list[dict[str, Any]]) -> Vote | None:
-    """Absolute last resort when even microstructure has no opinion."""
-    if not candles:
-        return None
-    last = candles[-1]
-    if last["close"] == last["open"]:
-        return None
-    direction = "CALL" if last["close"] > last["open"] else "PUT"
+def _fallback_vote(candles: list[dict[str, Any]]) -> Vote:
+    """Guarantees a direction even when every other source (including
+    microstructure) is silent, e.g. a perfectly flat candle — needed
+    because ALWAYS_SIGNAL means every pair fires on every candle, with
+    no exceptions."""
+    last = candles[-1] if candles else None
+    if last is not None and last["close"] != last["open"]:
+        direction = "CALL" if last["close"] > last["open"] else "PUT"
+    else:
+        direction = random.choice(["CALL", "PUT"])
     return Vote(direction, 0.3, "fallback_color")
 
 
@@ -116,15 +116,23 @@ async def _measured_win_rate(pair: str, sources: list[str]) -> float | None:
 
 
 async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]) -> Decision | None:
-    if not ind.get("ready"):
+    # Deliberately no `ind["ready"]` gate here: with ALWAYS_SIGNAL on,
+    # every pair has to fire on every candle even during the ~20 minutes
+    # after startup where a thin bootstrap history hasn't yet reached
+    # SMA_SLOW candles. _indicator_votes() degrades to zero votes on an
+    # unready `ind` safely (every field access goes through .get()), and
+    # the pattern/candle-reaction/miner/microstructure/fallback sources
+    # below only need the raw candle list, not the indicator snapshot.
+    if not candles:
         return None
 
     pattern_miner.maybe_retrain(pair, candles)
 
-    now = time.time()
-    last_ts = _last_signal_ts.get(pair, 0)
-    if now - last_ts < config.SIGNAL_COOLDOWN_SECONDS:
-        return None
+    # evaluate() is only ever called once per finalized candle (see
+    # feed.py's _finalize_candle), so there's no risk of double-firing
+    # within a candle — no separate cooldown gate is needed on top of
+    # that, and ALWAYS_SIGNAL means every pair fires every candle with
+    # no exceptions, so a cooldown would only ever work against that.
 
     cr_hit = candle_reaction.detect(candles)
 
@@ -150,30 +158,38 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
     contributing = [v for v in votes if v.direction == net_direction] if net_direction else []
 
     micro = microstructure.score(candles)
+    used_fallback = False
 
-    if (not contributing or len(contributing) < config.MIN_CONFIRMATIONS) and config.ALWAYS_SIGNAL:
-        if micro["direction"] is not None and micro["strength"] >= MICRO_FALLBACK_FLOOR:
-            fb = Vote(micro["direction"], micro["strength"], microstructure.PATTERN_NAME)
+    if not contributing or len(contributing) < config.MIN_CONFIRMATIONS:
+        if config.ALWAYS_SIGNAL:
+            # Guaranteed path: always produces *some* vote, so every pair
+            # fires on every candle. None of the quality/agreement gates
+            # below apply to it — this is deliberately a weaker, always-on
+            # signal, not a confirmed one; its (low) confidence score is
+            # informational rather than gating.
+            if micro["direction"] is not None and micro["strength"] >= MICRO_FALLBACK_FLOOR:
+                fb = Vote(micro["direction"], micro["strength"], microstructure.PATTERN_NAME)
+            else:
+                fb = _fallback_vote(candles)
+            net_direction = fb.direction
+            contributing = [fb]
+            used_fallback = True
         else:
-            fb = _fallback_vote(candles)
-        if fb and (net_direction is None or not conflict):
-            net_direction = fb.direction if not contributing else net_direction
-            contributing = contributing or [fb]
+            return None
 
-    if not net_direction or not contributing:
-        return None
-    if conflict and len(contributing) < config.MIN_CONFIRMATIONS:
-        # ambiguous market, no fallback strong enough to break the tie
-        return None
+    if not used_fallback:
+        if conflict and len(contributing) < config.MIN_CONFIRMATIONS:
+            # ambiguous market, no fallback strong enough to break the tie
+            return None
 
-    # gate: a confident opposing microstructure read vetoes the signal
-    if micro["direction"] is not None and micro["direction"] != net_direction and micro["strength"] >= MICRO_AGREEMENT_FLOOR:
-        return None
+        # gate: a confident opposing microstructure read vetoes the signal
+        if micro["direction"] is not None and micro["direction"] != net_direction and micro["strength"] >= MICRO_AGREEMENT_FLOOR:
+            return None
 
-    # gate: an actual wick-rejection against the proposed direction vetoes it,
-    # even if other sources outweighed it
-    if cr_hit is not None and cr_hit[1] != net_direction:
-        return None
+        # gate: an actual wick-rejection against the proposed direction vetoes it,
+        # even if other sources outweighed it
+        if cr_hit is not None and cr_hit[1] != net_direction:
+            return None
 
     sources = [v.source for v in contributing]
     total_possible = sum(v.weight for v in votes) or 1.0
@@ -185,12 +201,12 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
     confidence = 0.6 * measured + 0.4 * structural_weight
     confidence = max(0.0, min(1.0, confidence))
 
-    if confidence < config.MIN_CONFIDENCE:
-        return None
-    if structural_weight < config.QUALITY_FLOOR:
-        return None
+    if not used_fallback:
+        if confidence < config.MIN_CONFIDENCE:
+            return None
+        if structural_weight < config.QUALITY_FLOOR:
+            return None
 
-    _last_signal_ts[pair] = now
     return Decision(
         direction=net_direction,
         confidence=round(confidence, 3),

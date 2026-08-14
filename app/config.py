@@ -41,6 +41,12 @@ QUOTEX_USER_AGENT = os.getenv("QUOTEX_USER_AGENT", "")
 # email/password login automatically (see quotex_client.auth_mode()).
 QUOTEX_SESSION_FAILURE_THRESHOLD = int(os.getenv("QUOTEX_SESSION_FAILURE_THRESHOLD", "3"))
 
+# Required passcode to hit POST /api/session (paste a fresh token from the
+# frontend without redeploying). The app is publicly reachable once
+# deployed, so this endpoint must not be left open to anyone who finds
+# the URL — if ADMIN_TOKEN is unset, /api/session refuses every request.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
 MIN_CONFIDENCE = _float("MIN_CONFIDENCE", 0.6)
 ALWAYS_SIGNAL = _bool("ALWAYS_SIGNAL", True)
 SIGNAL_COOLDOWN_SECONDS = _int("SIGNAL_COOLDOWN_SECONDS", 60)

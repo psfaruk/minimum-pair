@@ -4,9 +4,10 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from app import config, db, quotex_client
 from app.evaluator import run_evaluator
@@ -73,10 +74,35 @@ async def _bootstrap_feed() -> None:
             await asyncio.sleep(RETRY_BACKOFF_SECONDS)
 
 
+async def _restart_feed() -> None:
+    """Tears down whatever's currently running (old bootstrap retry loop,
+    old feed manager, old Quotex client) and starts fresh — used after a
+    new session token is pasted in via /api/session so it takes effect
+    immediately instead of waiting for the next natural reconnect."""
+    old_bootstrap_task = app_state.get("bootstrap_task")
+    if old_bootstrap_task is not None:
+        old_bootstrap_task.cancel()
+        try:
+            await old_bootstrap_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    old_manager = app_state.get("feed_manager")
+    if old_manager is not None:
+        await old_manager.stop()
+        app_state["feed_manager"] = None
+
+    await quotex_client.close_client()
+
+    app_state["quotex_connected"] = False
+    app_state["error"] = None
+    app_state["bootstrap_task"] = asyncio.create_task(_bootstrap_feed())
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await db.init_db()
-    asyncio.create_task(_bootstrap_feed())
+    app_state["bootstrap_task"] = asyncio.create_task(_bootstrap_feed())
     asyncio.create_task(run_evaluator(_on_graded))
     yield
 
@@ -96,6 +122,29 @@ async def status():
         "account_mode": config.QUOTEX_ACCOUNT_MODE,
         "auth_mode": quotex_client.auth_mode(),
     }
+
+
+class SessionUpdate(BaseModel):
+    admin_token: str
+    session_token: str
+    session_cookies: str = ""
+
+
+@app.post("/api/session")
+async def update_session(payload: SessionUpdate):
+    if not config.ADMIN_TOKEN or payload.admin_token != config.ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid admin passcode")
+
+    session_token = payload.session_token.strip()
+    if not session_token:
+        raise HTTPException(status_code=400, detail="session_token is required")
+
+    config.QUOTEX_SESSION_TOKEN = session_token
+    config.QUOTEX_SESSION_COOKIES = payload.session_cookies.strip()
+    quotex_client.reset_session_failures()
+
+    asyncio.create_task(_restart_feed())
+    return {"ok": True, "message": "Session updated — reconnecting in the background"}
 
 
 @app.get("/api/pairs")

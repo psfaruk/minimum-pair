@@ -166,3 +166,21 @@ class FeedManager:
                 # One bad iteration (e.g. a broadcast racing a client
                 # (re)connect) must not permanently kill this pair's stream.
                 logger.exception("Feed iteration error for %s, continuing", state.display_name)
+
+    async def stop(self) -> None:
+        """Cancels every pair's streaming task. Each _run_pair loop
+        captured its own `client` reference when it started, so simply
+        swapping the module-level Quotex client (e.g. after a session
+        update) would leave these tasks silently talking to the old,
+        stale connection — they have to be torn down and restarted
+        instead of just letting the client singleton change underneath
+        them."""
+        tasks = [state.task for state in self.pairs.values() if state.task is not None]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.pairs.clear()

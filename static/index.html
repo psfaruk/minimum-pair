@@ -78,6 +78,15 @@
       <div id="settingsError" class="error-text"></div>
     </div>
     <div class="card">
+      <div class="card-title">Update Session Token</div>
+      <div class="settings-note settings-note-tight">Paste a fresh token to reconnect immediately — no redeploy needed</div>
+      <input type="password" id="sessionAdminToken" placeholder="Admin passcode" class="session-input" autocomplete="off">
+      <input type="text" id="sessionToken" placeholder="Session token (SSID)" class="session-input" autocomplete="off">
+      <textarea id="sessionCookies" placeholder="Session cookies (optional, e.g. cf_clearance=...; laravel_session=...)" class="session-input session-textarea" autocomplete="off"></textarea>
+      <button id="sessionUpdateBtn" type="button" class="session-submit">Update &amp; Reconnect</button>
+      <div id="sessionUpdateStatus" class="settings-note"></div>
+    </div>
+    <div class="card">
       <div class="card-title">Tracked Pairs</div>
       <div id="settingsPairs" class="pair-list"></div>
     </div>

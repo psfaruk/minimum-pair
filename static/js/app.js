@@ -19,6 +19,17 @@ App.api = async (path) => {
   return res.json();
 };
 
+App.apiPost = async (path, body) => {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `${path} -> ${res.status}`);
+  return data;
+};
+
 App.allPairNames = () => [...App.state.pairs.forex, ...App.state.pairs.otc];
 
 App.refreshWinRates = async () => {
