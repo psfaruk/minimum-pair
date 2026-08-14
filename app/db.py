@@ -8,6 +8,12 @@ from app.config import DB_PATH
 
 _write_lock = asyncio.Lock()
 
+# DB_PATH can point at a mounted volume (e.g. Railway's /data) whose
+# parent directory exists on the filesystem but was never created *by
+# this process* — sqlite3.connect() doesn't create missing directories,
+# it only fails with the unhelpful "unable to open database file".
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 
 @contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
