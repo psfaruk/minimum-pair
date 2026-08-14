@@ -417,6 +417,19 @@ async def pattern_stats(pattern: str, pair: str) -> tuple[int, int]:
     return await asyncio.to_thread(_pattern_stats_sync, pattern, pair)
 
 
+def _all_pattern_stats_sync() -> dict[tuple[str, str], tuple[int, int]]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT pattern, pair, wins, losses FROM pattern_stats").fetchall()
+    return {(r["pattern"], r["pair"]): (r["wins"], r["losses"]) for r in rows}
+
+
+async def all_pattern_stats() -> dict[tuple[str, str], tuple[int, int]]:
+    """Every source's record, keyed by (source, pair). One query, because
+    the decision engine needs the whole table on every candle to weight
+    its votes."""
+    return await asyncio.to_thread(_all_pattern_stats_sync)
+
+
 def _pattern_performance_sync(pair: str | None) -> list[dict[str, Any]]:
     # pattern_stats only updates when a signal is *graded*, so on its own
     # it undercounts "how many signals has this source fired" while any

@@ -12,7 +12,6 @@ from app.candle_shape import body_ratio, candle_range, is_bull, lower_wick, tren
 Candle = dict[str, Any]
 
 PATTERN_NAME = "microstructure"
-PRIOR_WIN_RATE = 0.5  # deliberately no edge assumed; it's a noisy fallback, not a real edge source
 
 W_COLOR = 0.25
 W_BODY = 0.25

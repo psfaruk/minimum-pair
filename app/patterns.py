@@ -1,7 +1,12 @@
 """Candlestick pattern detectors. Each returns a (name, direction) tuple
-or None. `PRIOR_WIN_RATE` gives each pattern a starting structural prior —
-used as the confidence input until enough measured history (>=5 graded
-signals for that pattern+pair, see decision.py) takes over."""
+or None.
+
+These used to carry a PRIOR_WIN_RATE table — 0.52 for a doji, 0.57 for an
+engulfing, and so on — which decision.py turned directly into vote
+weight. Those numbers were folklore, never measured, and a backtest put
+several of them on the wrong side of 50%. A pattern's weight now comes
+from its own measured record on the pair it fired on (app/weights.py), so
+there is nothing left for a prior to do."""
 from typing import Any
 
 from app.candle_shape import (
@@ -16,21 +21,6 @@ from app.candle_shape import (
 )
 
 Candle = dict[str, Any]
-
-PRIOR_WIN_RATE: dict[str, float] = {
-    "doji_reversal": 0.52,
-    "tweezer_top": 0.55,
-    "tweezer_bottom": 0.55,
-    "harami_bull": 0.53,
-    "harami_bear": 0.53,
-    "wickwall": 0.58,
-    "marubozu": 0.56,
-    "hammer": 0.54,
-    "shooting_star": 0.54,
-    "engulfing_bull": 0.57,
-    "engulfing_bear": 0.57,
-}
-
 
 def _doji_reversal(candles: list[Candle]) -> tuple[str, str] | None:
     c = candles[-1]
@@ -130,15 +120,9 @@ _DETECTORS = [
 ]
 
 
-def detect(candles: list[Candle]) -> list[tuple[str, str, float]]:
+def detect(candles: list[Candle]) -> list[tuple[str, str]]:
     """Runs every detector against the most recent candle(s). Returns a
-    list of (pattern_name, direction, prior_win_rate)."""
+    list of (pattern_name, direction)."""
     if len(candles) < 3:
         return []
-    hits = []
-    for detector in _DETECTORS:
-        result = detector(candles)
-        if result is not None:
-            name, direction = result
-            hits.append((name, direction, PRIOR_WIN_RATE[name]))
-    return hits
+    return [result for detector in _DETECTORS if (result := detector(candles)) is not None]
