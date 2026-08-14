@@ -1,9 +1,10 @@
+import hashlib
 import logging
 import time
 
 from pyquotex.stable_api import Quotex
 
-from app import config, railway_control
+from app import config, db, railway_control
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +50,80 @@ _session_failure_count = 0
 # this way — they never touch the login page.
 _password_failure_count = 0
 _login_blocked_until = 0.0  # time.monotonic() deadline; 0 means "free to try"
+_last_failure_kind = ""  # why the last password login failed, for /api/status
+
+# Persisted copies of the above. Railway restarts this container on every
+# crash and redeploy, which is precisely when an in-memory backoff would
+# reset to zero and send a fresh login straight at a Cloudflare block —
+# the exact loop this whole module exists to prevent. So the backoff, and
+# the captured token itself, are written to the database and reloaded on
+# boot (see load_persisted_state()).
+_STATE_BLOCKED_UNTIL = "login_blocked_until"
+_STATE_FAILURE_COUNT = "login_failure_count"
+_STATE_FAILURE_KIND = "login_failure_kind"
+_STATE_CREDENTIALS_FINGERPRINT = "login_credentials_fingerprint"
+_STATE_TOKEN = "quotex_session_token"
+_STATE_COOKIES = "quotex_session_cookies"
+_STATE_USER_AGENT = "quotex_user_agent"
+
+# What a failed login is telling us. The three cases need very different
+# responses, and treating them all alike is what turns one bad login into
+# a blocked IP.
+FAILURE_TRANSIENT = "transient"
+FAILURE_CLOUDFLARE = "cloudflare_block"
+FAILURE_CREDENTIALS = "invalid_credentials"
+
+# Substrings of what Cloudflare's block/challenge pages (and the HTTP
+# errors pyquotex raises for them) look like by the time they reach us.
+_CLOUDFLARE_MARKERS = (
+    "cloudflare",
+    "cf-ray",
+    "just a moment",
+    "checking your browser",
+    "attention required",
+    "error 1020",
+    "access denied",
+    "captcha",
+    "http 403",
+    "http 429",
+    "http 503",
+)
+
+# Phrases Quotex uses when it has actually rejected the credentials.
+# Deliberately narrow: misreading a network hiccup as "bad password"
+# would park logins for hours, so anything unrecognised stays transient.
+_CREDENTIAL_MARKERS = (
+    "do not match our records",
+    "does not match our records",
+    "incorrect email",
+    "incorrect password",
+    "invalid email",
+    "invalid password",
+    "email or password",
+    "wrong password",
+)
 
 
 class LoginBackoffError(ConnectionError):
     """Raised instead of attempting a password login that is still
     inside its Cloudflare-avoiding backoff window."""
+
+
+def _classify_failure(reason: str) -> str:
+    text = (reason or "").lower()
+    if any(marker in text for marker in _CLOUDFLARE_MARKERS):
+        return FAILURE_CLOUDFLARE
+    if any(marker in text for marker in _CREDENTIAL_MARKERS):
+        return FAILURE_CREDENTIALS
+    return FAILURE_TRANSIENT
+
+
+def _credentials_fingerprint() -> str:
+    """Identifies the current credentials without storing them. Lets a
+    corrected email/password clear a backoff that was parked because the
+    broker rejected the old ones."""
+    raw = f"{config.QUOTEX_EMAIL}:{config.QUOTEX_PASSWORD}".encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
 
 
 def auth_mode() -> str:
@@ -82,12 +152,111 @@ def retry_delay_seconds(default: float) -> float:
     return max(default, login_backoff_seconds_remaining())
 
 
-def _backoff_seconds_for(failure_count: int) -> int:
-    """Base delay doubled per consecutive failure, capped at the max."""
+def last_failure_kind() -> str:
+    return _last_failure_kind
+
+
+def _backoff_seconds_for(failure_count: int, kind: str = FAILURE_TRANSIENT) -> int:
+    """How long to wait before the next password login, given how many
+    have failed in a row and what the last one actually failed with."""
     if failure_count <= 0:
         return 0
-    doubled = config.LOGIN_BACKOFF_BASE_SECONDS * (2 ** (failure_count - 1))
-    return int(min(doubled, config.LOGIN_BACKOFF_MAX_SECONDS))
+    if kind == FAILURE_CREDENTIALS:
+        # Doubling is pointless here — the credentials are wrong until a
+        # human changes them, and a changed email/password clears this
+        # immediately via the fingerprint check.
+        return config.LOGIN_BACKOFF_CREDENTIALS_SECONDS
+    if kind == FAILURE_CLOUDFLARE:
+        base, cap = config.LOGIN_BACKOFF_CLOUDFLARE_SECONDS, config.LOGIN_BACKOFF_CLOUDFLARE_MAX_SECONDS
+    else:
+        base, cap = config.LOGIN_BACKOFF_BASE_SECONDS, config.LOGIN_BACKOFF_MAX_SECONDS
+    return int(min(base * (2 ** (failure_count - 1)), cap))
+
+
+async def _save_auth_state() -> None:
+    """Persists the backoff so a restart inherits it instead of walking
+    straight back into the login page."""
+    blocked_for = max(0.0, _login_blocked_until - time.monotonic())
+    try:
+        await db.set_state(
+            {
+                _STATE_BLOCKED_UNTIL: str(int(time.time() + blocked_for)),
+                _STATE_FAILURE_COUNT: str(_password_failure_count),
+                _STATE_FAILURE_KIND: _last_failure_kind,
+                _STATE_CREDENTIALS_FINGERPRINT: _credentials_fingerprint(),
+            }
+        )
+    except Exception:
+        # Losing the backoff to a storage problem is bad, but taking the
+        # app down over it is worse.
+        logger.exception("Could not persist login backoff state")
+
+
+async def _save_session_state() -> None:
+    """Persists the captured session so a restart reuses the token even
+    when Railway's API isn't configured (needs DB_PATH on a volume)."""
+    try:
+        await db.set_state(
+            {
+                _STATE_TOKEN: config.QUOTEX_SESSION_TOKEN,
+                _STATE_COOKIES: config.QUOTEX_SESSION_COOKIES,
+                _STATE_USER_AGENT: config.QUOTEX_USER_AGENT,
+            }
+        )
+    except Exception:
+        logger.exception("Could not persist captured session to the database")
+
+
+async def load_persisted_state() -> None:
+    """Restores the backoff and the last captured session on boot.
+
+    Without this, Railway's restart policy is a backoff-reset button: the
+    container dies, comes back with a clean counter, and logs in again
+    immediately — which is how a handful of failures becomes a
+    Cloudflare block.
+    """
+    global _password_failure_count, _login_blocked_until, _last_failure_kind
+
+    try:
+        state = await db.get_state(
+            _STATE_BLOCKED_UNTIL,
+            _STATE_FAILURE_COUNT,
+            _STATE_FAILURE_KIND,
+            _STATE_CREDENTIALS_FINGERPRINT,
+            _STATE_TOKEN,
+            _STATE_COOKIES,
+            _STATE_USER_AGENT,
+        )
+    except Exception:
+        logger.exception("Could not read persisted auth state — starting with a clean slate")
+        return
+
+    # Env vars win: a token pasted into Railway (by hand or by this app's
+    # own write-back) is newer than whatever the database remembers.
+    if not config.QUOTEX_SESSION_TOKEN and state.get(_STATE_TOKEN):
+        config.QUOTEX_SESSION_TOKEN = state[_STATE_TOKEN]
+        config.QUOTEX_SESSION_COOKIES = state.get(_STATE_COOKIES, "")
+        config.QUOTEX_USER_AGENT = state.get(_STATE_USER_AGENT, "") or config.QUOTEX_USER_AGENT
+        logger.info("Restored a session token from the database — no login needed to start")
+
+    stored_fingerprint = state.get(_STATE_CREDENTIALS_FINGERPRINT, "")
+    if stored_fingerprint and stored_fingerprint != _credentials_fingerprint():
+        logger.info("QUOTEX_EMAIL/QUOTEX_PASSWORD changed since the last failure — clearing the login backoff")
+        await _save_auth_state()
+        return
+
+    _password_failure_count = int(state.get(_STATE_FAILURE_COUNT, "0") or 0)
+    _last_failure_kind = state.get(_STATE_FAILURE_KIND, "")
+    blocked_until_wall = int(state.get(_STATE_BLOCKED_UNTIL, "0") or 0)
+    remaining = blocked_until_wall - time.time()
+    if remaining > 0:
+        _login_blocked_until = time.monotonic() + remaining
+        logger.warning(
+            "Restored login backoff from a previous boot: %d consecutive failures (%s), %ds still to wait",
+            _password_failure_count,
+            _last_failure_kind or "unknown",
+            int(remaining),
+        )
 
 
 def reset_session_failures() -> None:
@@ -97,11 +266,12 @@ def reset_session_failures() -> None:
     _session_failure_count = 0
 
 
-def _record_connect_failure(use_session: bool) -> None:
+async def _record_connect_failure(use_session: bool, reason: str) -> None:
     """Books one failed connect attempt against whichever credential path
     it used. A dead token eventually forces a password login; a failed
-    password login parks the next attempt behind a growing backoff."""
-    global _session_failure_count, _password_failure_count, _login_blocked_until
+    password login parks the next attempt behind a backoff sized by what
+    actually went wrong."""
+    global _session_failure_count, _password_failure_count, _login_blocked_until, _last_failure_kind
 
     if use_session:
         _session_failure_count += 1
@@ -114,14 +284,34 @@ def _record_connect_failure(use_session: bool) -> None:
         return
 
     _password_failure_count += 1
-    backoff = _backoff_seconds_for(_password_failure_count)
+    _last_failure_kind = _classify_failure(reason)
+    backoff = _backoff_seconds_for(_password_failure_count, _last_failure_kind)
     _login_blocked_until = time.monotonic() + backoff
-    logger.warning(
-        "Password login failed %d time(s) in a row — not retrying for %ds "
-        "(repeated logins from this IP are what trips the Cloudflare block)",
-        _password_failure_count,
-        backoff,
-    )
+
+    if _last_failure_kind == FAILURE_CLOUDFLARE:
+        logger.error(
+            "Login was blocked by Cloudflare (failure %d) — waiting %ds before trying again. "
+            "Retrying sooner only extends the block; set QUOTEX_LOGIN_PROXY or paste a token "
+            "from a browser via the Settings tab to get running immediately.",
+            _password_failure_count,
+            backoff,
+        )
+    elif _last_failure_kind == FAILURE_CREDENTIALS:
+        logger.error(
+            "Quotex rejected the credentials (failure %d) — waiting %ds. Fix QUOTEX_EMAIL / "
+            "QUOTEX_PASSWORD; the wait clears as soon as they change.",
+            _password_failure_count,
+            backoff,
+        )
+    else:
+        logger.warning(
+            "Password login failed %d time(s) in a row — not retrying for %ds "
+            "(repeated logins from this IP are what trips the Cloudflare block)",
+            _password_failure_count,
+            backoff,
+        )
+
+    await _save_auth_state()
 
 
 def _capture_session(client: Quotex) -> bool:
@@ -152,7 +342,7 @@ async def get_client() -> Quotex:
     pyquotex's own ReconnectPolicy (enabled by default) handles dropped
     connections and re-subscribes active streams automatically.
     """
-    global _client, _session_failure_count, _password_failure_count, _login_blocked_until
+    global _client, _session_failure_count, _password_failure_count, _login_blocked_until, _last_failure_kind
     if _client is not None and await _client.check_connect():
         return _client
 
@@ -161,10 +351,13 @@ async def get_client() -> Quotex:
     if not use_session:
         remaining = login_backoff_seconds_remaining()
         if remaining > 0:
+            detail = {
+                FAILURE_CLOUDFLARE: "Cloudflare blocked the last login",
+                FAILURE_CREDENTIALS: "Quotex rejected these credentials",
+            }.get(_last_failure_kind, "avoiding a Cloudflare block on repeated logins")
             raise LoginBackoffError(
                 f"Password login is backed off for another {remaining}s "
-                f"after {_password_failure_count} consecutive failures "
-                "(avoiding a Cloudflare block on repeated logins)"
+                f"after {_password_failure_count} consecutive failures ({detail})"
             )
         if not (config.QUOTEX_EMAIL and config.QUOTEX_PASSWORD):
             raise ConnectionError(
@@ -176,6 +369,11 @@ async def get_client() -> Quotex:
         password=config.QUOTEX_PASSWORD,
         lang=config.QUOTEX_LANG,
         root_path=str(config.SESSION_ROOT),
+        # Only the login's HTTP traffic goes through this; the websocket
+        # still runs over the service's own connection. It exists so a
+        # Cloudflare-blocked egress IP doesn't leave the app with no way
+        # back in.
+        proxies=config.QUOTEX_LOGIN_PROXY or None,
     )
 
     if use_session:
@@ -209,12 +407,14 @@ async def get_client() -> Quotex:
 
     try:
         ok, reason = await client.connect()
-    except Exception:
-        # A raised error (DNS, TLS, Cloudflare closing the connection) is
-        # just as much a failed attempt as a False return, and on the
-        # password path it has to count toward the backoff too — otherwise
-        # the retry loop keeps hitting the login page at full speed.
-        _record_connect_failure(use_session)
+    except Exception as e:
+        # A raised error (DNS, TLS, or the HTTP 403 pyquotex raises for a
+        # Cloudflare block page) is just as much a failed attempt as a
+        # False return, and on the password path it has to count toward
+        # the backoff too — otherwise the retry loop keeps hitting the
+        # login page at full speed. It also carries the clearest
+        # signal of *why*, so it feeds the classifier.
+        await _record_connect_failure(use_session, f"{type(e).__name__}: {e}")
         raise
 
     if not ok:
@@ -232,7 +432,7 @@ async def get_client() -> Quotex:
                 ok = True
                 break
         if not ok:
-            _record_connect_failure(use_session)
+            await _record_connect_failure(use_session, reason)
             raise ConnectionError(f"Quotex login failed: {reason}")
         logger.info("Connected after %.1fs grace period", CONNECT_GRACE_SECONDS - (deadline - time.monotonic()))
 
@@ -241,11 +441,15 @@ async def get_client() -> Quotex:
     else:
         _password_failure_count = 0
         _login_blocked_until = 0.0
+        _last_failure_kind = ""
+        await _save_auth_state()
         # A password login is the one thing that must not have to happen
-        # twice: capture what it produced and push it somewhere that
-        # survives this process before doing anything else with the
-        # connection.
+        # twice: capture what it produced and store it in both places
+        # that outlive this process — the database (instant, works
+        # without any Railway credentials) and the service's own Railway
+        # variables — before doing anything else with the connection.
         if _capture_session(client):
+            await _save_session_state()
             await railway_control.persist_session(
                 config.QUOTEX_SESSION_TOKEN,
                 config.QUOTEX_SESSION_COOKIES,
@@ -281,6 +485,27 @@ async def resolve_asset_codes() -> dict[str, str]:
                 candidates,
             )
     return resolved
+
+
+async def set_manual_session(token: str, cookies: str) -> None:
+    """Takes a token pasted in via /api/session. Stored like a captured
+    one so a restart keeps using it, and it clears the failure streak —
+    a human-supplied token deserves a clean slate."""
+    config.QUOTEX_SESSION_TOKEN = token
+    config.QUOTEX_SESSION_COOKIES = cookies
+    reset_session_failures()
+    await _save_session_state()
+
+
+async def is_connected() -> bool:
+    """Whether the singleton client is currently authenticated. Used by
+    the watchdog — unlike get_client() it never tries to reconnect."""
+    if _client is None:
+        return False
+    try:
+        return await _client.check_connect()
+    except Exception:
+        return False
 
 
 async def close_client() -> None:

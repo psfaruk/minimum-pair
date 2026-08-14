@@ -67,6 +67,24 @@ def _init_sync() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_signals_result ON signals(result)"
         )
+        # Small key/value store for state that has to outlive the
+        # process. The login backoff lives here for a specific reason:
+        # Railway restarts this container on every crash and redeploy, so
+        # an in-memory backoff counter resets to zero exactly when the
+        # app is at its most likely to hammer the Cloudflare-guarded
+        # login page. Persisted, a boot inherits the wait it was already
+        # serving. The captured session token lives here too, so the
+        # token survives a restart even when Railway's API isn't
+        # configured (given a mounted volume for DB_PATH).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS pattern_stats (
@@ -82,6 +100,43 @@ def _init_sync() -> None:
 
 async def init_db() -> None:
     await asyncio.to_thread(_init_sync)
+
+
+def _get_state_sync(keys: tuple[str, ...]) -> dict[str, str]:
+    with _connect() as conn:
+        placeholders = ",".join("?" for _ in keys)
+        rows = conn.execute(
+            f"SELECT key, value FROM app_state WHERE key IN ({placeholders})", keys
+        ).fetchall()
+    return {r["key"]: r["value"] for r in rows}
+
+
+async def get_state(*keys: str) -> dict[str, str]:
+    """Reads persisted key/value state. Missing keys are simply absent."""
+    if not keys:
+        return {}
+    return await asyncio.to_thread(_get_state_sync, keys)
+
+
+def _set_state_sync(values: dict[str, str]) -> None:
+    now = int(time.time())
+    with _connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            [(k, v, now) for k, v in values.items()],
+        )
+
+
+async def set_state(values: dict[str, str]) -> None:
+    """Writes persisted key/value state. Written as one transaction so a
+    restart never sees half of a backoff update."""
+    if not values:
+        return
+    async with _write_lock:
+        await asyncio.to_thread(_set_state_sync, values)
 
 
 def _insert_candle_sync(pair: str, ts: int, o: float, h: float, l: float, c: float) -> None:

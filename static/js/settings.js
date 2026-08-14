@@ -67,6 +67,7 @@ App.tabs.settings = {
       s.auth_mode === "session_token" ? "session token" : "email/password";
     document.getElementById("settingsLoginBackoff").textContent = this.describeBackoff(s);
     document.getElementById("settingsPersistence").textContent = this.describePersistence(s.session_persistence);
+    document.getElementById("settingsFeedHealth").textContent = this.describeFeedHealth(s);
     document.getElementById("settingsMinConf").textContent = (s.min_confidence * 100).toFixed(0) + "%";
     document.getElementById("settingsAlwaysSignal").textContent = s.always_signal ? "on" : "off";
     this._active = s.active_pairs || [];
@@ -80,7 +81,19 @@ App.tabs.settings = {
     const mins = Math.floor(remaining / 60);
     const secs = remaining % 60;
     const left = mins ? `${mins}m ${secs}s` : `${secs}s`;
-    return `${left} left after ${failures} failed login${failures === 1 ? "" : "s"}`;
+    const why = {
+      cloudflare_block: "Cloudflare blocked the login",
+      invalid_credentials: "Quotex rejected the credentials",
+    }[s.last_login_failure];
+    const reason = why ? ` — ${why}` : "";
+    return `${left} left after ${failures} failed login${failures === 1 ? "" : "s"}${reason}`;
+  },
+
+  describeFeedHealth(s) {
+    const reconnects = s.reconnects || 0;
+    const suffix = reconnects ? ` (${reconnects} auto-reconnect${reconnects === 1 ? "" : "s"})` : "";
+    if (s.feed_stale_seconds === null || s.feed_stale_seconds === undefined) return `not streaming${suffix}`;
+    return `last tick ${s.feed_stale_seconds}s ago${suffix}`;
   },
 
   describePersistence(p) {

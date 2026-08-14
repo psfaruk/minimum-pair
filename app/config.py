@@ -50,6 +50,29 @@ QUOTEX_SESSION_FAILURE_THRESHOLD = int(os.getenv("QUOTEX_SESSION_FAILURE_THRESHO
 LOGIN_BACKOFF_BASE_SECONDS = _int("LOGIN_BACKOFF_BASE_SECONDS", 300)
 LOGIN_BACKOFF_MAX_SECONDS = _int("LOGIN_BACKOFF_MAX_SECONDS", 3600)
 
+# Not every failed login deserves the same wait. Once Cloudflare has
+# actually blocked this IP, retrying soon just extends the block, so a
+# recognised block waits far longer than an ordinary network failure.
+LOGIN_BACKOFF_CLOUDFLARE_SECONDS = _int("LOGIN_BACKOFF_CLOUDFLARE_SECONDS", 3600)
+LOGIN_BACKOFF_CLOUDFLARE_MAX_SECONDS = _int("LOGIN_BACKOFF_CLOUDFLARE_MAX_SECONDS", 21600)
+# Credentials the broker actively rejected will not start working on
+# their own, and retrying them is pure Cloudflare-block fuel — so wait
+# long enough that a human can fix the variables, but still retry
+# eventually in case the message was misread.
+LOGIN_BACKOFF_CREDENTIALS_SECONDS = _int("LOGIN_BACKOFF_CREDENTIALS_SECONDS", 21600)
+
+# Optional HTTP(S) proxy used *only* for the email/password login, e.g.
+# "http://user:pass@host:port". This is the escape hatch for an egress IP
+# Cloudflare has already blocked: the login goes out through the proxy
+# while the websocket keeps using Railway's own connection.
+QUOTEX_LOGIN_PROXY = os.getenv("QUOTEX_LOGIN_PROXY", "")
+
+# A session token can die mid-run — the websocket simply stops
+# delivering ticks. The watchdog notices that silence and rebuilds the
+# connection (token first, password login only if the token is done).
+CONNECTION_WATCHDOG_SECONDS = _int("CONNECTION_WATCHDOG_SECONDS", 60)
+STALE_FEED_SECONDS = _int("STALE_FEED_SECONDS", 300)
+
 # --- Railway self-persistence -------------------------------------------
 # When a password login succeeds, the freshly captured session is written
 # back into this service's own Railway variables so the next boot reuses
@@ -72,6 +95,11 @@ RAILWAY_SERVICE_ID = os.getenv("RAILWAY_SERVICE_ID", "")
 # works end-to-end. Railway may already redeploy on a variable change;
 # set this to 0 if you'd rather not stack a second deploy on top.
 RAILWAY_REDEPLOY_AFTER_LOGIN = _bool("RAILWAY_REDEPLOY_AFTER_LOGIN", True)
+# Guard against a redeploy loop: if a persisted token turns out not to
+# work, the boot-fail-login-persist-redeploy cycle would repeat forever,
+# spending a password login each time. No second redeploy inside this
+# window (persisted, so it survives the restart it just caused).
+RAILWAY_REDEPLOY_MIN_INTERVAL_SECONDS = _int("RAILWAY_REDEPLOY_MIN_INTERVAL_SECONDS", 900)
 
 # Required passcode to hit POST /api/session (paste a fresh token from the
 # frontend without redeploying). The app is publicly reachable once

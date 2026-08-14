@@ -960,8 +960,14 @@ class QuotexAPI:
 
     @property
     def login(self) -> Login:
-        """Returns the Login action handler."""
-        return Login(self)
+        """Returns the Login action handler.
+
+        The configured proxies are handed to the underlying Browser so
+        the sign-in request can leave through a different egress IP than
+        the websocket — without this, the ``proxies`` constructor
+        argument never reached the one request that needs it.
+        """
+        return Login(self, proxies=self.proxies)
 
     @property
     def ssid(self) -> Ssid:
