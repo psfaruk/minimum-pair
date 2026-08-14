@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app import config, db, quotex_client, railway_control
+from app import backtest, config, db, quotex_client, railway_control
 from app.evaluator import run_evaluator
 from app.feed import FeedManager
 
@@ -249,6 +249,21 @@ async def live_signals(tier: str | None = None):
 @app.get("/api/patterns")
 async def patterns(pair: str | None = None):
     return await db.pattern_performance(pair)
+
+
+@app.get("/api/backtest")
+async def backtest_endpoint(pair: str | None = None, limit: int = 5000):
+    """Scores every strategy independently against the stored candles.
+
+    Unlike /api/patterns — which only sees sources that made it onto a
+    fired signal — this asks each source in isolation whether it was
+    right, on identical data, so the numbers are comparable and the
+    weight each has earned is visible. Read-only.
+    """
+    limit = max(100, min(limit, 20000))
+    if pair:
+        return {"pairs": [await backtest.backtest_pair(pair, limit)], "across_pairs": []}
+    return await backtest.backtest_all(limit)
 
 
 @app.get("/api/candles")

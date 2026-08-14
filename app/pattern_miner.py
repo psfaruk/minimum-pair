@@ -15,11 +15,10 @@ if it passes two statistical bars:
 
 Retrains per pair every RETRAIN_EVERY newly closed candles.
 """
-import math
 from typing import Any
 
 from app.candle_shape import body_ratio, is_bull
-from app.stats import wilson_lower_bound
+from app.stats import binom_p_value_one_sided, fdr_pass_mask, wilson_lower_bound
 
 Candle = dict[str, Any]
 
@@ -52,29 +51,6 @@ def _sequence_key(candles: list[Candle]) -> str:
     return "-".join(_encode_candle(c) for c in candles)
 
 
-def _binom_p_value_one_sided(wins: int, n: int, p: float = 0.5) -> float:
-    """P(X >= wins) under Binomial(n, p) — tests whether the majority
-    direction's hit rate is better than a coin flip."""
-    return sum(math.comb(n, k) * (p**k) * ((1 - p) ** (n - k)) for k in range(wins, n + 1))
-
-
-def _fdr_pass_mask(p_values: list[float], alpha: float = FDR_ALPHA) -> list[bool]:
-    """Benjamini-Hochberg: pass[i] True if hypothesis i survives FDR
-    correction across all hypotheses tested together."""
-    n = len(p_values)
-    if n == 0:
-        return []
-    order = sorted(range(n), key=lambda i: p_values[i])
-    max_rank = 0
-    for rank, idx in enumerate(order, start=1):
-        if p_values[idx] <= (rank / n) * alpha:
-            max_rank = rank
-    passed = [False] * n
-    for rank, idx in enumerate(order, start=1):
-        passed[idx] = rank <= max_rank
-    return passed
-
-
 def _mine(candles: list[Candle]) -> dict[str, dict[str, Any]]:
     occurrences: dict[str, list[bool]] = {}  # key -> [True if the graded outcome was CALL]
     for i in range(SEQUENCE_LENGTH - 1, len(candles) - 1):
@@ -103,13 +79,13 @@ def _mine(candles: list[Candle]) -> dict[str, dict[str, Any]]:
         downs = n - ups
         direction = "CALL" if ups >= downs else "PUT"
         wins = ups if direction == "CALL" else downs
-        p_value = _binom_p_value_one_sided(wins, n)
+        p_value = binom_p_value_one_sided(wins, n)
         candidates.append({"key": key, "direction": direction, "wins": wins, "n": n, "p_value": p_value})
 
     if not candidates:
         return {}
 
-    passed_mask = _fdr_pass_mask([c["p_value"] for c in candidates])
+    passed_mask = fdr_pass_mask([c["p_value"] for c in candidates], FDR_ALPHA)
 
     library: dict[str, dict[str, Any]] = {}
     for candidate, passed in zip(candidates, passed_mask):

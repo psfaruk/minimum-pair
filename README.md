@@ -132,3 +132,64 @@ from the corrected history. Nothing is discarded.
 These fixes make the reported numbers true; they do not create an edge.
 On edge-free data the engine now scores 50.0% — exactly what an honest
 pipeline should, and exactly what a strategy with no edge should.
+
+## Where a strategy's weight comes from
+
+Every weight used to be a number somebody typed. Indicators got 0.8–1.2,
+candlestick patterns got 0.10–0.32 (derived from invented "prior win
+rates" such as 0.52 for a doji or 0.75 for a candle reaction), and the
+two scales were then summed against each other — so one SMA crossover
+outvoted ten doji reversals by construction, whatever either had actually
+done.
+
+There is now one rule for every source (`app/weights.py`):
+
+- **Unmeasured sources all weigh the same.** A new pair starts with an
+  honest tie instead of a hierarchy nobody verified.
+- **A measured source weighs what it earned**, from its record *on that
+  pair* — a pattern that works on EUR/USD has no claim on USD/BDT OTC.
+- **The estimate is shrunk toward 50%** by 30 pseudo-trades, so a 3-for-4
+  start can't promote anything.
+- **No source is ever weighted to zero.** A silent source stops appearing
+  on signals, so it stops being graded, and could never recover — the
+  trap the old "drop below 42%" rule created.
+
+Expect fewer `confirmed` signals at first: with equal weights the votes
+often tie, and a tie honestly means "no confirmation". They come back as
+sources accumulate records and separate from each other.
+
+## Testing a strategy: `/api/backtest`
+
+`/api/patterns` only sees sources that made it onto a fired signal, in
+whatever direction the combined vote settled on. `/api/backtest` replays
+the stored candles and asks each source in isolation: when *you alone*
+said CALL, did the next candle close higher?
+
+```
+GET  /api/backtest                      # every pair, plus a cross-pair summary
+GET  /api/backtest?pair=EUR/USD&limit=5000
+python -m app.backtest --pair "EUR/USD" # same thing from the shell
+```
+
+It is read-only — no signals written, no `pattern_stats` touched, and the
+miner trains into a local library so a run can't disturb the live one.
+
+Three guards stand between a number and the word "edge", because without
+them the tool invents edges on data that provably has none:
+
+1. **A clustering-aware p-value.** Results arrive in runs, so the
+   binomial test — which assumes independent trials — reported p=1e-05
+   for a 63% hit rate that was pure coin flips. The p-value comes from
+   block sign-flip randomisation instead.
+2. **FDR correction across the batch.** Screening ~28 sources at 95%
+   confidence produces one or two "significant" results every time.
+3. **Consistency across sequential folds**, so one lucky stretch can't
+   carry the whole period.
+
+Even so, on driftless random walks about one run in six produced a source
+that cleared all three — because everything within one pair is measured
+on a single price path, and a path can simply favour a strategy. **The
+`across_pairs` summary is the real test**: separate pairs are separate
+paths, so a source with an edge on several is evidence, while a source
+that shines on exactly one is that same lucky path in a nicer suit. On
+six independent edge-free paths, no source cleared two.

@@ -3,27 +3,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from app import candle_reaction, config, db, microstructure, pattern_miner, patterns
-from app import stats as stats_lib
+from app import candle_reaction, config, db, microstructure, pattern_miner, patterns, weights
 
-# Structural-prior patterns/sources get scaled into a vote weight the same
-# way: (prior_win_rate - 0.5) * 4, floored at 0.1. A 0.75 prior (candle
-# reaction, the strongest source in the spec) lands near weight 1.0; a
-# 0.52 prior barely nudges the vote at all.
 MICRO_AGREEMENT_FLOOR = 0.30  # microstructure must be this confident to veto
 MICRO_FALLBACK_FLOOR = 0.15  # microstructure must be at least this confident to act as fallback
 
-# Sources that keep losing should stop being trusted — but the previous
-# rule (drop anything under 42% once it has 15 graded signals) was an
-# absorbing trap, not a filter. A perfectly fair 50% source hits that
-# threshold 30% of the time at n=15, and a dropped source never fires
-# again, so it can never accumulate the evidence that would clear it.
-# Two changes fix that: the test is now "is the whole 95% interval below
-# breakeven" rather than a point estimate, and the penalty is a weight
-# reduction, so a demoted source keeps a small voice and can earn its way
-# back out.
-LEARN_MIN_SAMPLES = 40
-DEMOTED_WEIGHT_MULTIPLIER = 0.25
 PATTERN_PERF_CACHE_TTL = 55.0
 
 # How much graded history a source needs before its measured rate is
@@ -34,7 +18,10 @@ CONFIDENCE_MIN_SAMPLES = 25
 TIER_CONFIRMED = "confirmed"
 TIER_NOISE = "noise"
 
-_pattern_perf_cache: dict[str, tuple[int, int]] = {}
+# (source, pair) -> (wins, losses). Per pair, because a pattern that
+# works on EUR/USD has no claim on USD/BDT OTC — they aren't the same
+# market and the old global tally quietly assumed they were.
+_pattern_perf_cache: dict[tuple[str, str], tuple[int, int]] = {}
 _pattern_perf_cache_ts: float = 0.0
 
 
@@ -43,23 +30,12 @@ async def _refresh_pattern_perf_cache() -> None:
     now = time.time()
     if now - _pattern_perf_cache_ts < PATTERN_PERF_CACHE_TTL:
         return
-    rows = await db.pattern_performance()
-    _pattern_perf_cache = {r["pattern"]: (r["wins"], r["losses"]) for r in rows}
+    _pattern_perf_cache = await db.all_pattern_stats()
     _pattern_perf_cache_ts = now
 
 
-def _is_confidently_losing(source: str) -> bool:
-    """True only when even the optimistic end of the 95% interval sits
-    below breakeven — i.e. this really is a losing source, not an unlucky
-    fair one."""
-    stats = _pattern_perf_cache.get(source)
-    if not stats:
-        return False
-    wins, losses = stats
-    total = wins + losses
-    if total < LEARN_MIN_SAMPLES:
-        return False
-    return stats_lib.wilson_upper_bound(wins, total) < 0.5
+def source_record(pair: str, source: str) -> tuple[int, int]:
+    return _pattern_perf_cache.get((source, pair), (0, 0))
 
 
 @dataclass
@@ -78,81 +54,84 @@ class Decision:
     tier: str  # TIER_CONFIRMED (passed the gates) or TIER_NOISE (ALWAYS_SIGNAL filler)
 
 
-async def _demote_learned_losers(votes: list[Vote]) -> list[Vote]:
-    """Shrinks the weight of sources with a proven losing record instead
-    of removing them, so a demoted source keeps producing the evidence
-    that could clear it."""
+async def _apply_measured_weights(pair: str, votes: list[Vote]) -> list[Vote]:
+    """Replaces each vote's placeholder weight with the one its record on
+    this pair has earned.
+
+    This is the only place a weight is decided. Sources with no history
+    all weigh the same, so a new pair starts with an honest tie rather
+    than a hierarchy someone typed in; sources with history are ranked by
+    what they actually did, shrunk toward no-edge so a short lucky run
+    can't promote one. Nothing is ever weighted to zero — a silent source
+    stops being graded, and would never get the chance to recover.
+    """
     await _refresh_pattern_perf_cache()
-    out = []
-    for v in votes:
-        if _is_confidently_losing(v.source):
-            out.append(Vote(v.direction, v.weight * DEMOTED_WEIGHT_MULTIPLIER, v.source))
-        else:
-            out.append(v)
-    return out
+    return [
+        Vote(v.direction, weights.weight_for(*source_record(pair, v.source)), v.source)
+        for v in votes
+    ]
 
 
-def _prior_to_weight(prior: float) -> float:
-    return max((prior - 0.5) * 4, 0.1)
-
-
+# Every source is born equal. The weight it actually votes with is
+# applied later, in _apply_measured_weights(), from its own record —
+# these constructors deliberately have no say in the matter.
 def _indicator_votes(ind: dict[str, Any]) -> list[Vote]:
     votes: list[Vote] = []
 
     rsi = ind.get("rsi")
     if rsi is not None:
         if rsi < 35:
-            votes.append(Vote("CALL", 1.0, "rsi_oversold"))
+            votes.append(Vote("CALL", weights.BASE_WEIGHT, "rsi_oversold"))
         elif rsi > 65:
-            votes.append(Vote("PUT", 1.0, "rsi_overbought"))
+            votes.append(Vote("PUT", weights.BASE_WEIGHT, "rsi_overbought"))
 
     dist = ind.get("ema_distance_atr")
     if dist is not None:
         if dist > 0.5:
-            votes.append(Vote("CALL", 0.8, "ema_trend_up"))
+            votes.append(Vote("CALL", weights.BASE_WEIGHT, "ema_trend_up"))
         elif dist < -0.5:
-            votes.append(Vote("PUT", 0.8, "ema_trend_down"))
+            votes.append(Vote("PUT", weights.BASE_WEIGHT, "ema_trend_down"))
 
     pb = ind.get("percent_b")
     if pb is not None:
         if pb <= 0.05:
-            votes.append(Vote("CALL", 1.0, "bb_lower_bounce"))
+            votes.append(Vote("CALL", weights.BASE_WEIGHT, "bb_lower_bounce"))
         elif pb >= 0.95:
-            votes.append(Vote("PUT", 1.0, "bb_upper_rejection"))
+            votes.append(Vote("PUT", weights.BASE_WEIGHT, "bb_upper_rejection"))
 
     if ind.get("sma_fresh_cross"):
         direction = "CALL" if ind.get("sma_cross") == "bullish" else "PUT"
-        votes.append(Vote(direction, 1.2, "sma_crossover"))
+        votes.append(Vote(direction, weights.BASE_WEIGHT, "sma_crossover"))
 
     close = ind.get("close")
     atr = ind.get("atr14")
     resistance, support = ind.get("resistance"), ind.get("support")
     if close is not None and atr:
         if resistance is not None and (resistance - close) < 0.3 * atr:
-            votes.append(Vote("PUT", 0.9, "near_resistance"))
+            votes.append(Vote("PUT", weights.BASE_WEIGHT, "near_resistance"))
         if support is not None and (close - support) < 0.3 * atr:
-            votes.append(Vote("CALL", 0.9, "near_support"))
+            votes.append(Vote("CALL", weights.BASE_WEIGHT, "near_support"))
 
     return votes
 
 
 def _pattern_votes(candles: list[dict[str, Any]]) -> list[Vote]:
-    return [Vote(direction, _prior_to_weight(prior), name) for name, direction, prior in patterns.detect(candles)]
+    return [Vote(direction, weights.BASE_WEIGHT, name) for name, direction in patterns.detect(candles)]
 
 
-def _candle_reaction_vote(hit: tuple[str, str, float] | None) -> Vote | None:
+def _candle_reaction_vote(hit: tuple[str, str] | None) -> Vote | None:
     if hit is None:
         return None
-    name, direction, prior = hit
-    return Vote(direction, _prior_to_weight(prior), name)
+    name, direction = hit
+    return Vote(direction, weights.BASE_WEIGHT, name)
 
 
 def _pattern_miner_vote(pair: str, candles: list[dict[str, Any]]) -> Vote | None:
     hit = pattern_miner.predict(pair, candles)
     if hit is None:
         return None
-    name, direction, win_rate = hit
-    return Vote(direction, _prior_to_weight(win_rate), name)
+    name, direction, _win_rate = hit
+    return Vote(direction, weights.BASE_WEIGHT, name)
 
 
 def _fallback_vote(candles: list[dict[str, Any]]) -> Vote:
@@ -165,7 +144,7 @@ def _fallback_vote(candles: list[dict[str, Any]]) -> Vote:
         direction = "CALL" if last["close"] > last["open"] else "PUT"
     else:
         direction = random.choice(["CALL", "PUT"])
-    return Vote(direction, 0.3, "fallback_color")
+    return Vote(direction, weights.BASE_WEIGHT, "fallback_color")
 
 
 async def _measured_win_rate(pair: str, sources: list[str]) -> tuple[float, int] | None:
@@ -221,7 +200,7 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
     if miner_vote:
         votes.append(miner_vote)
 
-    votes = await _demote_learned_losers(votes)
+    votes = await _apply_measured_weights(pair, votes)
 
     call_weight = sum(v.weight for v in votes if v.direction == "CALL")
     put_weight = sum(v.weight for v in votes if v.direction == "PUT")
