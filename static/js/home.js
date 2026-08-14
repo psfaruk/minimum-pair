@@ -43,8 +43,8 @@ App.tabs.home = {
     el.classList.remove("empty");
     el.innerHTML = `
       <div>
-        <div style="font-weight:600">${signal.pair}</div>
-        <div style="color:var(--text-dim);font-size:12px">${App.fmtTime(signal.entry_ts)} · conf ${(signal.confidence * 100).toFixed(0)}%</div>
+        <div style="font-weight:600">${signal.pair} ${App.tierBadge(signal.tier)}</div>
+        <div style="color:var(--text-dim);font-size:12px">${App.fmtTime(signal.entry_ts)} · ${App.fmtConf(signal.confidence)}</div>
       </div>
       <div style="display:flex;align-items:center;gap:8px">
         <span class="dir-badge ${signal.direction}">${signal.direction}</span>

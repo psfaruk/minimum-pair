@@ -35,11 +35,11 @@ App.tabs.history = {
     list.innerHTML = this.rows.map((s) => `
       <div class="history-row" data-id="${s.id}">
         <div class="left">
-          <span class="pair-name">${s.pair}</span>
+          <span class="pair-name">${s.pair} ${App.tierBadge(s.tier)}</span>
           <span class="time">${App.fmtTime(s.entry_ts)} · ${s.source}</span>
         </div>
         <div class="right">
-          <span class="conf">${(s.confidence * 100).toFixed(0)}%</span>
+          <span class="conf">${App.fmtConf(s.confidence)}</span>
           <span class="dir-badge ${s.direction}">${s.direction}</span>
           <span class="result-badge ${s.result}">${s.result}</span>
         </div>
