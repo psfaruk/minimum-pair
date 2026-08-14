@@ -1,4 +1,5 @@
 import random
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +11,51 @@ from app import candle_reaction, config, db, microstructure, pattern_miner, patt
 # 0.52 prior barely nudges the vote at all.
 MICRO_AGREEMENT_FLOOR = 0.30  # microstructure must be this confident to veto
 MICRO_FALLBACK_FLOOR = 0.15  # microstructure must be at least this confident to act as fallback
+
+# Backtest against the live signal history (1200+ graded) surfaced several
+# sources with a proven, sustained losing bias (e.g. rsi_overbought at
+# 33% over 21 samples) that nothing was stopping from firing again. This
+# is a live-updating version of the same idea the self-learned pattern
+# miner already applies to mined sequences: once a source has enough
+# track record to actually mean something, stop trusting it if it's
+# demonstrably below breakeven. Deliberately a simple threshold rather
+# than a Wilson-bound test here — that rigor matters for the miner
+# because it's testing hundreds of candidate sequences at once (real
+# multiple-testing risk); this is re-checking ~20 fixed, already-existing
+# indicators, so a plain threshold with a reasonable sample floor is
+# proportionate.
+LEARN_MIN_SAMPLES = 15
+LEARN_SUPPRESS_BELOW = 0.42
+PATTERN_PERF_CACHE_TTL = 55.0
+
+_pattern_perf_cache: dict[str, tuple[int, int]] = {}
+_pattern_perf_cache_ts: float = 0.0
+
+
+async def _refresh_pattern_perf_cache() -> None:
+    global _pattern_perf_cache, _pattern_perf_cache_ts
+    now = time.time()
+    if now - _pattern_perf_cache_ts < PATTERN_PERF_CACHE_TTL:
+        return
+    rows = await db.pattern_performance()
+    _pattern_perf_cache = {r["pattern"]: (r["wins"], r["losses"]) for r in rows}
+    _pattern_perf_cache_ts = now
+
+
+def _is_confidently_losing(source: str) -> bool:
+    stats = _pattern_perf_cache.get(source)
+    if not stats:
+        return False
+    wins, losses = stats
+    total = wins + losses
+    if total < LEARN_MIN_SAMPLES:
+        return False
+    return (wins / total) <= LEARN_SUPPRESS_BELOW
+
+
+async def _drop_learned_losers(votes: list[Vote]) -> list[Vote]:
+    await _refresh_pattern_perf_cache()
+    return [v for v in votes if not _is_confidently_losing(v.source)]
 
 
 @dataclass
@@ -144,6 +190,8 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
     miner_vote = _pattern_miner_vote(pair, candles)
     if miner_vote:
         votes.append(miner_vote)
+
+    votes = await _drop_learned_losers(votes)
 
     call_weight = sum(v.weight for v in votes if v.direction == "CALL")
     put_weight = sum(v.weight for v in votes if v.direction == "PUT")
