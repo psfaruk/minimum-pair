@@ -58,7 +58,7 @@ PORT = _int("PORT", 8000)
 
 CANDLE_PERIOD_SECONDS = 60
 
-DB_PATH = ROOT_DIR / "candles.db"
+DB_PATH = Path(os.getenv("DB_PATH")) if os.getenv("DB_PATH") else ROOT_DIR / "candles.db"
 SESSION_ROOT = ROOT_DIR  # pyquotex stores session.json here
 
 # display_name -> candidate Quotex asset codes, in preference order.
