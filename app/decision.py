@@ -99,6 +99,17 @@ def _indicator_votes(ind: dict[str, Any]) -> list[Vote]:
         elif pb >= 0.95:
             votes.append(Vote("PUT", weights.BASE_WEIGHT, "bb_upper_rejection"))
 
+    # Bollinger squeeze breakout — when bands are tight (low width) and
+    # price closes outside, the next candle typically continues in the
+    # breakout direction.
+    if ind.get("bb_squeeze") and ind.get("bb_upper") is not None and ind.get("bb_lower") is not None:
+        close = ind.get("close")
+        if close is not None:
+            if close > ind["bb_upper"]:
+                votes.append(Vote("CALL", weights.BASE_WEIGHT, "bb_squeeze_break_up"))
+            elif close < ind["bb_lower"]:
+                votes.append(Vote("PUT", weights.BASE_WEIGHT, "bb_squeeze_break_down"))
+
     if ind.get("sma_fresh_cross"):
         direction = "CALL" if ind.get("sma_cross") == "bullish" else "PUT"
         votes.append(Vote(direction, weights.BASE_WEIGHT, "sma_crossover"))
@@ -189,7 +200,7 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
     # that, and ALWAYS_SIGNAL means every pair fires every candle with
     # no exceptions, so a cooldown would only ever work against that.
 
-    cr_hit = candle_reaction.detect(candles)
+    cr_hit = candle_reaction.detect(candles, ind)
 
     votes = _indicator_votes(ind)
     votes.extend(_pattern_votes(candles))

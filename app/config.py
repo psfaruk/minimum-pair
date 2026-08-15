@@ -148,6 +148,33 @@ FOREX_PAIRS: dict[str, list[str]] = {
 
 ALL_PAIRS: dict[str, list[str]] = {**OTC_PAIRS, **FOREX_PAIRS}
 
+# Per-pair Quotex payout (fraction, e.g. 0.85 = 85%). Used by backtest.py
+# to compute the breakeven win rate (p_be = 1 / (1 + payout)) and the
+# payout-adjusted ROI per trade. These are conservative defaults based
+# on typical Quotex OTC payouts observed at 70-92% — override per pair
+# from the broker's payout table as needed.
+DEFAULT_PAIR_PAYOUT = 0.85
+PAIR_PAYOUT: dict[str, float] = {
+    # OTC exotic pairs typically have higher payouts (more broker edge)
+    "USD/BRL OTC": 0.92,
+    "USD/INR OTC": 0.90,
+    "USD/IDR OTC": 0.92,
+    "USD/COP OTC": 0.90,
+    "USD/BDT OTC": 0.92,
+    "USD/MXN OTC": 0.88,
+    "NZD/USD OTC": 0.85,
+    "USD/DZD OTC": 0.90,
+    "USD/PHP OTC": 0.88,
+    "USD/PKR OTC": 0.90,
+    "USD/ZAR OTC": 0.88,
+    # Major forex pairs have lower payouts (less broker edge)
+    "AUD/USD": 0.70,
+    "EUR/USD": 0.72,
+    "USD/JPY": 0.72,
+    "EUR/GBP": 0.70,
+    "GBP/USD": 0.72,
+}
+
 # Forex pairs are kept streaming at all times (subject to market hours);
 # OTC pairs stream on demand when a viewer requests them.
 ALWAYS_ON_DISPLAY_NAMES = list(FOREX_PAIRS.keys())

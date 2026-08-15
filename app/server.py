@@ -6,11 +6,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app import backtest, config, db, quotex_client, railway_control
+from app import backtest, config, db, patterns as patterns_module, quotex_client, railway_control
 from app.evaluator import run_evaluator
 from app.feed import FeedManager
 
@@ -160,6 +161,20 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# 2026-08 — Open public API.
+# Per the user requirement: "call put data signals যেনো অ্যাপ ইউআরএল
+# ব্যবহার করে, যে কেউ ফিচ করতে পারে। একেবারে ওপেন থাকবে।"
+# All GET /api/* read endpoints (signals, candles, history, backtest,
+# patterns, winrate) are intentionally left open without auth. The only
+# mutation endpoint (/api/session) still requires ADMIN_TOKEN.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/api/status")
 async def status():
@@ -279,6 +294,146 @@ async def history(pair: str | None = None, limit: int = 200):
 @app.get("/api/winrate")
 async def winrate(pair: str | None = None):
     return await db.win_rate(pair)
+
+
+# ---------------------------------------------------------------------------
+# Open public signal API — anyone can fetch the current CALL/PUT calls.
+# Per the user requirement: open URLs, no auth, suitable for external
+# bots/scripts to consume directly.
+# ---------------------------------------------------------------------------
+
+def _format_signal_row(r: dict) -> dict:
+    now = int(time.time())
+    return {
+        "pair": r["pair"],
+        "direction": r["direction"],
+        "confidence": r["confidence"],
+        "tier": r["tier"],
+        "result": r["result"],
+        "entry_ts": r["entry_ts"],
+        "target_close_ts": r["target_close_ts"],
+        "entry_price": r["entry_price"],
+        "close_price": r["close_price"],
+        "source": r["source"],
+        "sources": [s for s in (r["source"] or "").split(",") if s],
+        "created_at": r["created_at"],
+        "age_seconds": now - r["created_at"],
+        "stale": now - r["created_at"] > 3 * config.CANDLE_PERIOD_SECONDS,
+        "expires_in_seconds": max(0, r["target_close_ts"] - now),
+    }
+
+
+@app.get("/api/signals")
+async def signals_all(tier: str | None = None):
+    """All pairs' latest CALL/PUT signal, open to anyone.
+
+    Query params:
+      tier=confirmed  — only quality-gated signals
+      tier=noise      — only the ALWAYS_SIGNAL filler (no quality gate)
+
+    Each row includes:
+      pair, direction (CALL|PUT), confidence (0..1 or null),
+      tier (confirmed|noise), result (PENDING|WIN|LOSS|DRAW),
+      entry_ts, target_close_ts, entry_price, close_price,
+      source (comma-joined), sources (list), created_at, age_seconds,
+      stale (bool), expires_in_seconds (>=0).
+
+    This is the same payload as /api/live but with extra convenience
+    fields (sources list, expires_in_seconds) for direct bot/script use.
+    """
+    rows = await db.latest_signals()
+    out = [_format_signal_row(r) for r in rows if tier is None or r["tier"] == tier]
+    return {
+        "server_time": int(time.time()),
+        "candle_period_seconds": config.CANDLE_PERIOD_SECONDS,
+        "count": len(out),
+        "signals": out,
+    }
+
+
+@app.get("/api/signals/pair")
+async def signals_for_pair(pair: str):
+    """Latest signal for one specific pair, open to anyone.
+
+    Use as: GET /api/signals/pair?pair=EUR/USD
+    (We use a query param rather than a path param because pair names
+    like "EUR/USD" contain a slash, which FastAPI path params would
+    interpret as a URL separator.)
+
+    Returns 404 if the pair is unknown or has never produced a signal.
+    """
+    if pair not in config.ALL_PAIRS:
+        raise HTTPException(status_code=404, detail=f"unknown pair: {pair}")
+    rows = await db.latest_signals()
+    for r in rows:
+        if r["pair"] == pair:
+            return _format_signal_row(r)
+    raise HTTPException(status_code=404, detail=f"no signal yet for pair: {pair}")
+
+
+@app.get("/api/signals/history")
+async def signals_history(pair: str, limit: int = 100):
+    """Historical signals for one pair (newest first). Open to anyone.
+
+    Use as: GET /api/signals/history?pair=EUR/USD&limit=100
+    """
+    if pair not in config.ALL_PAIRS:
+        raise HTTPException(status_code=404, detail=f"unknown pair: {pair}")
+    limit = max(1, min(limit, 1000))
+    rows = await db.history(pair, limit)
+    return {
+        "pair": pair,
+        "count": len(rows),
+        "history": [_format_signal_row(r) for r in rows],
+    }
+
+
+@app.get("/api/strategies")
+async def strategies_registry():
+    """Open registry of every candlestick pattern the engine knows about.
+    Useful for documentation and for downstream consumers that want to
+    understand which sources are firing on their signals."""
+    return {
+        "patterns": patterns_module.PATTERN_REGISTRY,
+        "indicator_sources": [
+            {"name": "rsi_oversold",        "family": "indicator", "description": "RSI < 35 → CALL (oversold bounce)"},
+            {"name": "rsi_overbought",      "family": "indicator", "description": "RSI > 65 → PUT (overbought reversal)"},
+            {"name": "ema_trend_up",        "family": "indicator", "description": "Close > EMA50 + 0.5 ATR → CALL"},
+            {"name": "ema_trend_down",      "family": "indicator", "description": "Close < EMA50 - 0.5 ATR → PUT"},
+            {"name": "bb_lower_bounce",     "family": "indicator", "description": "%B ≤ 0.05 → CALL"},
+            {"name": "bb_upper_rejection",  "family": "indicator", "description": "%B ≥ 0.95 → PUT"},
+            {"name": "bb_squeeze_break_up",  "family": "indicator", "description": "Tight BB + close above upper → CALL"},
+            {"name": "bb_squeeze_break_down","family": "indicator", "description": "Tight BB + close below lower → PUT"},
+            {"name": "sma_crossover",       "family": "indicator", "description": "Fresh SMA(8)/SMA(21) cross"},
+            {"name": "near_resistance",     "family": "indicator", "description": "Close within 0.3 ATR of fractal resistance → PUT"},
+            {"name": "near_support",        "family": "indicator", "description": "Close within 0.3 ATR of fractal support → CALL"},
+        ],
+        "reaction_sources": [
+            {"name": "fractal_rejection_top",    "family": "reaction", "description": "Upper wick rejected at fractal swing high → PUT"},
+            {"name": "fractal_rejection_bottom", "family": "reaction", "description": "Lower wick rejected at fractal swing low → CALL"},
+            {"name": "ema_rejection_top",        "family": "reaction", "description": "Upper wick rejected at EMA50 → PUT"},
+            {"name": "ema_rejection_bottom",     "family": "reaction", "description": "Lower wick rejected at EMA50 → CALL"},
+            {"name": "bb_rejection_top",         "family": "reaction", "description": "Wick above BB upper, close inside → PUT"},
+            {"name": "bb_rejection_bottom",      "family": "reaction", "description": "Wick below BB lower, close inside → CALL"},
+            {"name": "round_number_rejection_top",    "family": "reaction", "description": "Upper wick rejected at round number → PUT"},
+            {"name": "round_number_rejection_bottom", "family": "reaction", "description": "Lower wick rejected at round number → CALL"},
+        ],
+        "microstructure_sources": [
+            {"name": "microstructure", "family": "microstructure", "description": "Blended candle color/body/wick/trend/streak score"},
+        ],
+        "mined_sources": [
+            {"name": "mined_*", "family": "mined", "description": "Self-learned 2-candle sequences promoted via FDR correction"},
+        ],
+        "fallback_sources": [
+            {"name": "fallback_color", "family": "fallback", "description": "ALWAYS_SIGNAL filler: previous candle's color (noise tier)"},
+        ],
+    }
+
+
+@app.get("/api/docs/openapi.json")
+async def openapi_json():
+    """Convenience redirect to FastAPI's built-in OpenAPI spec."""
+    return app.openapi()
 
 
 @app.websocket("/ws")
