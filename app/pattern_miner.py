@@ -131,7 +131,17 @@ def predict(pair: str, candles: list[Candle]) -> tuple[str, str, float] | None:
     library = _libraries.get(pair)
     if not library or len(candles) < SEQUENCE_LENGTH:
         return None
-    key = _sequence_key(candles[-SEQUENCE_LENGTH:])
+
+    window = candles[-SEQUENCE_LENGTH:]
+    # Training skips any window containing a fabricated candle, so
+    # matching against one here would apply the library to inputs it was
+    # never fitted on. A flat placeholder encodes as "down, small body",
+    # which is why mined_DS-DS fired 489 times and could be graded 0 of
+    # them: it was matching dead minutes and predicting into more of them.
+    if any(c.get("synthetic") for c in window):
+        return None
+
+    key = _sequence_key(window)
     entry = library.get(key)
     if entry is None:
         return None
