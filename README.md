@@ -1,5 +1,143 @@
 # minimum-pair
 
+## Open public signal API (2026-08)
+
+Anyone can fetch the current CALL/PUT signal for every pair, no auth, no
+WebSocket — just an HTTP GET. Per the user requirement: *"call put data
+signals যেনো অ্যাপ ইউআরএল ব্যবহার করে, যে কেউ ফিচ করতে পারে। একেবারে
+ওপেন থাকবে।"* CORS is open (`Access-Control-Allow-Origin: *`), so
+browser-side scripts and bots on other domains can hit these directly.
+
+```
+GET /api/signals                       # all pairs' latest signal
+GET /api/signals?tier=confirmed        # only quality-gated signals
+GET /api/signals/pair?pair=EUR/USD     # one pair's latest signal
+GET /api/signals/history?pair=EUR/USD  # one pair's signal history
+GET /api/strategies                    # registry of every strategy the engine knows
+GET /api/backtest?pair=EUR/USD         # per-pair per-strategy backtest matrix
+GET /api/candles?pair=EUR/USD          # raw candle history
+GET /api/winrate                       # per-pair win/loss tally
+GET /api/status                        # service status (auth, reconnects, feed health)
+```
+
+Each signal row includes:
+
+```json
+{
+  "pair": "EUR/USD",
+  "direction": "CALL",
+  "confidence": 0.62,
+  "tier": "confirmed",
+  "result": "PENDING",
+  "entry_ts": 1786821000,
+  "target_close_ts": 1786821060,
+  "entry_price": 1.1005,
+  "close_price": null,
+  "source": "rsi_oversold,hammer",
+  "sources": ["rsi_oversold", "hammer"],
+  "created_at": 1786820940,
+  "age_seconds": 60,
+  "stale": false,
+  "expires_in_seconds": 0
+}
+```
+
+The signal's lifetime is exactly one 1-minute candle: it fires at the
+**0-second mark** when a new candle opens (computed from the just-closed
+previous candle), and the `target_close_ts` is the close of that running
+candle. `expires_in_seconds` tells a bot exactly how long the entry is
+still valid for.
+
+## Per-pair per-strategy backtest matrix (2026-08)
+
+The user requirement: *"যত গুলো পেয়ার ও স্ট্রাটেজি ব্যবহার করা হয়েছে,
+প্রত্যেকটি কে আলাদা আলাদা পেয়ার এর সাথে ব্যাক টেস্ট করতে হবে।"*
+`/api/backtest` now produces, for every (pair, source) cell:
+
+- `n`, `wins`, `losses`, `win_rate`
+- `wilson_lower`, `wilson_upper` — 95% Wilson score CI
+- `p_value` — block sign-flip p-value (cluster-aware, not the naive binomial)
+- `survives_fdr` — Benjamini-Hochberg correction across the whole batch
+- `longest_losing_streak` — worst drawdown length
+- `payout`, `breakeven_win_rate` — per-pair payout → breakeven rate
+  (`p_be = 1 / (1 + payout)`, per binaryoptions.ae)
+- `roi_per_trade` — `win_rate * payout - (1 - win_rate)`; positive = real edge
+- `fold_rates` — sequential 5-fold consistency check
+- `verdict` — one of:
+  - `"edge (better than breakeven, consistent across folds, FDR-surviving)"`
+  - `"above breakeven, FDR-surviving, but not consistent across folds"`
+  - `"above breakeven (X%), fails multiple-testing correction"`
+  - `"reliably below breakeven (X%)"`
+  - `"reliably worse than chance (50%)"`
+  - `"no edge distinguishable from chance"`
+  - `"too few samples"`
+
+The `across_pairs` summary tells you which strategies have an edge on
+*more than one* pair (the only test that survives the lucky-path problem
+on synthetic data). Per-pair payouts are configurable in
+`config.PAIR_PAYOUT`.
+
+## Expanded candlestick pattern library (2026-08)
+
+The original engine covered 7 patterns. The web-research audit
+(`/home/z/my-project/download/research/binary-trading-research.md`,
+24 web searches across Investopedia, StockCharts ChartSchool, IG,
+TrendSpider, etc.) identified that:
+
+1. **Conflated shapes produce wrong-direction calls.** Hammer vs Hanging
+   Man are the same shape with opposite context — the old `_hammer` fired
+   "CALL" whenever the shape appeared, even after an uptrend (where it's
+   a Hanging Man → PUT). Same for Inverted Hammer vs Shooting Star, and
+   for Dragonfly vs Gravestone Doji. Now they're separated and require
+   the correct prior-trend context.
+2. **Missing high-value patterns.** Investopedia ranks Engulfing +
+   3-candle stars + Three Soldiers/Crows as the most reliable reversal
+   signals. These are now implemented: Piercing Line, Dark Cloud Cover,
+   Morning Star, Evening Star, Three White Soldiers, Three Black Crows,
+   Three Inside Up/Down, Three Outside Up/Down, Harami Cross.
+3. **Doji sub-types.** A doji is not just "indecision" — Dragonfly,
+   Gravestone, and Long-Legged have meaningfully different reversal
+   bias depending on prior trend.
+
+The full registry (31 patterns) is exposed at `GET /api/strategies`.
+
+## Expanded candle-reaction family (2026-08)
+
+The original `candle_reaction` source detected wick rejection at fractal
+swing S/R only. The web-research audit (Tradeciety "7 Rejection Price
+Patterns", JumpStartTrading pin bar guide, FBS) found that practitioners
+also reject at:
+
+- **Round numbers** (1.1000, 0.0100 multiples) — auto-detected per pair
+- **Dynamic MAs** (EMA 50 here)
+- **Bollinger band edges** — wick pierces the band, closes back inside
+
+Each rejection type is now a separate source
+(`fractal_rejection_top`, `ema_rejection_top`, `bb_rejection_top`,
+`round_number_rejection_top`, etc.) so the weight layer can learn which
+rejection levels work on which pairs, instead of one opaque bucket
+mixing them all.
+
+## 0-second signal timing (2026-08)
+
+The user requirement: *"একটি এক মিনিটের ক্যান্ডেল যখন 0 সেকেন্ড এ শুরু হবে,
+টিক তখনি সিগন্যাল আসতে হবে।"*
+
+The signal pipeline now:
+
+1. Closes candle N-1 at the **exact** minute boundary (was `boundary + 1s`).
+2. Computes the full feature pipeline (indicators, patterns, reactions,
+   microstructure, mined library) on closed candles only.
+3. Decides CALL/PUT/NO-SIGNAL.
+4. Broadcasts the signal via WebSocket and persists it to the DB, with
+   `entry_ts = candle[N-1].ts + 60s` (the open of candle N).
+5. `target_close_ts = entry_ts + 60s` (the close of candle N).
+
+Tick polling tightened from 150ms to 50ms so the 0-second signal fires
+within ~50ms of the candle boundary, suitable for binary-option entries.
+
+---
+
 ## Quotex login vs. Cloudflare on Railway
 
 Quotex's login page sits behind Cloudflare, and Cloudflare will eventually

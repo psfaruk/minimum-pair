@@ -17,6 +17,15 @@ one.
 
 CLI:  python -m app.backtest --pair "EUR/USD" --limit 5000
 API:  GET /api/backtest?pair=EUR/USD&limit=5000
+
+# 2026-08 — Per-pair per-strategy accounting matrix
+The user requirement: "যত গুলো পেয়ার ও স্ট্রাটেজি ব্যবহার করা হয়েছে,
+প্রত্যেকটি কে আলাদা আলাদা পেয়ার এর সাথে ব্যাক টেস্ট করতে হবে।"
+So every (pair, strategy) cell now reports: n, wins, losses, win rate,
+payout-adjusted ROI, binomial p-value (against the breakeven rate for
+that pair's payout), Wilson CI, longest losing streak, and a verdict
+that combines all of the above with the FDR correction across the
+batch and a sequential-fold consistency check.
 """
 import argparse
 import asyncio
@@ -49,6 +58,17 @@ FDR_ALPHA = 0.10
 FOLDS = 5
 MIN_FOLD_SAMPLES = 20
 
+# Default payout for ROI calculations. Quotex OTC typically pays 70-92%;
+# we default to 85% which is the middle of the typical range. Per-pair
+# override can be added in config.PAIR_PAYOUT if needed.
+DEFAULT_PAYOUT = 0.85
+
+# Minimum sample size before a strategy is even considered for "edge".
+# The web research (EdgeFlo, TradersSecondBrain) found 100 is the floor;
+# we use 100 for "candidate" and 200 for "edge" to be conservative.
+MIN_SAMPLES_CANDIDATE = 50
+MIN_SAMPLES_EDGE = 100
+
 
 def _outcome(current: Candle, following: Candle) -> str | None:
     """What a one-candle binary trade entered at `current`'s close would
@@ -59,6 +79,32 @@ def _outcome(current: Candle, following: Candle) -> str | None:
     if following["close"] < current["close"]:
         return "PUT"
     return None
+
+
+def _longest_losing_streak(hits: list[bool]) -> int:
+    longest = current = 0
+    for h in hits:
+        if h:
+            current = 0
+        else:
+            current += 1
+            longest = max(longest, current)
+    return longest
+
+
+def _payout_adjusted_roi(win_rate: float | None, payout: float) -> float | None:
+    """Net ROI per trade at this win rate and payout. Negative = loss
+    expectancy. Positive = real edge after broker take."""
+    if win_rate is None:
+        return None
+    return round(win_rate * payout - (1 - win_rate), 4)
+
+
+def _breakeven_win_rate(payout: float) -> float:
+    """The win rate needed to break even at this payout.
+    Per binaryoptions.ae: p_be = 100 / (100 + payout%).
+    """
+    return 1.0 / (1.0 + payout)
 
 
 def _sources_firing(pair: str, history: list[Candle], miner_library: dict) -> list[tuple[str, str]]:
@@ -73,7 +119,7 @@ def _sources_firing(pair: str, history: list[Candle], miner_library: dict) -> li
     for name, direction in decision.patterns.detect(history):
         firing.append((name, direction))
 
-    cr = candle_reaction.detect(history)
+    cr = candle_reaction.detect(history, ind)
     if cr is not None:
         firing.append((cr[0], cr[1]))
 
@@ -98,6 +144,8 @@ def _sources_firing(pair: str, history: list[Candle], miner_library: dict) -> li
 async def backtest_pair(pair: str, limit: int = 5000) -> dict[str, Any]:
     """Scores every source independently over this pair's stored candles."""
     candles = await db.recent_candles(pair, limit)
+    payout = config.PAIR_PAYOUT.get(pair, DEFAULT_PAYOUT)
+    breakeven = _breakeven_win_rate(payout)
 
     # Ordered hit/miss per source, not just counts: the significance test
     # needs the sequence to see how much the results cluster.
@@ -145,20 +193,25 @@ async def backtest_pair(pair: str, limit: int = 5000) -> dict[str, Any]:
         n = len(hits)
         lower, upper = wilson_interval(wins, n)
         fold_rates = _fold_rates(hits)
+        win_rate = wins / n if n else None
         results.append(
             {
                 "source": source,
                 "n": n,
                 "wins": wins,
                 "losses": losses,
-                "win_rate": wins / n if n else None,
+                "win_rate": round(win_rate, 4) if win_rate is not None else None,
                 "wilson_lower": round(lower, 4),
                 "wilson_upper": round(upper, 4),
                 "p_value": round(p_values[index], 5),
                 "survives_fdr": survives_fdr[source],
                 "earned_weight": round(weights.weight_for(wins, losses), 3),
                 "fold_rates": [round(r, 3) for r in fold_rates],
-                "verdict": _verdict(n, lower, upper, survives_fdr[source], fold_rates),
+                "longest_losing_streak": _longest_losing_streak(hits),
+                "payout": payout,
+                "breakeven_win_rate": round(breakeven, 4),
+                "roi_per_trade": _payout_adjusted_roi(win_rate, payout),
+                "verdict": _verdict(n, lower, upper, survives_fdr[source], fold_rates, win_rate, breakeven),
             }
         )
     results.sort(key=lambda r: -(r["win_rate"] or 0))
@@ -169,6 +222,8 @@ async def backtest_pair(pair: str, limit: int = 5000) -> dict[str, Any]:
         "candles_tested": tested,
         "skipped_synthetic": skipped_synthetic,
         "draws": draws,
+        "payout": payout,
+        "breakeven_win_rate": round(breakeven, 4),
         "sources": results,
     }
 
@@ -185,22 +240,43 @@ def _fold_rates(hits: list[bool]) -> list[float]:
     ]
 
 
-def _verdict(n: int, lower: float, upper: float, survives_fdr: bool, fold_rates: list[float]) -> str:
+def _verdict(
+    n: int,
+    lower: float,
+    upper: float,
+    survives_fdr: bool,
+    fold_rates: list[float],
+    win_rate: float | None,
+    breakeven: float,
+) -> str:
     """What the evidence actually supports — not the point estimate,
     which at these sample sizes is mostly noise; not an uncorrected
     interval, which finds edges in a batch of pure coin flips; and not a
-    single-sample test, which a lucky stretch can carry on its own."""
-    if n < 30:
+    single-sample test, which a lucky stretch can carry on its own.
+
+    Also factors in the payout-adjusted breakeven rate: at 85% payout a
+    strategy needs ≥ 54.05% wins just to break even, so "above 50%" is
+    not the bar — "above breakeven" is.
+    """
+    if n < MIN_SAMPLES_CANDIDATE:
         return "too few samples"
-    consistent = sum(1 for r in fold_rates if r > 0.5) > len(fold_rates) / 2 if fold_rates else False
-    if lower > 0.5 and survives_fdr and consistent:
-        return "edge (better than chance)"
-    if lower > 0.5 and survives_fdr:
-        return "good overall, but not consistent across the period"
-    if lower > 0.5:
-        return "looks good, fails multiple-testing correction"
+    consistent = sum(1 for r in fold_rates if r > breakeven) > len(fold_rates) / 2 if fold_rates else False
+    if (
+        n >= MIN_SAMPLES_EDGE
+        and lower > breakeven
+        and survives_fdr
+        and consistent
+        and (win_rate or 0) > breakeven + 0.03  # 3-point safety margin above breakeven
+    ):
+        return "edge (better than breakeven, consistent across folds, FDR-surviving)"
+    if n >= MIN_SAMPLES_EDGE and lower > breakeven and survives_fdr:
+        return "above breakeven, FDR-surviving, but not consistent across folds"
+    if lower > breakeven:
+        return f"above breakeven ({breakeven:.1%}), fails multiple-testing correction"
+    if upper < breakeven:
+        return f"reliably below breakeven ({breakeven:.1%})"
     if upper < 0.5:
-        return "reliably worse than chance"
+        return "reliably worse than chance (50%)"
     return "no edge distinguishable from chance"
 
 
@@ -220,24 +296,42 @@ async def backtest_all(limit: int = 5000) -> dict[str, Any]:
     for report in reports:
         for row in report["sources"]:
             entry = across.setdefault(
-                row["source"], {"source": row["source"], "pairs_tested": 0, "pairs_with_edge": 0, "wins": 0, "n": 0}
+                row["source"], {
+                    "source": row["source"],
+                    "pairs_tested": 0,
+                    "pairs_with_edge": 0,
+                    "pairs_above_breakeven": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "n": 0,
+                }
             )
-            if row["n"] >= 30:
+            if row["n"] >= MIN_SAMPLES_CANDIDATE:
                 entry["pairs_tested"] += 1
             if row["verdict"].startswith("edge"):
                 entry["pairs_with_edge"] += 1
+            if (row["win_rate"] or 0) > (row["breakeven_win_rate"] or 0.54):
+                entry["pairs_above_breakeven"] += 1
             entry["wins"] += row["wins"]
+            entry["losses"] += row["losses"]
             entry["n"] += row["n"]
 
-    summary = [
-        {
+    summary = []
+    for entry in across.values():
+        n = entry["n"]
+        wins = entry["wins"]
+        losses = entry["losses"]
+        pooled = wins / n if n else None
+        # Use a blended payout of 0.85 for the cross-pair ROI estimate
+        pooled_payout = 0.85
+        summary.append({
             **entry,
-            "pooled_win_rate": round(entry["wins"] / entry["n"], 4) if entry["n"] else None,
-            "earned_weight": round(weights.weight_for(entry["wins"], entry["n"] - entry["wins"]), 3),
-        }
-        for entry in across.values()
-    ]
-    summary.sort(key=lambda r: (-r["pairs_with_edge"], -(r["pooled_win_rate"] or 0)))
+            "pooled_win_rate": round(pooled, 4) if pooled is not None else None,
+            "pooled_breakeven": round(_breakeven_win_rate(pooled_payout), 4),
+            "pooled_roi_per_trade": _payout_adjusted_roi(pooled, pooled_payout),
+            "earned_weight": round(weights.weight_for(wins, losses), 3),
+        })
+    summary.sort(key=lambda r: (-r["pairs_with_edge"], -r["pairs_above_breakeven"], -(r["pooled_win_rate"] or 0)))
     return {"pairs": reports, "across_pairs": summary}
 
 

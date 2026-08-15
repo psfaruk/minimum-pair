@@ -113,10 +113,14 @@ def compute(candles: list[dict[str, Any]]) -> dict[str, Any]:
 
     bb = _bollinger(closes, BB_PERIOD, BB_STD)
     percent_b = None
+    bb_upper = bb_middle = bb_lower = bb_width = None
     if bb is not None:
         upper, lower = bb
+        bb_upper, bb_lower = upper, lower
+        bb_middle = (upper + lower) / 2
         if upper != lower:
             percent_b = (close - lower) / (upper - lower)
+            bb_width = (upper - lower) / bb_middle if bb_middle else None
 
     sma_fast_vals = _sma(closes, SMA_FAST)
     sma_slow_vals = _sma(closes, SMA_SLOW)
@@ -144,6 +148,11 @@ def compute(candles: list[dict[str, Any]]) -> dict[str, Any]:
         "ema_distance_atr": ema_distance_atr,
         "atr14": atr14,
         "percent_b": percent_b,
+        "bb_upper": bb_upper,
+        "bb_middle": bb_middle,
+        "bb_lower": bb_lower,
+        "bb_width": bb_width,
+        "bb_squeeze": bb_width is not None and atr14 is not None and bb_width < 0.5,
         "sma_cross": sma_cross,
         "sma_fresh_cross": fresh_cross,
         "support": support,

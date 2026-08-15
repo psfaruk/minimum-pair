@@ -9,7 +9,11 @@ from app.quotex_client import get_client, resolve_asset_codes
 
 logger = logging.getLogger(__name__)
 
-TICK_POLL_SECONDS = 0.15  # ~6-7 updates/sec on the live/forming candle
+# 2026-08: tighter tick polling (~20 Hz) so the 0-second signal fires
+# within ~50ms of the candle boundary instead of the old ~150ms. Costs
+# slightly more CPU per pair but is essential for the 0-second entry
+# requirement on Quotex 1-minute binary options.
+TICK_POLL_SECONDS = 0.05
 BOOTSTRAP_CANDLES = 200
 IN_MEMORY_CANDLES = 300
 
@@ -176,10 +180,16 @@ class FeedManager:
 
                 # Timer-based fallback close: keeps sparse OTC feeds moving
                 # even if no tick arrives right at the minute boundary.
+                # 2026-08: previously waited boundary_end + 1 before
+                # finalizing, which delayed the 0-second signal for the
+                # NEXT candle by ~1s on every sparse minute. Now we
+                # finalize exactly at boundary_end so the signal for the
+                # new candle is computed and broadcast at the 0-second
+                # mark, as the user requirement specifies.
                 if state.current is not None:
                     now = time.time()
                     boundary_end = state.current["ts"] + config.CANDLE_PERIOD_SECONDS
-                    if now >= boundary_end + 1:
+                    if now >= boundary_end:
                         finalized = state.current
                         last_price = finalized["close"]
                         # The replacement is a placeholder for a minute
