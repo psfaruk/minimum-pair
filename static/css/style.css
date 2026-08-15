@@ -254,6 +254,18 @@ select {
 .rate-good { color: var(--call); }
 .rate-bad { color: var(--put); }
 .rate-mid { color: var(--pending); }
+/* Under ~30 graded trades a hit rate is mostly noise — 15W/4L reads as
+   "79%" and means nothing. Colour it as undecided, not as a winner. */
+.rate-thin { color: var(--text-dim); }
+.thin-flag {
+  font-size: 10px;
+  color: var(--text-dim);
+  border: 1px solid var(--text-dim);
+  border-radius: 3px;
+  padding: 1px 4px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
 
 .history-list { display: flex; flex-direction: column; gap: 8px; }
 .history-row {

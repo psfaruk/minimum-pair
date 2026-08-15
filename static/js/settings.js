@@ -131,13 +131,22 @@ App.tabs.settings = {
     }
     list.innerHTML = rows.map((r) => {
       const rate = r.win_rate;
-      const rateClass = rate === null ? "" : rate >= 0.55 ? "rate-good" : rate <= 0.45 ? "rate-bad" : "rate-mid";
-      const pendingNote = r.pending ? ` (${r.pending} pending)` : "";
+      const graded = r.wins + r.losses;
+      // The rate is computed on graded signals only, so lead with that
+      // number. Showing the fired count instead made a source measured on
+      // 68 trades look like it had 564 behind it.
+      const rateClass = rate === null ? "" : graded < 30 ? "rate-thin"
+        : rate >= 0.55 ? "rate-good" : rate <= 0.45 ? "rate-bad" : "rate-mid";
+      const extras = [];
+      if (r.draws) extras.push(`${r.draws} no-move`);
+      if (r.pending) extras.push(`${r.pending} pending`);
+      const extraNote = extras.length ? ` (${extras.join(", ")})` : "";
+      const thin = graded > 0 && graded < 30 ? ' <span class="thin-flag">too few to judge</span>' : "";
       return `<div class="pair-row">
-        <span class="name">${r.pattern}</span>
-        <span><span class="signal-count">${r.total} signals</span>
+        <span class="name">${r.pattern}${thin}</span>
+        <span><span class="signal-count">${graded} graded</span>
         <span class="rate ${rateClass}">${App.fmtPct(rate)}</span>
-        <span class="counts">${r.wins}W / ${r.losses}L${pendingNote}</span></span>
+        <span class="counts">${r.wins}W / ${r.losses}L${extraNote}</span></span>
       </div>`;
     }).join("");
   },
