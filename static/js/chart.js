@@ -1,6 +1,7 @@
 App.tabs.chart = {
   chart: null,
   series: null,
+  signalSeries: null,
   pendingSignalId: null,
   signalRows: [],
   currentCandleTs: null,
@@ -51,6 +52,13 @@ App.tabs.chart = {
       borderUpColor: "#22c55e", borderDownColor: "#ef4444",
       wickUpColor: "#22c55e", wickDownColor: "#ef4444",
     });
+    // Signal markers are attached directly to the candlestick series
+    // via setMarkers() — every candle that produced a signal gets an
+    // arrow on the chart. CALL = green up-arrow below the bar,
+    // PUT = red down-arrow above it. Per the user requirement
+    // ("প্রত্যেক পেয়ার এ প্রত্যেক ক্যান্ডেল এ সিগন্যাল আসতে হবে"),
+    // every candle should carry its signal visually.
+    this.signalMarkers = [];
   },
 
   onShow() {
@@ -72,10 +80,46 @@ App.tabs.chart = {
     this.series.setData(rows.map((r) => ({ time: r.ts, open: r.open, high: r.high, low: r.low, close: r.close })));
 
     this.signalRows = history;
+    // Seed the chart markers with the history we just loaded. Each
+    // signal's `entry_ts` lines up with the open of the candle it
+    // was made for, so the marker sits on exactly the right bar.
+    this.signalMarkers = this.signalRows
+      .map((s) => this._markerFor(s))
+      .filter(Boolean);
+    this._renderMarkers();
     this.renderSignalsWindow();
 
     await App.refreshWinRates();
     this.renderWinRates();
+  },
+
+  _markerFor(s) {
+    if (!s || !s.entry_ts) return null;
+    const isCall = s.direction === "CALL";
+    return {
+      time: s.entry_ts,
+      position: isCall ? "belowBar" : "aboveBar",
+      color: isCall ? "#22c55e" : "#ef4444",
+      shape: isCall ? "arrowUp" : "arrowDown",
+      text: `${s.direction}${s.tier === "confirmed" ? "" : " · noise"}`,
+    };
+  },
+
+  _renderMarkers() {
+    if (!this.series || !this.series.setMarkers) return;
+    // lightweight-charts requires markers sorted ascending by time
+    // and unique — sort + dedupe just in case the same candle picked
+    // up two signals (e.g. a noise fallback replaced by a confirmed
+    // one in the same minute).
+    const seen = new Set();
+    const sorted = [...this.signalMarkers]
+      .filter((m) => {
+        if (seen.has(m.time)) return false;
+        seen.add(m.time);
+        return true;
+      })
+      .sort((a, b) => a.time - b.time);
+    this.series.setMarkers(sorted);
   },
 
   renderWinRates() {
@@ -102,7 +146,7 @@ App.tabs.chart = {
       <div class="history-row${s.id === highlightId ? " highlight" : ""}" data-id="${s.id}">
         <div class="left">
           <span class="time">${App.fmtTime(s.entry_ts)}</span>
-          <span class="conf">${(s.confidence * 100).toFixed(0)}% · ${s.source || ""}</span>
+          <span class="conf">${App.fmtConf(s.confidence)} · ${s.source || ""}</span>
         </div>
         <div class="right">
           <span class="dir-badge ${s.direction}">${s.direction}</span>
@@ -122,7 +166,7 @@ App.tabs.chart = {
     const badge = document.getElementById("signalBadge");
     badge.classList.remove("hidden", "CALL", "PUT");
     badge.classList.add(signal.direction);
-    badge.textContent = `${signal.direction} · ${(signal.confidence * 100).toFixed(0)}%`;
+    badge.textContent = `${signal.direction} · ${App.fmtConf(signal.confidence)}`;
     this.pendingSignalId = signal.id;
   },
 
@@ -136,6 +180,12 @@ App.tabs.chart = {
     this.showBadge(msg.signal);
     this.signalRows.unshift({ ...msg.signal, source: (msg.signal.sources || []).join(",") });
     this.signalRows = this.signalRows.slice(0, 50);
+    // Push the new signal's marker onto the chart and re-render.
+    const m = this._markerFor(msg.signal);
+    if (m) {
+      this.signalMarkers.push(m);
+      this._renderMarkers();
+    }
     this.renderSignalsWindow(msg.signal.id);
   },
 

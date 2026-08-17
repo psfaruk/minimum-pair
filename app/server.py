@@ -7,11 +7,11 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app import backtest, config, db, patterns as patterns_module, quotex_client, railway_control
+from app import backtest, config, db, patterns as patterns_module, quotex_client
 from app.evaluator import run_evaluator
 from app.feed import FeedManager
 
@@ -50,14 +50,25 @@ async def _on_graded(signal: dict) -> None:
     await broadcast({"type": "graded", "pair": signal["pair"], "signal": signal})
 
 
+# How long the bootstrap loop waits between connection attempts when the
+# last one failed. The password-login retry loop is gone — a single
+# failure permanently parks the password path until a human pastes a
+# token — so this only governs the cadence at which a freshly pasted
+# token is picked up after /api/session, and the watchdog's slow path
+# when the websocket has gone quiet.
 RETRY_BACKOFF_SECONDS = 20
 
 
 async def _bootstrap_feed() -> None:
-    """Keeps retrying the Quotex connection forever. On this network,
-    handshake failures are transient (flaky tethered link) rather than
-    permanent auth/config problems, so a one-shot failure here shouldn't
-    stop the app from ever coming online — it should just keep trying."""
+    """Brings the Quotex feed online.
+
+    A one-shot password login that fails is the END of the password path
+    in this run — the app does not retry the Cloudflare-guarded login
+    page (retrying is what used to block the egress IP). The loop keeps
+    running so a freshly pasted token is picked up promptly: when
+    /api/session writes a new token it cancels this task and starts a
+    fresh one, which then succeeds on the token path.
+    """
     attempt = 0
     while True:
         attempt += 1
@@ -69,20 +80,18 @@ async def _bootstrap_feed() -> None:
             app_state["feed_manager"] = manager
             logger.info("Feed manager started for %d pairs (attempt %d)", len(manager.pairs), attempt)
             return
-        except quotex_client.LoginBackoffError as e:
-            # Expected, self-clearing state rather than a fault: the app is
-            # deliberately sitting out the Cloudflare-avoiding login backoff.
+        except quotex_client.LoginUnavailableError as e:
+            # The password path is permanently parked in this run. Stay
+            # alive so /api/session can paste a token at any time — the
+            # Settings UI shows exactly this state.
             app_state["quotex_connected"] = False
             app_state["error"] = str(e)
             delay = quotex_client.retry_delay_seconds(RETRY_BACKOFF_SECONDS)
-            logger.info("Waiting %ds before the next login attempt (attempt %d): %s", delay, attempt, e)
+            logger.info("Password login unavailable — waiting %ds before re-checking for a pasted token (attempt %d)", delay, attempt)
             await asyncio.sleep(delay)
         except Exception as e:
             app_state["quotex_connected"] = False
             app_state["error"] = str(e)
-            # A failed password login sets a backoff far longer than
-            # RETRY_BACKOFF_SECONDS — retrying sooner would just hammer the
-            # Cloudflare-guarded login page again.
             delay = quotex_client.retry_delay_seconds(RETRY_BACKOFF_SECONDS)
             logger.exception("Failed to start Quotex feed (attempt %d), retrying in %ds", attempt, delay)
             await asyncio.sleep(delay)
@@ -122,9 +131,8 @@ async def _connection_watchdog() -> None:
     app would sit there "connected" and signal-less until someone
     restarted it. OTC pairs trade around the clock, so silence across
     *every* pair means the connection is gone, not that the market is
-    closed. The restart goes through get_client(), which tries the token
-    first and only falls back to a password login (under its backoff) if
-    the token really is dead.
+    closed. The restart reuses the pasted token; it never falls back
+    to a fresh password login (that path is one-shot per process now).
     """
     while True:
         await asyncio.sleep(config.CONNECTION_WATCHDOG_SECONDS)
@@ -149,9 +157,8 @@ async def _connection_watchdog() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await db.init_db()
-    # Must run before the first connect: it restores the login backoff a
-    # previous boot was serving (Railway restarts would otherwise reset
-    # it) and any session token captured earlier.
+    # Must run before the first connect: it restores any session token
+    # captured earlier (Railway restarts would otherwise lose it).
     await quotex_client.load_persisted_state()
     app_state["bootstrap_task"] = asyncio.create_task(_bootstrap_feed())
     asyncio.create_task(run_evaluator(_on_graded))
@@ -161,12 +168,11 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# 2026-08 — Open public API.
-# Per the user requirement: "call put data signals যেনো অ্যাপ ইউআরএল
-# ব্যবহার করে, যে কেউ ফিচ করতে পারে। একেবারে ওপেন থাকবে।"
-# All GET /api/* read endpoints (signals, candles, history, backtest,
-# patterns, winrate) are intentionally left open without auth. The only
-# mutation endpoint (/api/session) still requires ADMIN_TOKEN.
+# Open public API: anyone can fetch the current CALL/PUT signal for every
+# pair via plain HTTP GET. Per the user requirement: open URLs, no auth,
+# suitable for external bots/scripts to consume directly. CORS is open
+# (`Access-Control-Allow-Origin: *`) so browser-side scripts and bots on
+# other domains can hit these directly.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -194,21 +200,33 @@ async def status():
         "feed_stale_seconds": (
             int(app_state["feed_manager"].seconds_since_last_tick()) if app_state.get("feed_manager") else None
         ),
-        "session_persistence": railway_control.status(),
+        # The token-persistence card used to surface Railway write-back.
+        # That machinery is gone (no admin keys in the frontend now), so
+        # the field is reported as off for UI compatibility.
+        "session_persistence": {"configured": False, "missing_settings": [], "redeploy_after_login": False},
     }
 
 
 class SessionUpdate(BaseModel):
-    admin_token: str
+    # Token-only auth surface: a single `session_token` (the SSID string
+    # pasted from a logged-in browser session) is the entire credential.
+    # The optional cookies field carries cf_clearance / laravel_session
+    # for browsers that need them — together they let the websocket
+    # authenticate without ever touching the Cloudflare-guarded login
+    # page. No admin passcode, no API keys, no other auth fields.
     session_token: str
     session_cookies: str = ""
 
 
 @app.post("/api/session")
 async def update_session(payload: SessionUpdate):
-    if not config.ADMIN_TOKEN or payload.admin_token != config.ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid admin passcode")
+    """Paste a fresh Quotex session token. This is the ONLY way the
+    frontend authenticates against the broker — no admin passcode, no
+    API keys, nothing else is asked of the user.
 
+    Stored like a captured one so a restart keeps using it. Pasting a
+    fresh token also clears any prior one-shot password-login failure
+    flag, so the next boot is back to a clean slate."""
     session_token = payload.session_token.strip()
     if not session_token:
         raise HTTPException(status_code=400, detail="session_token is required")

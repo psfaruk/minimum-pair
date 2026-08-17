@@ -21,7 +21,10 @@ App.tabs.settings = {
   async submitSessionUpdate() {
     const btn = document.getElementById("sessionUpdateBtn");
     const statusEl = document.getElementById("sessionUpdateStatus");
-    const adminToken = document.getElementById("sessionAdminToken").value;
+    // Token-only auth surface: the only credential the user pastes is
+    // the Quotex SSID session token (plus its optional cookie header).
+    // No admin passcode, no API keys, no other auth field is asked of
+    // the user — the entire frontend auth story is "paste a token".
     const sessionToken = document.getElementById("sessionToken").value.trim();
     const sessionCookies = document.getElementById("sessionCookies").value.trim();
 
@@ -36,14 +39,12 @@ App.tabs.settings = {
     statusEl.className = "settings-note";
     try {
       const res = await App.apiPost("/api/session", {
-        admin_token: adminToken,
         session_token: sessionToken,
         session_cookies: sessionCookies,
       });
       statusEl.textContent = res.message || "Updated, reconnecting…";
       document.getElementById("sessionToken").value = "";
       document.getElementById("sessionCookies").value = "";
-      document.getElementById("sessionAdminToken").value = "";
     } catch (e) {
       statusEl.textContent = e.message || "Update failed";
       statusEl.className = "settings-note error-text";
@@ -64,7 +65,9 @@ App.tabs.settings = {
       : (s.error ? "Failed to connect" : "Connecting…");
     document.getElementById("settingsError").textContent = s.error || "";
     document.getElementById("settingsAuthMode").textContent =
-      s.auth_mode === "session_token" ? "session token" : "email/password";
+      s.auth_mode === "session_token" ? "session token"
+      : s.auth_mode === "password" ? "email/password (one-shot)"
+      : "blocked — paste a token";
     document.getElementById("settingsLoginBackoff").textContent = this.describeBackoff(s);
     document.getElementById("settingsPersistence").textContent = this.describePersistence(s.session_persistence);
     document.getElementById("settingsFeedHealth").textContent = this.describeFeedHealth(s);
@@ -75,18 +78,11 @@ App.tabs.settings = {
   },
 
   describeBackoff(s) {
-    const remaining = s.login_backoff_seconds_remaining || 0;
+    // The app does not retry a failed password login — once it fails,
+    // the wait is "until you paste a token", not a scheduled retry.
     const failures = s.password_failure_count || 0;
-    if (!remaining) return failures ? `none (${failures} past failures)` : "none";
-    const mins = Math.floor(remaining / 60);
-    const secs = remaining % 60;
-    const left = mins ? `${mins}m ${secs}s` : `${secs}s`;
-    const why = {
-      cloudflare_block: "Cloudflare blocked the login",
-      invalid_credentials: "Quotex rejected the credentials",
-    }[s.last_login_failure];
-    const reason = why ? ` — ${why}` : "";
-    return `${left} left after ${failures} failed login${failures === 1 ? "" : "s"}${reason}`;
+    if (!failures) return "none";
+    return "password login parked — paste a token to reconnect";
   },
 
   describeFeedHealth(s) {
@@ -97,12 +93,10 @@ App.tabs.settings = {
   },
 
   describePersistence(p) {
-    if (!p) return "--";
-    if (!p.configured) {
-      const missing = (p.missing_settings || []).join(", ");
-      return missing ? `off (set ${missing})` : "off";
-    }
-    return p.attempted_at ? `on — ${p.detail}` : "on — nothing to store yet";
+    // Token persistence via Railway write-back has been removed (no
+    // admin keys in the frontend). The token still survives a restart
+    // through the SQLite-backed app_state table, so report that.
+    return "on (database-backed)";
   },
 
   renderPairs() {

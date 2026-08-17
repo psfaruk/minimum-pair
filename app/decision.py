@@ -189,6 +189,12 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
     # unready `ind` safely (every field access goes through .get()), and
     # the pattern/candle-reaction/miner/microstructure/fallback sources
     # below only need the raw candle list, not the indicator snapshot.
+    #
+    # Returns None ONLY when there are zero candles (the very first
+    # bootstrap call before any history exists). Once at least one
+    # candle is present, every code path that would previously have
+    # returned None now routes through _noise_decision(), which always
+    # returns a Decision — that's the per-candle signal guarantee.
     if not candles:
         return None
 
@@ -227,12 +233,19 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
 
     micro = microstructure.score(candles)
 
-    def _noise_decision() -> Decision | None:
+    def _noise_decision() -> Decision:
         """The ALWAYS_SIGNAL filler: some direction, always, tagged for
         exactly what it is. It passes no gate and carries no confidence,
-        because there is nothing here to be confident about."""
-        if not config.ALWAYS_SIGNAL:
-            return None
+        because there is nothing here to be confident about.
+
+        Per the user requirement ("প্রত্যেক পেয়ার এ প্রত্যেক ক্যান্ডেল এ
+        সিগন্যাল আসতে হবে" — every pair, every candle, a signal must
+        come), this NEVER returns None. A real candle that reached
+        _finalize_candle() always produces a signal — either confirmed
+        (passed the gates) or noise (filler). The previous `if not
+        config.ALWAYS_SIGNAL: return None` gate would silently produce
+        nothing for entire minutes, which broke the per-candle promise
+        on every ambiguous candle."""
         if micro["direction"] is not None and micro["strength"] >= MICRO_FALLBACK_FLOOR:
             fb = Vote(micro["direction"], micro["strength"], microstructure.PATTERN_NAME)
         else:
