@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#0b0f14">
 <title>Signal</title>
 <link rel="stylesheet" href="/static/css/style.css">
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
@@ -36,7 +37,7 @@
 
   <section id="view-chart" class="view">
     <div class="chart-toolbar">
-      <select id="pairSelect"></select>
+      <select id="pairSelect" aria-label="Select pair"></select>
       <div id="candleTimer" class="candle-timer" title="Time left in current candle">--s</div>
       <div id="signalBadge" class="signal-badge hidden"></div>
     </div>
@@ -63,7 +64,7 @@
 
   <section id="view-history" class="view">
     <div class="chart-toolbar">
-      <select id="historyPairFilter">
+      <select id="historyPairFilter" aria-label="Filter history by pair">
         <option value="">All pairs</option>
       </select>
     </div>
@@ -75,7 +76,6 @@
       <div class="card-title">Quotex Connection</div>
       <div id="settingsConn" class="settings-row">checking…</div>
       <div class="settings-row">Auth mode: <span id="settingsAuthMode">--</span></div>
-      <div class="settings-row">Login backoff: <span id="settingsLoginBackoff">--</span></div>
       <div class="settings-row">Token persistence: <span id="settingsPersistence">--</span></div>
       <div class="settings-row">Feed health: <span id="settingsFeedHealth">--</span></div>
       <div id="settingsError" class="error-text"></div>
@@ -100,7 +100,7 @@
     </div>
     <div class="card">
       <div class="card-title">Strategy Performance</div>
-      <select id="patternPerfPairFilter" class="settings-select">
+      <select id="patternPerfPairFilter" class="settings-select" aria-label="Filter strategy performance by pair">
         <option value="">All pairs (combined)</option>
       </select>
       <div id="patternPerfList" class="pair-list"></div>
@@ -110,16 +110,16 @@
 </main>
 
 <nav class="bottomnav">
-  <button class="navbtn active" data-view="home">
+  <button type="button" class="navbtn active" data-view="home">
     <span class="icon">&#8962;</span><span>Home</span>
   </button>
-  <button class="navbtn" data-view="chart">
+  <button type="button" class="navbtn" data-view="chart">
     <span class="icon">&#128200;</span><span>Signal Chart</span>
   </button>
-  <button class="navbtn" data-view="history">
+  <button type="button" class="navbtn" data-view="history">
     <span class="icon">&#8635;</span><span>History</span>
   </button>
-  <button class="navbtn" data-view="settings">
+  <button type="button" class="navbtn" data-view="settings">
     <span class="icon">&#9881;</span><span>Settings</span>
   </button>
 </nav>

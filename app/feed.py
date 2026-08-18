@@ -107,8 +107,17 @@ class FeedManager:
             logger.debug("Skipping signal for %s: no ticks in this minute", state.display_name)
             return
 
-        ind = indicators.compute(state.candles)
-        dec = await decision.evaluate(state.display_name, state.candles, ind)
+        # Synthetic fillers are fabricated flat candles (open=high=low=close,
+        # the last known price repeated) inserted only to keep the minute
+        # sequence unbroken. Feeding them into indicators/patterns/reaction
+        # detection would let a fake zero-range bar shape an SMA/EMA/RSI
+        # window or masquerade as a doji/harami against a real neighbour —
+        # the same reason pattern_miner already excludes them from its
+        # training windows. Compact them out so every downstream detector
+        # only ever sees real market data.
+        clean_candles = [c for c in state.candles if not c.get("synthetic")]
+        ind = indicators.compute(clean_candles)
+        dec = await decision.evaluate(state.display_name, clean_candles, ind)
         if dec is not None:
             entry_ts = candle["ts"] + config.CANDLE_PERIOD_SECONDS
             target_close_ts = entry_ts + config.CANDLE_PERIOD_SECONDS

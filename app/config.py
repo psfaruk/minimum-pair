@@ -24,37 +24,23 @@ def _int(name: str, default: int) -> int:
     return int(val) if val else default
 
 
-# --- Quotex credentials (used only for the one-shot email/password
-#     login; the running app authenticates against the pasted token) ---
-QUOTEX_EMAIL = os.getenv("QUOTEX_EMAIL", "")
-QUOTEX_PASSWORD = os.getenv("QUOTEX_PASSWORD", "")
 QUOTEX_ACCOUNT_MODE = os.getenv("QUOTEX_ACCOUNT_MODE", "PRACTICE").upper()
 QUOTEX_LANG = os.getenv("QUOTEX_LANG", "en")
 
 # --- Token-only auth surface ---
 # The app connects to Quotex via the SSID token pasted into the Settings
-# tab (POST /api/session). The token is the only auth credential the
-# frontend ever sees — no admin passcode, no API keys, no Railway tokens
-# are exposed or required. When a token is set, pyquotex skips the
-# Cloudflare-guarded HTTP login page entirely and connects the websocket
-# directly with it.
+# tab (POST /api/session) — the ONLY credential the frontend ever asks
+# for. There is no email/password login path at all: no Cloudflare-guarded
+# login page is ever touched, no admin passcode, no API keys. Without a
+# token, the app simply waits for one to be pasted in.
 QUOTEX_SESSION_TOKEN = os.getenv("QUOTEX_SESSION_TOKEN", "")
 QUOTEX_SESSION_COOKIES = os.getenv("QUOTEX_SESSION_COOKIES", "")
 QUOTEX_USER_AGENT = os.getenv("QUOTEX_USER_AGENT", "")
 
-# Optional HTTP(S) proxy used *only* for the one-shot email/password
-# login, e.g. "http://user:pass@host:port". This is the escape hatch
-# for an egress IP Cloudflare has already blocked: the login goes out
-# through the proxy while the websocket keeps using the service's own
-# connection. With retries removed, the proxy is the one chance a
-# password login has, so it's worth setting if credentials are used.
-QUOTEX_LOGIN_PROXY = os.getenv("QUOTEX_LOGIN_PROXY", "")
-
 # A session token can die mid-run — the websocket simply stops
 # delivering ticks. The watchdog notices that silence and rebuilds the
-# connection from the pasted token. With the password-login retry loop
-# removed, the watchdog only ever reuses the token; it never falls back
-# to a fresh login on its own.
+# connection by reusing the pasted token; there is no password path to
+# fall back to.
 CONNECTION_WATCHDOG_SECONDS = _int("CONNECTION_WATCHDOG_SECONDS", 60)
 STALE_FEED_SECONDS = _int("STALE_FEED_SECONDS", 300)
 
@@ -62,6 +48,19 @@ MIN_CONFIDENCE = _float("MIN_CONFIDENCE", 0.6)
 ALWAYS_SIGNAL = _bool("ALWAYS_SIGNAL", True)
 MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS", 2)
 QUALITY_FLOOR = _float("QUALITY_FLOOR", 0.5)
+
+# With ALWAYS_SIGNAL on, every pair fires a row on every 60s candle close —
+# 16 pairs is ~23k candles and ~23k signals per day, forever, with no
+# cleanup. Left unbounded this both grows the Railway volume indefinitely
+# and makes /api/patterns and /api/winrate (full-table scans) slower every
+# day. pattern_stats (the compact aggregate weights.py actually learns
+# from) is never pruned — only the raw per-candle/per-signal log rows are,
+# so pruning does not erase what a source has learned. PENDING signals are
+# never pruned regardless of age; only rows already graded (WIN/LOSS/DRAW)
+# or plain candle history count against the window.
+CANDLE_RETENTION_DAYS = _int("CANDLE_RETENTION_DAYS", 30)
+SIGNAL_RETENTION_DAYS = _int("SIGNAL_RETENTION_DAYS", 60)
+PRUNE_INTERVAL_SECONDS = _int("PRUNE_INTERVAL_SECONDS", 3600)
 
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = _int("PORT", 8000)

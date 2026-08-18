@@ -62,14 +62,11 @@ App.tabs.settings = {
     const conn = document.getElementById("settingsConn");
     conn.textContent = s.quotex_connected
       ? `Connected (${s.account_mode} account)`
-      : (s.error ? "Failed to connect" : "Connecting…");
+      : (s.error ? "Waiting for a valid token" : "Connecting…");
     document.getElementById("settingsError").textContent = s.error || "";
     document.getElementById("settingsAuthMode").textContent =
-      s.auth_mode === "session_token" ? "session token"
-      : s.auth_mode === "password" ? "email/password (one-shot)"
-      : "blocked — paste a token";
-    document.getElementById("settingsLoginBackoff").textContent = this.describeBackoff(s);
-    document.getElementById("settingsPersistence").textContent = this.describePersistence(s.session_persistence);
+      s.auth_mode === "session_token" ? "session token" : "no token pasted yet";
+    document.getElementById("settingsPersistence").textContent = "on (database-backed)";
     document.getElementById("settingsFeedHealth").textContent = this.describeFeedHealth(s);
     document.getElementById("settingsMinConf").textContent = (s.min_confidence * 100).toFixed(0) + "%";
     document.getElementById("settingsAlwaysSignal").textContent = s.always_signal ? "on" : "off";
@@ -77,26 +74,11 @@ App.tabs.settings = {
     this.renderPairs();
   },
 
-  describeBackoff(s) {
-    // The app does not retry a failed password login — once it fails,
-    // the wait is "until you paste a token", not a scheduled retry.
-    const failures = s.password_failure_count || 0;
-    if (!failures) return "none";
-    return "password login parked — paste a token to reconnect";
-  },
-
   describeFeedHealth(s) {
     const reconnects = s.reconnects || 0;
     const suffix = reconnects ? ` (${reconnects} auto-reconnect${reconnects === 1 ? "" : "s"})` : "";
     if (s.feed_stale_seconds === null || s.feed_stale_seconds === undefined) return `not streaming${suffix}`;
     return `last tick ${s.feed_stale_seconds}s ago${suffix}`;
-  },
-
-  describePersistence(p) {
-    // Token persistence via Railway write-back has been removed (no
-    // admin keys in the frontend). The token still survives a restart
-    // through the SQLite-backed app_state table, so report that.
-    return "on (database-backed)";
   },
 
   renderPairs() {

@@ -51,23 +51,20 @@ async def _on_graded(signal: dict) -> None:
 
 
 # How long the bootstrap loop waits between connection attempts when the
-# last one failed. The password-login retry loop is gone — a single
-# failure permanently parks the password path until a human pastes a
-# token — so this only governs the cadence at which a freshly pasted
-# token is picked up after /api/session, and the watchdog's slow path
-# when the websocket has gone quiet.
+# last one failed — including "no token configured yet". Governs the
+# cadence at which a freshly pasted token is picked up after /api/session,
+# and how often the app re-checks while waiting for one.
 RETRY_BACKOFF_SECONDS = 20
 
 
 async def _bootstrap_feed() -> None:
     """Brings the Quotex feed online.
 
-    A one-shot password login that fails is the END of the password path
-    in this run — the app does not retry the Cloudflare-guarded login
-    page (retrying is what used to block the egress IP). The loop keeps
-    running so a freshly pasted token is picked up promptly: when
-    /api/session writes a new token it cancels this task and starts a
-    fresh one, which then succeeds on the token path.
+    Token-only: with no session token configured, get_client() raises
+    NoSessionTokenError immediately, which this loop treats the same as
+    any other failure — wait, then try again. Pasting a token via
+    /api/session cancels this task and starts a fresh one, which then
+    succeeds.
     """
     attempt = 0
     while True:
@@ -80,21 +77,16 @@ async def _bootstrap_feed() -> None:
             app_state["feed_manager"] = manager
             logger.info("Feed manager started for %d pairs (attempt %d)", len(manager.pairs), attempt)
             return
-        except quotex_client.LoginUnavailableError as e:
-            # The password path is permanently parked in this run. Stay
-            # alive so /api/session can paste a token at any time — the
-            # Settings UI shows exactly this state.
+        except quotex_client.NoSessionTokenError as e:
             app_state["quotex_connected"] = False
             app_state["error"] = str(e)
-            delay = quotex_client.retry_delay_seconds(RETRY_BACKOFF_SECONDS)
-            logger.info("Password login unavailable — waiting %ds before re-checking for a pasted token (attempt %d)", delay, attempt)
-            await asyncio.sleep(delay)
+            logger.info("No session token yet — waiting %ds before re-checking (attempt %d)", RETRY_BACKOFF_SECONDS, attempt)
+            await asyncio.sleep(RETRY_BACKOFF_SECONDS)
         except Exception as e:
             app_state["quotex_connected"] = False
             app_state["error"] = str(e)
-            delay = quotex_client.retry_delay_seconds(RETRY_BACKOFF_SECONDS)
-            logger.exception("Failed to start Quotex feed (attempt %d), retrying in %ds", attempt, delay)
-            await asyncio.sleep(delay)
+            logger.exception("Failed to start Quotex feed (attempt %d), retrying in %ds", attempt, RETRY_BACKOFF_SECONDS)
+            await asyncio.sleep(RETRY_BACKOFF_SECONDS)
 
 
 async def _restart_feed() -> None:
@@ -131,8 +123,8 @@ async def _connection_watchdog() -> None:
     app would sit there "connected" and signal-less until someone
     restarted it. OTC pairs trade around the clock, so silence across
     *every* pair means the connection is gone, not that the market is
-    closed. The restart reuses the pasted token; it never falls back
-    to a fresh password login (that path is one-shot per process now).
+    closed. The restart reuses the pasted token — there is no password
+    path to fall back to.
     """
     while True:
         await asyncio.sleep(config.CONNECTION_WATCHDOG_SECONDS)
@@ -154,6 +146,32 @@ async def _connection_watchdog() -> None:
         await _restart_feed()
 
 
+async def _prune_loop() -> None:
+    """Keeps the candles/signals tables from growing forever. With
+    ALWAYS_SIGNAL on, 16 pairs write a row per pair per 60s candle close —
+    tens of thousands of rows a day, unbounded, on a billed Railway
+    volume. pattern_stats (what weights.py actually learns from) is a
+    separate aggregate table this never touches."""
+    while True:
+        # Sleep first: running immediately at boot would pile a DELETE
+        # sweep on top of the bootstrap burst (16 pairs' history backfill
+        # + initial connects), the busiest and most contention-prone
+        # moment the DB ever sees.
+        await asyncio.sleep(config.PRUNE_INTERVAL_SECONDS)
+        try:
+            deleted_candles, deleted_signals = await db.prune_old_data(
+                config.CANDLE_RETENTION_DAYS, config.SIGNAL_RETENTION_DAYS
+            )
+            if deleted_candles or deleted_signals:
+                logger.info(
+                    "Pruned %d candle rows older than %dd and %d graded signal rows older than %dd",
+                    deleted_candles, config.CANDLE_RETENTION_DAYS,
+                    deleted_signals, config.SIGNAL_RETENTION_DAYS,
+                )
+        except Exception:
+            logger.exception("Prune loop error")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await db.init_db()
@@ -163,6 +181,7 @@ async def lifespan(_: FastAPI):
     app_state["bootstrap_task"] = asyncio.create_task(_bootstrap_feed())
     asyncio.create_task(run_evaluator(_on_graded))
     asyncio.create_task(_connection_watchdog())
+    asyncio.create_task(_prune_loop())
     yield
 
 
@@ -193,17 +212,10 @@ async def status():
         "always_signal": config.ALWAYS_SIGNAL,
         "account_mode": config.QUOTEX_ACCOUNT_MODE,
         "auth_mode": quotex_client.auth_mode(),
-        "password_failure_count": quotex_client.password_failure_count(),
-        "login_backoff_seconds_remaining": quotex_client.login_backoff_seconds_remaining(),
-        "last_login_failure": quotex_client.last_failure_kind(),
         "reconnects": app_state.get("reconnects", 0),
         "feed_stale_seconds": (
             int(app_state["feed_manager"].seconds_since_last_tick()) if app_state.get("feed_manager") else None
         ),
-        # The token-persistence card used to surface Railway write-back.
-        # That machinery is gone (no admin keys in the frontend now), so
-        # the field is reported as off for UI compatibility.
-        "session_persistence": {"configured": False, "missing_settings": [], "redeploy_after_login": False},
     }
 
 

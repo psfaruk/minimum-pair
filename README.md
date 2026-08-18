@@ -18,31 +18,24 @@ SSID. Set it when the broker requires `cf_clearance` or
 handshake to complete.
 
 The pasted token is stored in the SQLite-backed `app_state` table
-(`DB_PATH`), so it survives a container restart. The very first
-successful password login (if `QUOTEX_EMAIL`/`QUOTEX_PASSWORD` are
-configured) also captures and persists the resulting token — after
-that, every reconnect uses the token path and never touches the
-Cloudflare-guarded login page.
+(`DB_PATH`), so it survives a container restart.
 
-## No retry on a failed password login
+## No email/password login path
 
-Per the user requirement (*"যদি কোনো কারণে প্রথম বারে লগিং ফেইল
-হলে, সেকেন্ড টাইম আর লগিং ট্রাই করা যাবে না"*), a failed
-password login permanently parks the password path for the rest of
-the run. The app does **not** retry the Cloudflare-guarded login page
-on its own — retrying that page on a short loop is exactly what used
-to block the shared egress IP, so it no longer happens.
+There is no email/password login at all — not as a fallback, not as
+a one-shot bootstrap. The app never touches the Cloudflare-guarded
+login page, which is also what used to get the shared egress IP
+blocked when it was retried. A missing or dead token simply means the
+app waits.
 
 | State | Behaviour |
 | --- | --- |
-| Fresh boot, no token | One password-login attempt is made (if `QUOTEX_EMAIL`/`QUOTEX_PASSWORD` are set) |
-| That attempt fails | `auth_mode` flips to `blocked`. The Settings tab shows the failure reason. The app stays alive so a token can be pasted at any time. |
-| Token pasted via `/api/session` | `auth_mode` flips to `session_token`, the failure flag clears, the feed reconnects immediately. |
-| Mid-run token dies | The connection watchdog notices the silent feed and rebuilds the connection — reusing the same pasted token. It does **not** fall back to a fresh password login. |
+| Fresh boot, no token | `auth_mode` is `no_token`. The app waits, re-checking every ~20s, for one to be pasted. |
+| Token pasted via `/api/session` | `auth_mode` flips to `session_token`, the feed connects immediately. |
+| Mid-run token dies | The connection watchdog notices the silent feed and rebuilds the connection — reusing the same pasted token. |
 
-`/api/status` exposes `auth_mode`, `password_failure_count`,
-`login_backoff_seconds_remaining`, and `last_login_failure` so the
-Settings tab can show exactly where the app is in this cycle.
+`/api/status` exposes `auth_mode` so the Settings tab can show
+exactly where the app is in this cycle.
 
 ## Per-pair, per-candle signal guarantee
 
@@ -194,10 +187,10 @@ the candle boundary, suitable for binary-option entries.
 
 ## Signal quality: what the numbers mean
 
-A measurement audit (`docs/signal-diagnosis.html`) ran the real engine
-over price data with no predictable edge, where an honest pipeline
-must score 50%. It scored 33.6% on a thin OTC-style feed — the gap
-was measurement bugs, not market reads. What changed:
+A measurement audit ran the real engine over price data with no
+predictable edge, where an honest pipeline must score 50%. It scored
+33.6% on a thin OTC-style feed — the gap was measurement bugs, not
+market reads. What changed:
 
 - **`DRAW` is a real outcome.** When price finishes exactly where it
   started the broker refunds the stake, so it is neither a win nor a

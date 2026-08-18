@@ -563,3 +563,33 @@ def _latest_signals_sync() -> list[dict[str, Any]]:
 
 async def latest_signals() -> list[dict[str, Any]]:
     return await asyncio.to_thread(_latest_signals_sync)
+
+
+def _prune_old_data_sync(candle_cutoff_ts: int, signal_cutoff_ts: int) -> tuple[int, int]:
+    with _connect() as conn:
+        candles_deleted = conn.execute(
+            "DELETE FROM candles WHERE ts < ?", (candle_cutoff_ts,)
+        ).rowcount
+        # PENDING is deliberately excluded from the cutoff: a signal must
+        # be graded before it's eligible for pruning, no matter its age.
+        signals_deleted = conn.execute(
+            """
+            DELETE FROM signals
+            WHERE created_at < ? AND result IN ('WIN', 'LOSS', 'DRAW')
+            """,
+            (signal_cutoff_ts,),
+        ).rowcount
+    return candles_deleted, signals_deleted
+
+
+async def prune_old_data(candle_retention_days: int, signal_retention_days: int) -> tuple[int, int]:
+    """Deletes candle/signal rows older than their retention window.
+
+    pattern_stats (the aggregate weights.py learns from) is untouched —
+    only the raw per-candle and per-signal log rows are pruned, so this
+    never erases what a source has measurably earned."""
+    now = int(time.time())
+    candle_cutoff = now - candle_retention_days * 86400
+    signal_cutoff = now - signal_retention_days * 86400
+    async with _write_lock:
+        return await asyncio.to_thread(_prune_old_data_sync, candle_cutoff, signal_cutoff)

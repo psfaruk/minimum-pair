@@ -112,31 +112,37 @@ def _sources_firing(pair: str, history: list[Candle], miner_library: dict) -> li
     weighting or vote aggregation."""
     firing: list[tuple[str, str]] = []
 
-    ind = indicators.compute(history)
+    # Mirror feed.py: strip synthetic fillers out of the lookback window
+    # before computing anything. Leaving them in would let backtest
+    # measure sources against candles live decision.evaluate() never
+    # actually sees, making the two disagree on identical data.
+    clean_history = [c for c in history if not c.get("synthetic")]
+
+    ind = indicators.compute(clean_history)
     for vote in decision._indicator_votes(ind):
         firing.append((vote.source, vote.direction))
 
-    for name, direction in decision.patterns.detect(history):
+    for name, direction in decision.patterns.detect(clean_history):
         firing.append((name, direction))
 
-    cr = candle_reaction.detect(history, ind)
+    cr = candle_reaction.detect(clean_history, ind)
     if cr is not None:
         firing.append((cr[0], cr[1]))
 
-    micro = microstructure.score(history)
+    micro = microstructure.score(clean_history)
     if micro["direction"] is not None:
         firing.append((microstructure.PATTERN_NAME, micro["direction"]))
 
     # The miner, applied out-of-sample against the local library.
-    if miner_library and len(history) >= pattern_miner.SEQUENCE_LENGTH:
-        key = pattern_miner._sequence_key(history[-pattern_miner.SEQUENCE_LENGTH :])
+    if miner_library and len(clean_history) >= pattern_miner.SEQUENCE_LENGTH:
+        key = pattern_miner._sequence_key(clean_history[-pattern_miner.SEQUENCE_LENGTH :])
         entry = miner_library.get(key)
         if entry is not None:
             firing.append((f"{pattern_miner.PATTERN_PREFIX}_{key}", entry["direction"]))
 
     # The always-on filler, measured like everything else so its true
     # value (none) is visible rather than assumed.
-    firing.append(("fallback_color", decision._fallback_vote(history).direction))
+    firing.append(("fallback_color", decision._fallback_vote(clean_history).direction))
 
     return firing
 
