@@ -17,6 +17,29 @@ TICK_POLL_SECONDS = 0.05
 BOOTSTRAP_CANDLES = 200
 IN_MEMORY_CANDLES = 300
 
+# Round-trip budget for the background real-candle backfill (a WS
+# request/response to Quotex's own history endpoint). Short enough to
+# comfortably land within evaluator.py's SYNTHETIC_GRACE_SECONDS window,
+# generous enough to survive normal network jitter.
+BACKFILL_TIMEOUT_SECONDS = 8
+
+# pyquotex correlates a get_candles() response to its request through one
+# shared string on the connection (the most recent "status" control frame),
+# not a per-request id. With 16 pairs' candles finalizing in the same
+# second, firing get_candles() concurrently means their requests and
+# replies interleave on that shared state and every one of them times out
+# — observed 100% failure firing them concurrently. Serializing through
+# this lock keeps at most one history/load round trip in flight at a
+# time, which is what actually lets any of them succeed.
+_BACKFILL_LOCK = asyncio.Lock()
+
+# Safety net against unbounded backlog growth: if backfills are being
+# produced faster than the serialized queue can drain them (e.g. every
+# attempt is timing out for some other reason), stop piling new tasks
+# behind the lock instead of growing without limit.
+_backfill_queue_depth = 0
+MAX_BACKFILL_QUEUE_DEPTH = 24
+
 OnCandle = Callable[[str, dict[str, Any], bool], Awaitable[None]]
 OnSignal = Callable[[str, dict[str, Any]], Awaitable[None]]
 
@@ -100,10 +123,25 @@ class FeedManager:
         await self.on_candle(state.display_name, candle, True)
 
         if synthetic:
-            # This candle is a placeholder for a minute that produced no
-            # ticks — every field is the last known price repeated. Firing
-            # a signal off it means predicting from data that doesn't
-            # exist, and it would be graded against another placeholder.
+            # This candle is a placeholder for a minute our own tick
+            # polling produced no ticks for — every field is the last
+            # known price repeated. Firing a signal off it means
+            # predicting from data that doesn't exist, and it would be
+            # graded against another placeholder. But the broker's own
+            # feed almost always kept moving even when our polling missed
+            # it, so fetch the real OHLC in the background (never
+            # blocking the 0-second signal path for the NEXT candle) and
+            # correct the stored row once it's back. evaluator.py gives
+            # this a short grace window before conceding a draw.
+            global _backfill_queue_depth
+            if _backfill_queue_depth < MAX_BACKFILL_QUEUE_DEPTH:
+                _backfill_queue_depth += 1
+                asyncio.create_task(self._backfill_real_candle(state, candle))
+            else:
+                logger.warning(
+                    "Backfill queue at capacity (%d) — leaving %s @ %s as a placeholder",
+                    _backfill_queue_depth, state.display_name, candle["ts"],
+                )
             logger.debug("Skipping signal for %s: no ticks in this minute", state.display_name)
             return
 
@@ -146,6 +184,58 @@ class FeedManager:
                     "result": "PENDING",
                 },
             )
+
+    async def _backfill_real_candle(self, state: PairState, candle: dict[str, Any]) -> None:
+        """Replaces a fabricated flat candle with the broker's own OHLC
+        for that minute, once it's available.
+
+        Our tick polling missing a minute doesn't mean the market was
+        flat — it means our websocket subscription didn't happen to
+        observe a tick, which turned out to be true for ~45% of minutes
+        on some pairs. Quotex's own history endpoint aggregates from its
+        real feed server-side, independent of what our client happened to
+        see, so it almost always has the real bar. This runs as a
+        fire-and-forget background task so it never delays the
+        0-second signal for the next candle."""
+        global _backfill_queue_depth
+        try:
+            try:
+                client = await get_client()
+                async with _BACKFILL_LOCK:
+                    rows = await client.get_candles(
+                        state.asset_code,
+                        candle["ts"] + config.CANDLE_PERIOD_SECONDS,
+                        config.CANDLE_PERIOD_SECONDS,
+                        config.CANDLE_PERIOD_SECONDS,
+                        timeout=BACKFILL_TIMEOUT_SECONDS,
+                        use_cache=True,
+                    )
+            except Exception:
+                logger.debug(
+                    "Backfill fetch failed for %s @ %s", state.display_name, candle["ts"], exc_info=True
+                )
+                return
+
+            real = next((r for r in (rows or []) if int(r.get("time", -1)) == candle["ts"]), None)
+            if real is None:
+                return  # broker has nothing for this minute either — the placeholder stands
+
+            o, h, l, c = float(real["open"]), float(real["high"]), float(real["low"]), float(real["close"])
+            if h == l:
+                # The broker itself reports a flat/no-trade minute — the
+                # fabricated placeholder already happened to be the right
+                # answer, nothing to correct.
+                return
+
+            await db.save_candle(state.display_name, candle["ts"], o, h, l, c, synthetic=False)
+            for c_ in state.candles:
+                if c_["ts"] == candle["ts"]:
+                    c_.update(open=o, high=h, low=l, close=c)
+                    c_.pop("synthetic", None)
+                    break
+            logger.debug("Backfilled real candle for %s @ %s", state.display_name, candle["ts"])
+        finally:
+            _backfill_queue_depth -= 1
 
     def _apply_tick(self, state: PairState, tick_time: float, price: float) -> dict[str, Any] | None:
         """Aggregates one tick into the running candle. Returns the

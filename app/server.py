@@ -114,6 +114,14 @@ async def _restart_feed() -> None:
     app_state["bootstrap_task"] = asyncio.create_task(_bootstrap_feed())
 
 
+# Cap on how far the watchdog's rebuild backoff can stretch, in multiples
+# of CONNECTION_WATCHDOG_SECONDS. At the default 60s that's a 10-minute
+# ceiling between attempts once the connection has stayed dead for a
+# while — still recovers well inside a market session, but stops
+# hammering the broker every single check interval forever.
+MAX_WATCHDOG_BACKOFF_MULTIPLE = 10
+
+
 async def _connection_watchdog() -> None:
     """Rebuilds the connection when the feed goes silent.
 
@@ -125,22 +133,50 @@ async def _connection_watchdog() -> None:
     *every* pair means the connection is gone, not that the market is
     closed. The restart reuses the pasted token — there is no password
     path to fall back to.
+
+    Rebuilding means a full teardown and a fresh Quotex login with that
+    same static token. Retrying that every single
+    CONNECTION_WATCHDOG_SECONDS with no backoff — which is what this used
+    to do — means dozens of full re-authentications per hour whenever the
+    feed doesn't recover on the first try, which is exactly the kind of
+    repeated-login pattern that gets a broker session invalidated well
+    before its normal lifetime (observed: tokens that should last ~24h
+    dying within 2-3h). So each consecutive rebuild that doesn't bring
+    ticks back waits longer before the next attempt.
     """
+    consecutive_rebuilds = 0
     while True:
         await asyncio.sleep(config.CONNECTION_WATCHDOG_SECONDS)
         manager = app_state.get("feed_manager")
         if manager is None:
+            consecutive_rebuilds = 0
+            app_state["consecutive_rebuild_failures"] = 0
             continue  # the bootstrap loop already owns the reconnect
 
         stale_for = manager.seconds_since_last_tick()
         connected = await quotex_client.is_connected()
         if connected and stale_for < config.STALE_FEED_SECONDS:
+            consecutive_rebuilds = 0
+            app_state["consecutive_rebuild_failures"] = 0
             continue
 
+        consecutive_rebuilds += 1
+        app_state["consecutive_rebuild_failures"] = consecutive_rebuilds
+        extra_wait = min(consecutive_rebuilds - 1, MAX_WATCHDOG_BACKOFF_MULTIPLE) * config.CONNECTION_WATCHDOG_SECONDS
+        if extra_wait:
+            logger.warning(
+                "Connection still dead after %d consecutive rebuild attempts — "
+                "backing off an extra %ds before trying again",
+                consecutive_rebuilds,
+                extra_wait,
+            )
+            await asyncio.sleep(extra_wait)
+
         logger.warning(
-            "Connection looks dead (authenticated=%s, no ticks for %.0fs) — rebuilding it",
+            "Connection looks dead (authenticated=%s, no ticks for %.0fs) — rebuilding it (attempt %d)",
             connected,
             stale_for,
+            consecutive_rebuilds,
         )
         app_state["reconnects"] = app_state.get("reconnects", 0) + 1
         await _restart_feed()
@@ -213,6 +249,7 @@ async def status():
         "account_mode": config.QUOTEX_ACCOUNT_MODE,
         "auth_mode": quotex_client.auth_mode(),
         "reconnects": app_state.get("reconnects", 0),
+        "consecutive_rebuild_failures": app_state.get("consecutive_rebuild_failures", 0),
         "feed_stale_seconds": (
             int(app_state["feed_manager"].seconds_since_last_tick()) if app_state.get("feed_manager") else None
         ),

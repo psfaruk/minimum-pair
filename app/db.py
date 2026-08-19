@@ -259,9 +259,11 @@ def _insert_candle_sync(
             INSERT INTO candles (pair, ts, open, high, low, close, synthetic)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(pair, ts) DO UPDATE SET
-                high=excluded.high, low=excluded.low, close=excluded.close,
+                open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close,
                 -- real ticks arriving late for a minute the feed had to
-                -- invent turn that placeholder into genuine data
+                -- invent turn that placeholder into genuine data — open
+                -- has to be corrected too, or a backfilled real candle
+                -- keeps the fabricated open and reports a fake body/wick
                 synthetic=excluded.synthetic
             """,
             (pair, ts, o, h, l, c, 1 if synthetic else 0),

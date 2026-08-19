@@ -15,6 +15,19 @@ POLL_INTERVAL_SECONDS = 5
 # re-queried every POLL_INTERVAL_SECONDS for the life of the database.
 ABANDON_AFTER_SECONDS = 600
 
+# A synthetic candle at grading time might just be a backfill race, not a
+# genuinely quiet minute: feed.py fires a background fetch of the
+# broker's real OHLC the moment a candle finalizes synthetic, but every
+# pair's fetch is serialized through one lock (see feed.py's
+# _BACKFILL_LOCK — pyquotex correlates get_candles() responses through
+# shared connection state, so concurrent fetches interleave and all time
+# out). Measured live: a full burst of 16 pairs going synthetic in the
+# same minute took up to ~100s to fully drain through that single queue.
+# Grading DRAW immediately would beat the backfill on nearly every
+# occurrence and throw away real outcomes for no reason, so this grace
+# window has to comfortably clear that worst case.
+SYNTHETIC_GRACE_SECONDS = 150
+
 
 async def _grade_one(signal: dict, on_graded: Callable[[dict], Awaitable[None]]) -> bool:
     """Attempts to grade a single pending signal. Returns True if graded."""
@@ -40,10 +53,15 @@ async def _grade_one(signal: dict, on_graded: Callable[[dict], Awaitable[None]])
         entry_price = candle["open"]
 
     if candle.get("synthetic"):
-        # The feed invented this candle because the minute arrived with no
-        # ticks, so its close is just the previous price repeated. There is
-        # no outcome to read off it — scoring it either way would be making
-        # the result up.
+        # The feed invented this candle because our own tick polling
+        # observed nothing this minute. feed.py is already trying to
+        # backfill the broker's real OHLC in the background — give that a
+        # short grace window before conceding there's truly no outcome to
+        # read off it, so a normal-speed backfill isn't beaten to the
+        # punch by this loop's own 5s poll cadence.
+        overdue = int(time.time()) - signal["target_close_ts"]
+        if overdue < SYNTHETIC_GRACE_SECONDS:
+            return False  # retry later — the backfill may still land
         result = "DRAW"
     elif close_price == entry_price:
         # Price finished exactly where it started. Brokers refund these,
