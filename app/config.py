@@ -44,10 +44,10 @@ QUOTEX_USER_AGENT = os.getenv("QUOTEX_USER_AGENT", "")
 CONNECTION_WATCHDOG_SECONDS = _int("CONNECTION_WATCHDOG_SECONDS", 60)
 STALE_FEED_SECONDS = _int("STALE_FEED_SECONDS", 300)
 
-MIN_CONFIDENCE = _float("MIN_CONFIDENCE", 0.6)
+MIN_CONFIDENCE = _float("MIN_CONFIDENCE", 0.65)
 ALWAYS_SIGNAL = _bool("ALWAYS_SIGNAL", True)
 MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS", 1)
-QUALITY_FLOOR = _float("QUALITY_FLOOR", 0.5)
+QUALITY_FLOOR = _float("QUALITY_FLOOR", 0.65)
 
 # With ALWAYS_SIGNAL on, every pair fires a row on every 60s candle close —
 # 16 pairs is ~23k candles and ~23k signals per day, forever, with no
