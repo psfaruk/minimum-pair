@@ -1,10 +1,13 @@
 import asyncio
+import logging
 import sqlite3
 import time
 from contextlib import contextmanager
 from typing import Any, Iterator
 
 from app.config import DB_PATH
+
+logger = logging.getLogger(__name__)
 
 _write_lock = asyncio.Lock()
 
@@ -116,12 +119,25 @@ def _rebuild_pattern_stats(conn: sqlite3.Connection) -> None:
     """Recomputes every per-source tally from the signals table.
 
     pattern_stats is a running total, so it can't be corrected in place
-    once the rules that produced it change — it has to be recounted from
-    the graded signals themselves.
+    once the rules that produce it change — it has to be recounted from
+    the graded signals themselves. The recount also drops duplicate
+    signals: the feed race used to fire 2-4 signals for the same
+    (pair, entry_ts), and each duplicate graded the same sources twice
+    for the same trade — inflating their sample counts with copies of
+    themselves. Only the first signal per entry minute is kept, because
+    it is the one fired at the boundary, off the real candle.
     """
     conn.execute("DELETE FROM pattern_stats")
     rows = conn.execute(
-        "SELECT pair, source, result FROM signals WHERE result IN ('WIN', 'LOSS')"
+        """
+        SELECT pair, source, result FROM (
+            SELECT pair, entry_ts, source, result,
+                   ROW_NUMBER() OVER (PARTITION BY pair, entry_ts ORDER BY id) AS rn
+            FROM signals
+            WHERE result IN ('WIN', 'LOSS')
+        )
+        WHERE rn = 1
+        """
     ).fetchall()
     tally: dict[tuple[str, str], list[int]] = {}
     for r in rows:
@@ -201,8 +217,49 @@ def _migrate_sync() -> None:
               AND close_price = entry_price
             """
         ).rowcount
-        if repaired:
+
+        # Repair the leftovers of the duplicate-signal feed race: a
+        # WIN/LOSS graded against a synthetic outcome candle is
+        # impossible by the evaluator's own rules (a synthetic outcome
+        # gets a grace window and then grades DRAW), so these rows were
+        # graded against a real candle whose row the race later
+        # overwrote. The real outcome is gone; the only honest grade
+        # left is DRAW.
+        regraded = conn.execute(
+            """
+            UPDATE signals SET result = 'DRAW', close_price = NULL
+            WHERE result IN ('WIN', 'LOSS')
+              AND id IN (
+                SELECT s.id FROM signals s
+                JOIN candles cd ON cd.pair = s.pair AND cd.ts = s.entry_ts
+                WHERE cd.synthetic = 1
+              )
+            """
+        ).rowcount
+
+        # pattern_stats has to be rebuilt whenever a grading repair lands,
+        # and once per database to drop the duplicate signals the feed
+        # race graded twice. The app_state flag keeps the one-time
+        # recount from running on every boot — the table is maintained
+        # incrementally by the evaluator after that.
+        deduped = conn.execute(
+            "SELECT 1 FROM app_state WHERE key = 'pattern_stats_deduped_v2'"
+        ).fetchone()
+        if repaired or regraded or not deduped:
             _rebuild_pattern_stats(conn)
+            conn.execute(
+                """
+                INSERT INTO app_state (key, value, updated_at)
+                VALUES ('pattern_stats_deduped_v2', '1', ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (int(time.time()),),
+            )
+        if regraded:
+            logger.info("Re-graded %d signals whose outcome candle never had real data -> DRAW", regraded)
+        if repaired:
+            logger.info("Re-graded %d flat-tie signals -> DRAW", repaired)
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_pair ON signals(pair)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_result ON signals(result)")
@@ -358,6 +415,48 @@ async def insert_signal(
             source,
             entry_price,
             tier,
+        )
+
+
+def _signal_exists_sync(pair: str, entry_ts: int) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM signals WHERE pair = ? AND entry_ts = ? LIMIT 1",
+            (pair, entry_ts),
+        ).fetchone()
+    return row is not None
+
+
+async def signal_exists(pair: str, entry_ts: int) -> bool:
+    """True if a signal already fires for this pair's entry minute. The
+    feed checks this before inserting so one pair can never get two
+    signals for the same candle (the duplicate-signal race)."""
+    return await asyncio.to_thread(_signal_exists_sync, pair, entry_ts)
+
+
+def _update_pending_entry_price_sync(
+    pair: str, entry_ts: int, old_price: float, new_price: float
+) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE signals SET entry_price = ?
+            WHERE pair = ? AND entry_ts = ? AND result = 'PENDING' AND entry_price = ?
+            """,
+            (new_price, pair, entry_ts, old_price),
+        )
+        return cur.rowcount
+
+
+async def update_pending_entry_price(
+    pair: str, entry_ts: int, old_price: float, new_price: float
+) -> int:
+    """Re-prices PENDING signals whose entry minute began with a close
+    that a late tick later corrected (see feed._flush_late_updates).
+    Only PENDING rows are touched — a graded result stands."""
+    async with _write_lock:
+        return await asyncio.to_thread(
+            _update_pending_entry_price_sync, pair, entry_ts, old_price, new_price
         )
 
 

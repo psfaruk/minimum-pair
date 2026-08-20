@@ -17,6 +17,17 @@ TICK_POLL_SECONDS = 0.05
 BOOTSTRAP_CANDLES = 200
 IN_MEMORY_CANDLES = 300
 
+# How stale a tick may be and still be folded into its (already
+# finalized) candle. Quotex OTC ticks can arrive late — in bursts after
+# a brief websocket stall — and a tick timestamped inside a minute that
+# already closed used to re-open that minute: it finalized the running
+# placeholder early, re-created the old minute as a one-tick candle, and
+# fired a second signal for the same entry minute (222 same-minute
+# CALL+PUT contradictions and 422 duplicate entry minutes in one day of
+# production data). Ticks older than this window are dropped as junk —
+# by then the minute's outcome is the candle/backfill's business.
+LATE_TICK_MAX_AGE_SECONDS = 2 * config.CANDLE_PERIOD_SECONDS
+
 # Round-trip budget for the background real-candle backfill (a WS
 # request/response to Quotex's own history endpoint). Short enough to
 # comfortably land within evaluator.py's SYNTHETIC_GRACE_SECONDS window,
@@ -153,11 +164,37 @@ class FeedManager:
         # the same reason pattern_miner already excludes them from its
         # training windows. Compact them out so every downstream detector
         # only ever sees real market data.
+        entry_ts = candle["ts"] + config.CANDLE_PERIOD_SECONDS
+
+        # One signal per entry minute, no exceptions. A second finalize
+        # of the same candle can only be a feed race (the late-tick
+        # double-finalize this file now guards against, or a restart
+        # replaying a boundary) — and a duplicate signal is worse than
+        # none: it contradicts the first in the UI and grades the same
+        # sources twice for the same trade.
+        if await db.signal_exists(state.display_name, entry_ts):
+            logger.debug(
+                "A signal already exists for %s @ %s — skipping duplicate",
+                state.display_name, entry_ts,
+            )
+            return
+
+        # A candle finalized this far past its boundary (event-loop
+        # stall, deploy freeze, DB congestion) would produce a signal
+        # whose entry minute has already closed. It would be graded
+        # instantly against a candle nobody predicted and shown as
+        # though it were current — a lie either way. Honest to skip it.
+        if time.time() - entry_ts >= config.CANDLE_PERIOD_SECONDS:
+            logger.warning(
+                "Candle %s @ %s finalized %ds late — entry minute already closed, skipping signal",
+                state.display_name, candle["ts"], int(time.time() - entry_ts),
+            )
+            return
+
         clean_candles = [c for c in state.candles if not c.get("synthetic")]
         ind = indicators.compute(clean_candles)
         dec = await decision.evaluate(state.display_name, clean_candles, ind)
         if dec is not None:
-            entry_ts = candle["ts"] + config.CANDLE_PERIOD_SECONDS
             target_close_ts = entry_ts + config.CANDLE_PERIOD_SECONDS
             signal_id = await db.insert_signal(
                 pair=state.display_name,
@@ -237,18 +274,21 @@ class FeedManager:
         finally:
             _backfill_queue_depth -= 1
 
-    def _apply_tick(self, state: PairState, tick_time: float, price: float) -> dict[str, Any] | None:
+    def _apply_tick(self, state: PairState, bucket: int, price: float) -> dict[str, Any] | None:
         """Aggregates one tick into the running candle. Returns the
         just-finalized candle dict if this tick crossed a minute
-        boundary, else None."""
-        bucket_start = int(tick_time // config.CANDLE_PERIOD_SECONDS) * config.CANDLE_PERIOD_SECONDS
+        boundary, else None.
+
+        Callers must route ticks from already-finalized minutes to
+        _handle_tick() instead — re-opening a closed minute here is what
+        produced duplicate signals and fabric candles."""
         finalized = None
 
         if state.current is None:
-            state.current = {"ts": bucket_start, "open": price, "high": price, "low": price, "close": price}
-        elif bucket_start != state.current["ts"]:
+            state.current = {"ts": bucket, "open": price, "high": price, "low": price, "close": price}
+        elif bucket != state.current["ts"]:
             finalized = state.current
-            state.current = {"ts": bucket_start, "open": price, "high": price, "low": price, "close": price}
+            state.current = {"ts": bucket, "open": price, "high": price, "low": price, "close": price}
         else:
             c = state.current
             c["high"] = max(c["high"], price)
@@ -259,6 +299,66 @@ class FeedManager:
             c.pop("synthetic", None)
 
         return finalized
+
+    def _handle_tick(
+        self,
+        state: PairState,
+        bucket: int,
+        price: float,
+        late_updates: dict[int, tuple[dict[str, Any], float]],
+    ) -> dict[str, Any] | None:
+        """Routes one tick into the running candle, guarding the boundary
+        that the duplicate-signal race lived on.
+
+        A tick whose minute already closed is folded into that finalized
+        candle instead of re-opening it: the candle's high/low/close are
+        corrected in memory (and flushed to the DB + any PENDING signal
+        by _flush_late_updates), and a placeholder minute that finally
+        saw a real tick loses its synthetic flag. `late_updates` maps
+        bucket -> (candle, close_before_this_burst) so the flush can
+        write each candle once per burst with its final value."""
+        if state.current is not None and bucket < state.current["ts"]:
+            if state.current["ts"] - bucket > LATE_TICK_MAX_AGE_SECONDS:
+                return None  # ancient tick (clock jitter/replay) — not evidence
+            candle = next((c for c in reversed(state.candles) if c["ts"] == bucket), None)
+            if candle is None:
+                return None  # older than the in-memory window — nothing to correct
+            late_updates.setdefault(bucket, (candle, candle["close"]))
+            candle["high"] = max(candle["high"], price)
+            candle["low"] = min(candle["low"], price)
+            candle["close"] = price
+            candle.pop("synthetic", None)
+            return None
+        return self._apply_tick(state, bucket, price)
+
+    async def _flush_late_updates(
+        self, state: PairState, late_updates: dict[int, tuple[dict[str, Any], float]]
+    ) -> None:
+        """Persists the late-tick folds collected by _handle_tick.
+
+        One write per candle per burst, ordered, so a burst's last tick
+        for a minute is what lands. A folded candle was finalized by the
+        timer as a placeholder, its synthetic flag is cleared here — real
+        tick evidence arrived. Any PENDING signal that used the old close
+        as its entry price is re-priced to the corrected one, so grading
+        compares against the price the minute actually ended at."""
+        for bucket, (candle, old_close) in late_updates.items():
+            await db.save_candle(
+                state.display_name,
+                bucket,
+                candle["open"],
+                candle["high"],
+                candle["low"],
+                candle["close"],
+                synthetic=False,
+            )
+            if candle["close"] != old_close:
+                await db.update_pending_entry_price(
+                    state.display_name,
+                    bucket + config.CANDLE_PERIOD_SECONDS,
+                    old_close,
+                    candle["close"],
+                )
 
     async def _run_pair(self, state: PairState) -> None:
         client = await get_client()
@@ -271,11 +371,14 @@ class FeedManager:
                 if new_ticks:
                     self.last_tick_at = time.monotonic()
 
+                late_updates: dict[int, tuple[dict[str, Any], float]] = {}
                 for t in new_ticks:
-                    finalized = self._apply_tick(state, t["time"], t["price"])
-                    state.last_tick_time = t["time"]
+                    bucket = int(t["time"] // config.CANDLE_PERIOD_SECONDS) * config.CANDLE_PERIOD_SECONDS
+                    finalized = self._handle_tick(state, bucket, t["price"], late_updates)
+                    state.last_tick_time = max(state.last_tick_time, t["time"])
                     if finalized is not None:
                         await self._finalize_candle(state, finalized)
+                await self._flush_late_updates(state, late_updates)
 
                 # Timer-based fallback close: keeps sparse OTC feeds moving
                 # even if no tick arrives right at the minute boundary.
