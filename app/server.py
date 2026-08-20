@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
+# Bumped on every production-visible change so a redeploy can be verified
+# from outside: /api/status exposes it, and Railway has no other way to
+# tell which commit a running instance was built from.
+CODE_VERSION = "2026.08.20-racefix"
+
 app_state: dict = {"quotex_connected": False, "error": None, "pairs": list(config.ALL_PAIRS.keys())}
 _ws_clients: set[WebSocket] = set()
 
@@ -240,6 +245,7 @@ app.add_middleware(
 @app.get("/api/status")
 async def status():
     return {
+        "code_version": CODE_VERSION,
         "quotex_connected": app_state["quotex_connected"],
         "error": app_state["error"],
         "pairs": app_state["pairs"],
@@ -250,6 +256,10 @@ async def status():
         "auth_mode": quotex_client.auth_mode(),
         "reconnects": app_state.get("reconnects", 0),
         "consecutive_rebuild_failures": app_state.get("consecutive_rebuild_failures", 0),
+        # Set by the boot migration once the one-time repair + dedupe
+        # recount of pattern_stats has run — proves the new code booted
+        # and repaired this instance's database.
+        "migration_deduped": bool(await db.get_state("pattern_stats_deduped_v2")),
         "feed_stale_seconds": (
             int(app_state["feed_manager"].seconds_since_last_tick()) if app_state.get("feed_manager") else None
         ),
