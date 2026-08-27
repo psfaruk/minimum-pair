@@ -63,6 +63,10 @@ class PairState:
     current: dict[str, Any] | None = None
     last_tick_time: float = 0.0
     task: asyncio.Task | None = None
+    # The most recent regime read for this pair ("trend" | "range" |
+    # "neutral") — surfaced via /api/status so consumers can see what
+    # market condition the engine believed it was trading into.
+    last_regime: str = "neutral"
 
 
 class FeedManager:
@@ -195,6 +199,7 @@ class FeedManager:
         ind = indicators.compute(clean_candles)
         dec = await decision.evaluate(state.display_name, clean_candles, ind)
         if dec is not None:
+            state.last_regime = dec.regime
             target_close_ts = entry_ts + config.CANDLE_PERIOD_SECONDS
             signal_id = await db.insert_signal(
                 pair=state.display_name,
@@ -205,6 +210,7 @@ class FeedManager:
                 source=",".join(dec.sources),
                 entry_price=candle["close"],
                 tier=dec.tier,
+                all_sources=[{"source": s, "direction": d} for s, d in dec.all_votes],
             )
             await self.on_signal(
                 state.display_name,
@@ -216,6 +222,7 @@ class FeedManager:
                     "confirmations": dec.confirmations,
                     "sources": dec.sources,
                     "tier": dec.tier,
+                    "regime": dec.regime,
                     "entry_ts": entry_ts,
                     "target_close_ts": target_close_ts,
                     "result": "PENDING",

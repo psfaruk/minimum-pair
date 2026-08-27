@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import sqlite3
 import time
@@ -70,6 +71,13 @@ def _init_sync() -> None:
                 -- fallback, which passes no quality gate and must never be
                 -- presented as an equal.
                 tier TEXT NOT NULL DEFAULT 'confirmed',
+                -- JSON array of EVERY vote fired on this candle:
+                -- [{"source": ..., "direction": "CALL"|"PUT"}, ...].
+                -- The evaluator grades all of them — the outvoted minority
+                -- included — so the weight layer learns from every source
+                -- on every candle, not only from the ones that happened to
+                -- agree with the majority.
+                all_sources TEXT,
                 -- DRAW: price finished exactly where it started. The broker
                 -- refunds these, so scoring them as losses (as this app used
                 -- to) both understates the win rate and poisons learning.
@@ -126,12 +134,17 @@ def _rebuild_pattern_stats(conn: sqlite3.Connection) -> None:
     for the same trade — inflating their sample counts with copies of
     themselves. Only the first signal per entry minute is kept, because
     it is the one fired at the boundary, off the real candle.
+
+    Since all_sources exists, every vote on a signal is graded — the
+    outvoted minority included, each on its OWN direction. Legacy rows
+    (written before the column) carry only the contributing sources in
+    `source`; they keep the old, majority-side accounting.
     """
     conn.execute("DELETE FROM pattern_stats")
     rows = conn.execute(
         """
-        SELECT pair, source, result FROM (
-            SELECT pair, entry_ts, source, result,
+        SELECT pair, source, all_sources, direction, result FROM (
+            SELECT pair, entry_ts, source, all_sources, direction, result,
                    ROW_NUMBER() OVER (PARTITION BY pair, entry_ts ORDER BY id) AS rn
             FROM signals
             WHERE result IN ('WIN', 'LOSS')
@@ -141,11 +154,26 @@ def _rebuild_pattern_stats(conn: sqlite3.Connection) -> None:
     ).fetchall()
     tally: dict[tuple[str, str], list[int]] = {}
     for r in rows:
-        for source in (r["source"] or "").split(","):
-            if not source:
-                continue
+        # outcome_direction: the direction that actually paid. A WIN on a
+        # CALL signal means CALL was right; a LOSS means PUT was.
+        if r["result"] == "WIN":
+            outcome = r["direction"]
+        else:
+            outcome = "PUT" if r["direction"] == "CALL" else "CALL"
+
+        votes: list[tuple[str, str]] = []
+        if r["all_sources"]:
+            try:
+                parsed = json.loads(r["all_sources"])
+                votes = [(v["source"], v["direction"]) for v in parsed if v.get("source")]
+            except (ValueError, TypeError, KeyError):
+                votes = []
+        if not votes:
+            votes = [(s, r["direction"]) for s in (r["source"] or "").split(",") if s]
+
+        for source, direction in votes:
             entry = tally.setdefault((source, r["pair"]), [0, 0])
-            entry[0 if r["result"] == "WIN" else 1] += 1
+            entry[0 if direction == outcome else 1] += 1
     conn.executemany(
         "INSERT INTO pattern_stats (pattern, pair, wins, losses) VALUES (?, ?, ?, ?)",
         [(source, pair, w, l) for (source, pair), (w, l) in tally.items()],
@@ -169,8 +197,7 @@ def _migrate_sync() -> None:
             conn.execute("UPDATE candles SET synthetic = 1 WHERE high = low")
 
         schema = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'signals'"
-        ).fetchone()
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'signals'").fetchone()
         if schema and "DRAW" not in (schema["sql"] or ""):
             conn.execute("DROP INDEX IF EXISTS idx_signals_pair")
             conn.execute("DROP INDEX IF EXISTS idx_signals_result")
@@ -189,6 +216,7 @@ def _migrate_sync() -> None:
                     entry_price REAL,
                     close_price REAL,
                     tier TEXT NOT NULL DEFAULT 'confirmed',
+                    all_sources TEXT,
                     result TEXT NOT NULL DEFAULT 'PENDING'
                         CHECK (result IN ('PENDING', 'WIN', 'LOSS', 'DRAW'))
                 )
@@ -205,6 +233,14 @@ def _migrate_sync() -> None:
                 """
             )
             conn.execute("DROP TABLE signals_legacy")
+
+        # 2026-08 — all_sources: every vote on a signal is persisted and
+        # graded (see _rebuild_pattern_stats). Older databases get the
+        # column added in place; existing rows keep NULL and are graded
+        # the legacy majority-side way.
+        signal_cols = {r["name"] for r in conn.execute("PRAGMA table_info(signals)")}
+        if signal_cols and "all_sources" not in signal_cols:
+            conn.execute("ALTER TABLE signals ADD COLUMN all_sources TEXT")
 
         # Repair the ties, whether they came from the legacy table or from
         # a newer database graded before this rule landed.
@@ -242,11 +278,19 @@ def _migrate_sync() -> None:
         # race graded twice. The app_state flag keeps the one-time
         # recount from running on every boot — the table is maintained
         # incrementally by the evaluator after that.
+        # v3 (2026-08): grading rules changed again — every persisted
+        # vote is now graded on its own direction (all_sources), not just
+        # the majority side. One recount aligns the table with the new
+        # rules; afterwards the evaluator maintains it incrementally.
         deduped = conn.execute(
             "SELECT 1 FROM app_state WHERE key = 'pattern_stats_deduped_v2'"
         ).fetchone()
-        if repaired or regraded or not deduped:
+        allvotes_rebuilt = conn.execute(
+            "SELECT 1 FROM app_state WHERE key = 'pattern_stats_allvotes_v3'"
+        ).fetchone()
+        if repaired or regraded or not deduped or not allvotes_rebuilt:
             _rebuild_pattern_stats(conn)
+            now = int(time.time())
             conn.execute(
                 """
                 INSERT INTO app_state (key, value, updated_at)
@@ -254,7 +298,16 @@ def _migrate_sync() -> None:
                 ON CONFLICT(key) DO UPDATE SET
                     value = excluded.value, updated_at = excluded.updated_at
                 """,
-                (int(time.time()),),
+                (now,),
+            )
+            conn.execute(
+                """
+                INSERT INTO app_state (key, value, updated_at)
+                VALUES ('pattern_stats_allvotes_v3', '1', ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (now,),
             )
         if regraded:
             logger.info("Re-graded %d signals whose outcome candle never had real data -> DRAW", regraded)
@@ -370,14 +423,15 @@ def _insert_signal_sync(
     source: str,
     entry_price: float | None,
     tier: str,
+    all_sources: str | None,
 ) -> int:
     with _connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO signals
                 (pair, direction, created_at, entry_ts, target_close_ts,
-                 confidence, source, entry_price, tier)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 confidence, source, entry_price, tier, all_sources)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 pair,
@@ -389,6 +443,7 @@ def _insert_signal_sync(
                 source,
                 entry_price,
                 tier,
+                all_sources,
             ),
         )
         return cur.lastrowid
@@ -403,7 +458,17 @@ async def insert_signal(
     source: str,
     entry_price: float | None,
     tier: str = "confirmed",
+    all_sources: list[dict[str, str]] | None = None,
 ) -> int:
+    """`all_sources` carries EVERY vote fired on the signal candle — both
+    the contributing majority AND the outvoted minority, each with its own
+    direction. The evaluator grades all of them, so a source that keeps
+    voting the wrong side finally accumulates losses and loses weight,
+    instead of being invisible to the learning loop whenever the crowd
+    outvoted it."""
+    import json as _json
+
+    payload = _json.dumps(all_sources, ensure_ascii=False) if all_sources else None
     async with _write_lock:
         return await asyncio.to_thread(
             _insert_signal_sync,
@@ -415,6 +480,7 @@ async def insert_signal(
             source,
             entry_price,
             tier,
+            payload,
         )
 
 

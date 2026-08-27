@@ -260,6 +260,13 @@ async def status():
         # recount of pattern_stats has run — proves the new code booted
         # and repaired this instance's database.
         "migration_deduped": bool(await db.get_state("pattern_stats_deduped_v2")),
+        # Per-pair regime read at each pair's latest signal: "trend",
+        # "range" or "neutral". Tells consumers what market condition the
+        # engine believed it was trading into when it last fired.
+        "regimes": {
+            name: state.last_regime
+            for name, state in app_state["feed_manager"].pairs.items()
+        } if app_state.get("feed_manager") else {},
         "feed_stale_seconds": (
             int(app_state["feed_manager"].seconds_since_last_tick()) if app_state.get("feed_manager") else None
         ),

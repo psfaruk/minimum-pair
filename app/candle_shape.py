@@ -50,6 +50,24 @@ def fractal_levels(highs: list[float], lows: list[float]) -> tuple[list[float], 
     return fractal_highs, fractal_lows
 
 
+def recent_fractal_levels(
+    highs: list[float], lows: list[float], max_levels: int = 6
+) -> tuple[list[float], list[float]]:
+    """Only the most recent `max_levels` swing highs and swing lows.
+
+    The old callers fed fractal_levels() the raw 120-candle lookback,
+    which returns hundreds of levels — a wick touches *some* level on
+    nearly every candle, so the rejection detector fired constantly and
+    the S/R distance votes were computed against prices formed up to two
+    hours earlier. Traders watch a handful of the most recent swings;
+    this returns exactly that (most recent first)."""
+    fractal_highs, fractal_lows = fractal_levels(highs, lows)
+    return (
+        list(reversed(fractal_highs[-max_levels:])),
+        list(reversed(fractal_lows[-max_levels:])),
+    )
+
+
 def trend_direction(candles: list[Candle], lookback: int = 5) -> str:
     """Crude short trend read: net close-to-close drift over the last
     `lookback` candles. Used to give reversal patterns context (a hammer

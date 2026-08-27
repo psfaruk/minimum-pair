@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from typing import Awaitable, Callable
@@ -77,9 +78,41 @@ async def _grade_one(signal: dict, on_graded: Callable[[dict], Awaitable[None]])
     await db.grade_signal(signal["id"], close_price, result)
 
     if result != "DRAW":
-        sources = [s for s in (signal["source"] or "").split(",") if s]
-        for source in sources:
-            await db.bump_pattern_stat(source, pair, result == "WIN")
+        outcome_direction = (
+            signal["direction"]
+            if result == "WIN"
+            else ("PUT" if signal["direction"] == "CALL" else "CALL")
+        )
+
+        # Grade EVERY vote this candle produced, each on its OWN
+        # direction — not just the sources that ended up on the fired
+        # signal. The old rule graded only the majority side, so a source
+        # that kept voting the wrong direction but losing the weight
+        # contest was invisible to the learning loop: no losses ever
+        # accumulated, its weight never fell, and the engine kept acting
+        # on its opinion. all_sources (persisted by feed.py from the
+        # decision's full vote list) fixes that; legacy rows without it
+        # fall back to the old majority-side accounting.
+        votes: list[tuple[str, str]] = []
+        if signal.get("all_sources"):
+            try:
+                parsed = json.loads(signal["all_sources"])
+                votes = [(v["source"], v["direction"]) for v in parsed if v.get("source")]
+            except (ValueError, TypeError, KeyError):
+                votes = []
+        if not votes:
+            votes = [
+                (s, signal["direction"])
+                for s in (signal["source"] or "").split(",")
+                if s
+            ]
+
+        seen: set[str] = set()
+        for source, direction in votes:
+            if source in seen:
+                continue
+            seen.add(source)
+            await db.bump_pattern_stat(source, pair, direction == outcome_direction)
 
     graded = dict(signal)
     graded["close_price"] = close_price

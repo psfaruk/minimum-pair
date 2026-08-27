@@ -1,6 +1,6 @@
 from typing import Any
 
-from app.candle_shape import fractal_levels
+from app.candle_shape import recent_fractal_levels
 
 RSI_PERIOD = 14
 EMA_PERIOD = 50
@@ -10,6 +10,21 @@ SMA_FAST = 8
 SMA_SLOW = 21
 ATR_PERIOD = 14
 FRACTAL_LOOKBACK = 120
+
+# A "squeeze" is RELATIVE, not absolute. The old test — bb_width < 0.5
+# — compared a raw (upper-lower)/middle ratio against 0.5, but on FX/OTC
+# price scales that ratio lives around 0.0002-0.003, so the condition
+# was true on every candle and "squeeze breakout" really meant "any
+# close outside the 2-sigma band". A squeeze now means the band is tight
+# relative to ITS OWN recent history: current width in the tightest
+# quartile of the widths seen over the lookback window.
+BB_SQUEEZE_LOOKBACK = 120
+BB_SQUEEZE_QUARTILE = 0.25
+
+# S/R levels come from the most recent swing points only — a level from
+# two hours ago is not where traders are actually positioned. See
+# candle_shape.recent_fractal_levels for the reasoning.
+SR_MAX_LEVELS = 6
 
 # NOTE: pyquotex.utils.indicators.TechnicalIndicators rounds every value to
 # 2 decimal places internally, which is fine for a 0-100 oscillator like RSI
@@ -84,6 +99,30 @@ def _bollinger(closes: list[float], period: int = BB_PERIOD, num_std: float = BB
     return mean + num_std * std, mean - num_std * std
 
 
+
+def _bb_width_percentile(closes: list[float], current_width: float) -> float | None:
+    """Where the current band width sits among the widths of the last
+    BB_SQUEEZE_LOOKBACK windows (0 = tightest, 1 = widest)."""
+    if current_width is None:
+        return None
+    end = len(closes)
+    start = max(BB_PERIOD, end - BB_SQUEEZE_LOOKBACK)
+    widths: list[float] = []
+    for j in range(start, end + 1):
+        window = closes[j - BB_PERIOD : j]
+        if len(window) < BB_PERIOD:
+            continue
+        mean = sum(window) / BB_PERIOD
+        std = (sum((x - mean) ** 2 for x in window) / BB_PERIOD) ** 0.5
+        mid = mean if mean else 1e-12
+        widths.append(2 * BB_STD * std / mid)
+    if len(widths) < 20:  # not enough history to rank against
+        return None
+    widths.sort()
+    below = sum(1 for w in widths if w < current_width)
+    return below / len(widths)
+
+
 def compute(candles: list[dict[str, Any]]) -> dict[str, Any]:
     """Computes the indicator snapshot for the most recently closed candle.
 
@@ -122,6 +161,11 @@ def compute(candles: list[dict[str, Any]]) -> dict[str, Any]:
             percent_b = (close - lower) / (upper - lower)
             bb_width = (upper - lower) / bb_middle if bb_middle else None
 
+    # Squeeze = current width in the tightest quartile of its own recent
+    # history (see the note at BB_SQUEEZE_QUARTILE above).
+    width_pctl = _bb_width_percentile(closes, bb_width) if bb_width is not None else None
+    bb_squeeze = width_pctl is not None and width_pctl <= BB_SQUEEZE_QUARTILE
+
     sma_fast_vals = _sma(closes, SMA_FAST)
     sma_slow_vals = _sma(closes, SMA_SLOW)
     sma_cross = None
@@ -134,8 +178,8 @@ def compute(candles: list[dict[str, Any]]) -> dict[str, Any]:
         fresh_cross = was_bullish != (fast_now > slow_now)
 
     lookback = candles[-FRACTAL_LOOKBACK:] if len(candles) > FRACTAL_LOOKBACK else candles
-    fractal_highs, fractal_lows = fractal_levels(
-        [c["high"] for c in lookback], [c["low"] for c in lookback]
+    fractal_highs, fractal_lows = recent_fractal_levels(
+        [c["high"] for c in lookback], [c["low"] for c in lookback], SR_MAX_LEVELS
     )
     resistance = min((h for h in fractal_highs if h > close), default=None)
     support = max((l for l in fractal_lows if l < close), default=None)
@@ -152,7 +196,8 @@ def compute(candles: list[dict[str, Any]]) -> dict[str, Any]:
         "bb_middle": bb_middle,
         "bb_lower": bb_lower,
         "bb_width": bb_width,
-        "bb_squeeze": bb_width is not None and atr14 is not None and bb_width < 0.5,
+        "bb_squeeze": bb_squeeze,
+        "bb_width_percentile": width_pctl,
         "sma_cross": sma_cross,
         "sma_fresh_cross": fresh_cross,
         "support": support,

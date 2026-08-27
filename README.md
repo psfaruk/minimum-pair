@@ -1,5 +1,79 @@
 # minimum-pair
 
+## Why signals were wrong — and what changed (2026-08, engine rebuild)
+
+A walk-forward A/B of the FULL pipeline (`tools/backtest_engine.py`,
+identical data through the old and the new engine) measured the old
+engine at **45.7%** on an OTC-style mean-reverting feed — below the
+~54% breakeven, i.e. guaranteed loss — and the rebuilt engine at
+**56.8%** on the same data, with the same honesty preserved on
+driftless noise (~50%). Six root causes were found and fixed:
+
+1. **No regime detection (wrong theory applied).** The vote pool mixed
+   mean-reversion sources (RSI extremes, band bounces, wick
+   rejections, S/R fades) with trend-following sources (EMA/SMA
+   alignment, marubozu continuation, squeeze breakouts) and never asked
+   which condition the pair was actually in. In a trend, reversal votes
+   fire repeatedly against the move; in a range, trend votes enter
+   after the move is exhausted. NEW `app/regime.py` reads the market
+   first — Kaufman efficiency ratio + lag-1 autocorrelation of returns
+   → `trend` / `range` / `neutral` with a strength — and every vote is
+   weighed by how well its theory matches that condition (matching
+   family up to 1.6x, opposing family down to 0.4x, never zero).
+
+2. **The noise filler threw away the engine's own answer.** When the
+   quality gates failed (most OTC candles), `_noise_decision()`
+   discarded the computed net direction and answered with
+   last-candle-colour following — worth exactly 50% and the single
+   biggest visible source of wrong predictions, because
+   `ALWAYS_SIGNAL` means most displayed signals ARE fillers. The filler
+   now carries the ensemble's best direction (regime-weighted,
+   measured-weighted), with regime-aware fallbacks behind it.
+
+3. **`bb_squeeze` was always true.** The test compared the raw band
+   width ratio (0.0002–0.003 on FX scales) against 0.5 — every candle
+   "squeezed", so "squeeze breakout" really meant "any close outside
+   the 2σ band". A squeeze now means the width sits in the tightest
+   quartile of its own recent history.
+
+4. **Fractal S/R was too dense.** Levels from the last 120 candles
+   produced hundreds of swing points; some wick touched *some* level on
+   nearly every candle, letting the rejection detector drive or veto
+   the whole engine. Both the indicator S/R and the rejection detector
+   now use only the most recent swings (`recent_fractal_levels`, 6 per
+   side).
+
+5. **Learning was selection-biased.** The evaluator graded only the
+   sources that made it onto the fired signal (the majority side) — a
+   source that kept voting the wrong direction but losing the weight
+   contest never accumulated losses and was never demoted. Every signal
+   now persists ALL votes in `signals.all_sources` (JSON) and every
+   vote is graded on its OWN direction; `pattern_stats` was recounted
+   once under the new rule (`pattern_stats_allvotes_v3`).
+
+6. **A lone unmeasured vote could confirm.** `MIN_CONFIRMATIONS=1` plus
+   a structural weight of 1.0 meant any single detector firing alone
+   produced a "confirmed" signal. A lone vote now confirms only when
+   its source has measured above `LONE_VOTE_MIN_WEIGHT` (0.80) on that
+   pair; otherwise it still fires — as best-effort noise carrying the
+   same direction.
+
+Extras: the microstructure fallback now FADES the last move when the
+regime reads a confident range (on mean-reverting OTC feeds,
+colour-following is systematically wrong; the fade is the theory the
+feed is exhibiting), `/api/status` exposes per-pair `regimes`, the WS
+signal payload carries `regime`, and noise signals are best-effort but
+still honestly tiered — poll `/api/signals?tier=confirmed` for only the
+gated ones.
+
+Verification tooling (committed): `tools/backtest_engine.py` (walk-
+forward full-pipeline A/B over deterministic synthetic feeds:
+random_walk / mean_revert / trending / mixed, `--learn` to run the
+weight-learning loop), `tools/regime_calibration.py` (regime threshold
+calibration against driftless noise), `tools/diagnose_sources.py`
+(per-source win rates on generated data), and
+`tests/test_engine_fixes.py` (unit coverage for all six fixes).
+
 ## Token-only auth surface (2026-08)
 
 The app authenticates against Quotex **only** through a session token

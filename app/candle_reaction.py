@@ -27,7 +27,7 @@ bucket mixing them all together.
 """
 from typing import Any
 
-from app.candle_shape import body, candle_range, fractal_levels, lower_wick, upper_wick
+from app.candle_shape import body, candle_range, recent_fractal_levels, lower_wick, upper_wick
 from app import indicators
 
 Candle = dict[str, Any]
@@ -150,10 +150,16 @@ def _detect_bb_rejection(cur: Candle, ind: dict[str, Any] | None) -> tuple[str, 
 
 def _detect_fractal_rejection(cur: Candle, context: list[Candle]) -> tuple[str, str] | None:
     """Original fractal S/R rejection — kept as the legacy core of the
-    candle-reaction family."""
+    candle-reaction family.
+
+    Levels come from the most recent swings only (see
+    candle_shape.recent_fractal_levels): against the full 120-candle
+    lookback the level set was so dense that some wick touched *some*
+    level on nearly every candle, which let this one source drive or veto
+    almost the entire engine."""
     if len(context) < 5:
         return None
-    fractal_highs, fractal_lows = fractal_levels(
+    fractal_highs, fractal_lows = recent_fractal_levels(
         [c["high"] for c in context], [c["low"] for c in context]
     )
     b = max(body(cur), 1e-12)

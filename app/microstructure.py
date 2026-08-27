@@ -4,7 +4,15 @@ single directional score. Used two ways in decision.py:
   1. as the ALWAYS_SIGNAL fallback source when nothing else fires
   2. as an agreement check — a pattern/indicator signal against the
      microstructure read is treated as weaker evidence, not vetoed
-     outright (microstructure is a rough, noisy read on its own)."""
+     outright (microstructure is a rough, noisy read on its own).
+
+2026-08 — regime-aware follow/fade. The scorer used to be pure
+momentum: it followed the last candle's colour unconditionally. On a
+mean-reverting (range-regime) OTC feed that is systematically wrong —
+the honest read there is the FADE. `score(..., fade=True)` flips the
+momentum components (colour, body, trend, streak) while keeping the
+wick component, which is already a reversal argument in both modes.
+decision.py sets `fade` from the detected regime."""
 from typing import Any
 
 from app.candle_shape import body_ratio, candle_range, is_bull, lower_wick, trend_direction, upper_wick
@@ -35,12 +43,20 @@ def _streak(candles: list[Candle]) -> tuple[int, str]:
     return min(n, STREAK_CAP), last_dir
 
 
-def score(candles: list[Candle]) -> dict[str, Any]:
-    """Returns {"direction": "CALL"|"PUT"|None, "strength": 0..1}."""
+def score(candles: list[Candle], fade: bool = False) -> dict[str, Any]:
+    """Returns {"direction": "CALL"|"PUT"|None, "strength": 0..1}.
+
+    `fade=True` inverts the momentum components: the score then measures
+    how strongly the market should reverse the last move, not continue
+    it. The wick-imbalance component is deliberately NOT flipped —
+    a long lower wick argues for rejection of the lows (bullish) whether
+    the regime fades or follows."""
     if not candles:
         return {"direction": None, "strength": 0.0}
 
     cur = candles[-1]
+    momentum_sign = -1.0 if fade else 1.0
+
     color = 1.0 if is_bull(cur) else -1.0
     body_component = color * body_ratio(cur)
 
@@ -54,11 +70,9 @@ def score(candles: list[Candle]) -> dict[str, Any]:
     streak_component = (streak_len / STREAK_CAP) * (1.0 if streak_dir == "up" else -1.0)
 
     raw = (
-        W_COLOR * color
-        + W_BODY * body_component
+        momentum_sign * (W_COLOR * color + W_BODY * body_component)
         + W_WICK * wick_component
-        + W_TREND * trend_component
-        + W_STREAK * streak_component
+        + momentum_sign * (W_TREND * trend_component + W_STREAK * streak_component)
     )
     strength = min(abs(raw), 1.0)
     if strength < 0.05:
