@@ -67,9 +67,10 @@ def _init_sync() -> None:
                 source TEXT NOT NULL,
                 entry_price REAL,
                 close_price REAL,
-                -- 'confirmed' = the gated path; 'noise' = the ALWAYS_SIGNAL
-                -- fallback, which passes no quality gate and must never be
-                -- presented as an equal.
+                -- 'confirmed' = passed every quality gate — the only tier
+                -- decision.evaluate() can produce now. 'noise' (the old
+                -- ALWAYS_SIGNAL filler, no quality gate at all) may still
+                -- appear on rows written before that filler was removed.
                 tier TEXT NOT NULL DEFAULT 'confirmed',
                 -- JSON array of EVERY vote fired on this candle:
                 -- [{"source": ..., "direction": "CALL"|"PUT"}, ...].

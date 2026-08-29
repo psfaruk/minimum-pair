@@ -4,10 +4,11 @@ candles.
 
 Why this exists: the per-source matrix in app/backtest.py measures each
 source in isolation. It cannot tell you whether the ENGINE as a whole
-picks the right direction, because weighting, regime scaling, vetoes and
-tier gating only exist in the combination. This harness replays candle
-by candle, grades every fired signal against the next candle's close
-(the real binary-option outcome), and reports win rates per tier.
+picks the right direction, because weighting, regime scaling, and
+vetoes only exist in the combination. This harness replays candle by
+candle, grades every fired (confirmed) signal against the next candle's
+close (the real binary-option outcome), and reports the overall win
+rate plus how often the gates let a candle trade at all.
 
 Data generators (--gen), all deterministic per seed:
 
@@ -149,7 +150,12 @@ async def run(engine: str, candles: list[dict], learn: bool) -> dict:
     pair = "TEST"
     clean = [dict(c) for c in candles]
 
-    tally = {"confirmed": [0, 0], "noise": [0, 0]}  # tier -> [wins, losses]
+    # There is no more noise-tier fallback: evaluate() returns None on any
+    # gate failure instead of a filler Decision, so every fired signal is
+    # tier=="confirmed" and `skipped` is now the count of candles that
+    # didn't earn a signal at all — the trade-frequency cost of dropping
+    # the old ALWAYS_SIGNAL filler.
+    wins = losses = 0
     draws = skipped = 0
     direction_counts = {"CALL": 0, "PUT": 0}
 
@@ -169,7 +175,8 @@ async def run(engine: str, candles: list[dict], learn: bool) -> dict:
 
         outcome_call = following["close"] > current["close"]
         won = (dec.direction == "CALL") == outcome_call
-        tally[dec.tier][0 if won else 1] += 1
+        wins += won
+        losses += not won
         direction_counts[dec.direction] += 1
 
         if learn:
@@ -189,24 +196,14 @@ async def run(engine: str, candles: list[dict], learn: bool) -> dict:
                 # replay has to force it so the weights actually learn.
                 decision._pattern_perf_cache_ts = 0.0
 
-    def rate(t: str) -> float | None:
-        w, l = tally[t]
-        n = w + l
-        return round(w / n, 4) if n else None
-
-    total_w = tally["confirmed"][0] + tally["noise"][0]
-    total_l = tally["confirmed"][1] + tally["noise"][1]
+    traded = wins + losses
     return {
         "engine": engine,
         "bars": len(clean),
-        "traded": total_w + total_l,
+        "traded": traded,
         "draws": draws,
         "skipped": skipped,
-        "win_rate_all": round(total_w / (total_w + total_l), 4) if total_w + total_l else None,
-        "win_rate_confirmed": rate("confirmed"),
-        "n_confirmed": tally["confirmed"][0] + tally["confirmed"][1],
-        "win_rate_noise": rate("noise"),
-        "n_noise": tally["noise"][0] + tally["noise"][1],
+        "win_rate": round(wins / traded, 4) if traded else None,
         "calls": direction_counts["CALL"],
         "puts": direction_counts["PUT"],
     }
@@ -239,10 +236,8 @@ async def main() -> None:
         print(json.dumps(result, indent=2))
         return
     print(f"[{args.engine}] gen={args.gen} seed={args.seed} learn={args.learn}")
-    print(f"  bars={result['bars']} traded={result['traded']} draws={result['draws']}")
-    print(f"  win_rate_all       = {result['win_rate_all']}")
-    print(f"  win_rate_confirmed = {result['win_rate_confirmed']} (n={result['n_confirmed']})")
-    print(f"  win_rate_noise     = {result['win_rate_noise']} (n={result['n_noise']})")
+    print(f"  bars={result['bars']} traded={result['traded']} skipped={result['skipped']} draws={result['draws']}")
+    print(f"  win_rate = {result['win_rate']} (n={result['traded']})")
     print(f"  calls={result['calls']} puts={result['puts']}")
 
 
