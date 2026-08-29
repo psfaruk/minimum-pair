@@ -69,7 +69,6 @@ App.tabs.settings = {
     document.getElementById("settingsPersistence").textContent = "on (database-backed)";
     document.getElementById("settingsFeedHealth").textContent = this.describeFeedHealth(s);
     document.getElementById("settingsMinConf").textContent = (s.min_confidence * 100).toFixed(0) + "%";
-    document.getElementById("settingsAlwaysSignal").textContent = s.always_signal ? "on" : "off";
     this._active = s.active_pairs || [];
     this.renderPairs();
   },

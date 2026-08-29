@@ -7,13 +7,6 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT_DIR / ".env")
 
 
-def _bool(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return val.strip().lower() in ("1", "true", "yes", "on")
-
-
 def _float(name: str, default: float) -> float:
     val = os.getenv(name)
     return float(val) if val else default
@@ -45,19 +38,19 @@ CONNECTION_WATCHDOG_SECONDS = _int("CONNECTION_WATCHDOG_SECONDS", 60)
 STALE_FEED_SECONDS = _int("STALE_FEED_SECONDS", 300)
 
 MIN_CONFIDENCE = _float("MIN_CONFIDENCE", 0.65)
-ALWAYS_SIGNAL = _bool("ALWAYS_SIGNAL", True)
 MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS", 1)
 QUALITY_FLOOR = _float("QUALITY_FLOOR", 0.65)
 
-# With ALWAYS_SIGNAL on, every pair fires a row on every 60s candle close —
-# 16 pairs is ~23k candles and ~23k signals per day, forever, with no
-# cleanup. Left unbounded this both grows the Railway volume indefinitely
-# and makes /api/patterns and /api/winrate (full-table scans) slower every
-# day. pattern_stats (the compact aggregate weights.py actually learns
-# from) is never pruned — only the raw per-candle/per-signal log rows are,
-# so pruning does not erase what a source has learned. PENDING signals are
-# never pruned regardless of age; only rows already graded (WIN/LOSS/DRAW)
-# or plain candle history count against the window.
+# Candle history still grows without bound regardless of how many signals
+# fire — 16 pairs at one 60s candle each is ~23k candle rows/day, forever,
+# with no cleanup. Left unbounded this both grows the Railway volume
+# indefinitely and makes /api/patterns and /api/winrate (full-table scans)
+# slower every day. pattern_stats (the compact aggregate weights.py
+# actually learns from) is never pruned — only the raw per-candle/
+# per-signal log rows are, so pruning does not erase what a source has
+# learned. PENDING signals are never pruned regardless of age; only rows
+# already graded (WIN/LOSS/DRAW) or plain candle history count against
+# the window.
 CANDLE_RETENTION_DAYS = _int("CANDLE_RETENTION_DAYS", 30)
 SIGNAL_RETENTION_DAYS = _int("SIGNAL_RETENTION_DAYS", 60)
 PRUNE_INTERVAL_SECONDS = _int("PRUNE_INTERVAL_SECONDS", 3600)

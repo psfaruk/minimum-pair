@@ -191,7 +191,7 @@ def fade_last_move(regime: dict[str, Any]) -> bool:
     """Whether the market is currently mean-reverting strongly enough that
     last-candle momentum should be faded rather than followed.
 
-    This is what the ALWAYS_SIGNAL fallback needs: on a range-regime OTC
+    Feeds into microstructure.score()'s fade mode: on a range-regime OTC
     feed, following the last candle's colour is systematically wrong —
     the colour-fade is the theory the feed is actually exhibiting.
     """

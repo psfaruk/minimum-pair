@@ -140,8 +140,9 @@ def _sources_firing(pair: str, history: list[Candle], miner_library: dict) -> li
         if entry is not None:
             firing.append((f"{pattern_miner.PATTERN_PREFIX}_{key}", entry["direction"]))
 
-    # The always-on filler, measured like everything else so its true
-    # value (none) is visible rather than assumed.
+    # A naive colour-following baseline, measured like everything else so
+    # its true value (none) is visible rather than assumed — it never
+    # fires a live signal, it's here purely for comparison.
     firing.append(("fallback_color", decision._fallback_vote(clean_history).direction))
 
     return firing
