@@ -67,10 +67,11 @@ def _init_sync() -> None:
                 source TEXT NOT NULL,
                 entry_price REAL,
                 close_price REAL,
-                -- 'confirmed' = passed every quality gate — the only tier
-                -- decision.evaluate() can produce now. 'noise' (the old
-                -- ALWAYS_SIGNAL filler, no quality gate at all) may still
-                -- appear on rows written before that filler was removed.
+                -- 'confirmed' = passed every quality gate; 'fallback' =
+                -- the per-candle-guarantee filler (no quality gate),
+                -- honestly tiered so it's never presented as an equal.
+                -- Some pre-2026-08-29 rows may carry the old tier name
+                -- 'noise' for the same fallback concept.
                 tier TEXT NOT NULL DEFAULT 'confirmed',
                 -- JSON array of EVERY vote fired on this candle:
                 -- [{"source": ..., "direction": "CALL"|"PUT"}, ...].

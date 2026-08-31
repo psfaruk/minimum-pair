@@ -22,11 +22,10 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app import config, db, decision, feed  # noqa: E402
+from app import config, db, feed  # noqa: E402
 
 
 async def noop(*_args, **_kwargs):
@@ -46,16 +45,6 @@ async def main() -> None:
 
     fm = feed.FeedManager(on_candle=noop, on_signal=on_signal)
 
-    # This file tests feed-level race/dedup mechanics (late ticks, double
-    # finalize, synthetic-candle repair), not decision quality — decision
-    # now only confirms on real quality gates, which the tiny two-tick
-    # fixtures below have no chance of clearing. Pin evaluate() to always
-    # confirm so a signal fires exactly when the feed layer decides to
-    # call evaluate(), independent of decision.py's own gating.
-    always_confirms = decision.Decision(
-        direction="CALL", confidence=None, confirmations=1, sources=["mock"], tier="confirmed",
-    )
-
     # --- scenario 1 + 2: normal boundary finalize, then a late-tick burst
     state = feed.PairState(display_name="TEST", asset_code="TEST")
     base = int(time.time())  # real clock so the stale guard sees real ages
@@ -70,8 +59,7 @@ async def main() -> None:
         "ts": base + 60, "open": 101.0, "high": 101.0, "low": 101.0,
         "close": 101.0, "synthetic": True,
     }
-    with patch.object(decision, "evaluate", return_value=always_confirms):
-        await fm._finalize_candle(state, finalized)
+    await fm._finalize_candle(state, finalized)
     assert len(signals) == 1, f"expected 1 signal, got {len(signals)}"
     assert signals[0]["entry_ts"] == base + 60
 
@@ -104,8 +92,7 @@ async def main() -> None:
         "ts": base + 120, "open": 103.0, "high": 103.0, "low": 103.0,
         "close": 103.0, "synthetic": True,
     }
-    with patch.object(decision, "evaluate", return_value=always_confirms):
-        await fm._finalize_candle(state, finalized2)
+    await fm._finalize_candle(state, finalized2)
     assert len(signals) == 2, f"expected 2 signals, got {len(signals)}"
     row2 = await db.get_candle("TEST", base + 60)
     assert row2["synthetic"] == 0

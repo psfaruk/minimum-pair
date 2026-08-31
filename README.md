@@ -1,37 +1,35 @@
 # minimum-pair
 
-## The noise filler is gone — confirmed-only signals (2026-08)
+## Per-candle guarantee, honestly tiered (2026-08-30)
 
-`ALWAYS_SIGNAL` (previously on by default) forced a signal on every
-60-second candle for every pair regardless of quality — 16 pairs meant
-~23k rows/day, and on thin OTC feeds most of those failed every quality
-gate and fell back to `decision._noise_decision()`: a coin-flip filler,
-tagged `tier=noise`, carrying no confidence. The volume of predictions
-this produced — real trading calls buried in a constant stream of
-50/50 filler — was reported as unacceptable, and per that report the
-filler has been removed entirely:
+Two requirements landed back to back, pulling in opposite directions:
+"এত পরিমাণে প্রেডিকশন হয় যা অগ্রহণযোগ্য... শুধুমাত্র ট্রেডিং স্ট্রাটেজি
+দিয়ে সিগন্যাল আসবে" (too much prediction volume, unacceptable — only
+real trading-strategy signals should fire) briefly removed the always-on
+filler entirely (`decision.evaluate()` returned `None` on any gate
+failure). Right after, "প্রত্যেক ক্যান্ডেল এ সিগন্যাল আসতে হবে" (a
+signal must come on every candle) asked for the guarantee back. Both are
+satisfied together the same way the engine originally did it, just with
+clearer terminology:
 
-- `decision.evaluate()` now returns `None` on any gate failure
-  (insufficient confirmations, conflicting votes, an unproven lone
-  vote, a microstructure or wick-rejection veto, structural weight
-  below `QUALITY_FLOOR`, or measured confidence below `MIN_CONFIDENCE`)
-  instead of falling back to a filler `Decision`. `app/feed.py` already
-  treated a `None` decision as "nothing to do here" — no DB row, no
-  broadcast — so removing the filler needed no change there.
-- The `ALWAYS_SIGNAL` config flag, the `noise` tier, and the fallback
-  direction logic that powered it are gone from the live path.
-  `fallback_color` (last-candle-colour) still exists, but only as a
-  reference row in `/api/backtest` showing that naive colour-following
-  has no edge — it never fires a live signal.
-- This **reverses** the earlier "প্রত্যেক পেয়ার এ প্রত্যেক ক্যান্ডেল এ
-  সিগন্যাল আসতে হবে" (every pair, every candle, a signal must come)
-  requirement described below — that guarantee traded volume for
-  quality, and the volume turned out to be the problem. A pair now
-  shows nothing new until its sources actually clear the gates; polling
-  `/api/live` or `/api/signals` between confirmed calls returns the
-  last one, aging past `stale: true` after 3 minutes with no update.
-- Old rows written before this change may still carry `tier=noise` —
-  they aren't rewritten, only left to age out via `SIGNAL_RETENTION_DAYS`.
+- Every real finalized candle still fires a signal — `decision.evaluate()`
+  only returns `None` for the very first bootstrap call (zero candles).
+  Every other path — insufficient confirmations, conflicting votes, an
+  unproven lone vote, a microstructure/wick-rejection veto, structural
+  weight below `QUALITY_FLOOR`, or measured confidence below
+  `MIN_CONFIDENCE` — routes through `decision._fallback_decision()`
+  instead, which always returns a `Decision`.
+- Every signal carries a `tier`: `confirmed` passed every quality gate;
+  `fallback` is the best-effort filler that carries no confidence and
+  is no better than the engine's best guess. The fallback direction is
+  the ensemble's own regime-weighted net read when one exists, falling
+  through to microstructure, then a literal wick rejection, then plain
+  last-candle colour only when nothing else fired at all — never a pure
+  coin flip while there's a real read available. Poll
+  `/api/signals?tier=confirmed` to see only the gated ones.
+- (Pre-2026-08-29 rows, from a short-lived version of this filler, may
+  carry the old tier name `noise` for the same fallback concept — same
+  meaning, different label.)
 
 ## Why signals were wrong — and what changed (2026-08, engine rebuild)
 
@@ -144,22 +142,20 @@ app waits.
 `/api/status` exposes `auth_mode` so the Settings tab can show
 exactly where the app is in this cycle.
 
-## Per-pair, per-candle signal guarantee — superseded, see top of file
+## Per-pair, per-candle signal guarantee
 
-**This section describes the OLD behaviour and no longer holds** — see
-"The noise filler is gone" at the top of this file. It's kept here for
-history: every real finalized candle used to produce a signal, either
-`confirmed` (passed the quality gates) or `noise` (the fallback
-filler), per the original requirement (*"প্রত্যেক পেয়ার এ প্রত্যেক
-ক্যান্ডেল এ সিগন্যাল আসতে হবে"*). That guarantee is gone; a candle
-that doesn't clear the gates now produces nothing.
+Per the user requirement (*"প্রত্যেক পেয়ার এ প্রত্যেক ক্যান্ডেল এ
+সিগন্যাল আসতে হবে"*), every real finalized candle produces a
+signal — either `confirmed` (passed the quality gates) or `fallback`
+(the best-effort filler, see "Per-candle guarantee, honestly tiered"
+at the top of this file for how the two coexist without the volume
+complaint that first triggered removing this guarantee).
 
-When a signal does fire, it's still fired at the **0-second mark**
-when a new candle opens (computed from the just-closed previous
-candle), and the chart view still shows it as a coloured arrow on its
-candle (green up-arrow for CALL, red down-arrow for PUT) — that timing
-and rendering are unchanged, only the guarantee that *something* fires
-every candle is gone.
+A signal is fired at the **0-second mark** when a new candle opens
+(computed from the just-closed previous candle). The chart view
+shows every signal as a coloured arrow on its candle (green up-arrow
+for CALL, red down-arrow for PUT), so the per-candle promise is also
+visible.
 
 ## Open public signal API
 
@@ -311,10 +307,12 @@ market reads. What changed:
   stays continuous. It is a placeholder, not market data:
   `candles.synthetic` marks it, nothing fires a signal on it, nothing
   is graded against it, and the miner doesn't train on it.
-- **Every signal carries a `tier`.** It's always `confirmed` now — it
-  passed the quality gates. (Rows fired before the noise filler was
-  removed may still show `tier=noise`, no better than a coin flip;
-  `/api/signals?tier=confirmed` filters those out if any remain.)
+- **Every signal carries a `tier`.** `confirmed` passed the quality
+  gates; `fallback` is the per-candle-guarantee filler that exists so
+  each pair always shows something, and is no better than a coin flip.
+  Poll `/api/signals?tier=confirmed` to get only the gated ones. (Rows
+  fired before 2026-08-30 may show the old tier name `tier=noise` for
+  the same concept.)
 - **`confidence` is a measurement or it is `null`.** It's the measured
   hit rate of this signal's sources on this pair, and stays `null`
   until there are at least 25 graded samples.

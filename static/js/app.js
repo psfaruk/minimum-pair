@@ -38,12 +38,14 @@ App.allPairNames = () => [...App.state.pairs.forex, ...App.state.pairs.otc];
 // is the opposite of "not known".
 App.fmtConf = (c) => (c === null || c === undefined ? "conf —" : `conf ${(c * 100).toFixed(0)}%`);
 
-// The noise filler tier has been removed — every new signal is
-// confirmed. This badge only still matters for legacy rows fired before
-// the removal, which pass no quality gate and are no better than a coin
-// flip, so they must never look like the confirmed ones.
+// Fallback-tier signals exist so every pair always shows something on
+// every candle. They pass no quality gate and carry no measured
+// confidence, so they must never look like the confirmed ones. "noise"
+// is the pre-2026-08-30 name for the same concept, kept for old rows.
 App.tierBadge = (tier) =>
-  tier === "noise" ? '<span class="tier-badge noise" title="No confirmation — legacy filler signal">noise</span>' : "";
+  tier === "fallback" || tier === "noise"
+    ? '<span class="tier-badge noise" title="No confirmation — best-effort fallback signal">fallback</span>'
+    : "";
 
 App.refreshWinRates = async () => {
   const rows = await App.api("/api/winrate");

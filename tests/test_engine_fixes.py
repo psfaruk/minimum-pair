@@ -8,10 +8,10 @@ Covers:
   3. indicators bb_squeeze — now relative to the band's own recent
      width history (the old absolute 0.5 test was always true).
   4. recent_fractal_levels — only the most recent swings survive.
-  5. decision gate failure — evaluate() returns None (no signal) when
-     the vote pool doesn't clear the gates, instead of firing a filler.
-  6. decision lone-vote rule — a single unmeasured vote produces no
-     signal, not confirmed; a strong measured lone vote confirms.
+  5. decision fallback path — the ensemble's own net direction is used
+     as the fallback direction instead of being thrown away.
+  6. decision lone-vote rule — a single unmeasured vote fires fallback,
+     not confirmed; a strong measured lone vote confirms.
   7. evaluator all-votes grading — outvoted minority sources
      accumulate losses, which the old majority-only rule never let
      happen.
@@ -155,10 +155,9 @@ def test_recent_fractal_levels():
     print("  recent_fractal_levels OK")
 
 
-def test_below_gate_produces_no_signal():
-    """A below-quality-floor vote pool must produce no signal at all —
-    the old noise filler (which fired anyway with the ensemble's
-    direction) has been removed."""
+def test_fallback_uses_ensemble_direction():
+    """A below-quality-floor vote pool must still steer the fallback
+    signal by its own net direction, not by last-candle colour."""
     tmp = Path(tempfile.mkdtemp())
     db.DB_PATH = tmp / "t3.db"
     asyncio.run(db.init_db())
@@ -176,10 +175,14 @@ def test_below_gate_produces_no_signal():
         patch.object(decision.pattern_miner, "predict", return_value=None),
     ):
         dec = asyncio.run(decision.evaluate("TESTPAIR", mild, ind))
-    # A lone oversold vote (weight 0.5 < 0.8) cannot confirm, and there is
-    # no filler tier to fall back to any more — evaluate() must return None.
-    assert dec is None, f"lone unmeasured vote below LONE_VOTE_MIN_WEIGHT must produce no signal, got {dec}"
-    print("  decision.below-gate-no-signal OK")
+    assert dec is not None
+    # A lone oversold vote (weight 0.5 < 0.8) cannot confirm — but the
+    # fired fallback signal must carry the ensemble's direction (CALL,
+    # the reversion read), NOT the colour-follow PUT.
+    assert dec.tier == "fallback", f"lone unmeasured vote must be fallback, got {dec.tier}"
+    assert dec.direction == "CALL", f"fallback should carry the ensemble's direction, got {dec.direction}"
+    assert dec.sources == ["rsi_oversold"]
+    print("  decision.fallback-uses-ensemble OK")
 
 
 def test_measured_lone_vote_can_confirm():
@@ -217,7 +220,7 @@ def test_measured_lone_vote_can_confirm():
 
 def test_lone_vote_cannot_confirm():
     votes = [decision.Vote("CALL", 0.5, "rsi_oversold", regime.FAMILY_REVERSION)]
-    # Below LONE_VOTE_MIN_WEIGHT -> no signal; at/above -> confirmed
+    # Below LONE_VOTE_MIN_WEIGHT -> fallback; at/above -> confirmed
     # happens in evaluate(); here we assert the threshold logic directly.
     assert votes[0].weight < decision.LONE_VOTE_MIN_WEIGHT
     strong = decision.Vote("CALL", decision.LONE_VOTE_MIN_WEIGHT, "measured_source")
@@ -302,7 +305,7 @@ if __name__ == "__main__":
     test_regime_family_multiplier()
     test_bb_squeeze_relative()
     test_recent_fractal_levels()
-    test_below_gate_produces_no_signal()
+    test_fallback_uses_ensemble_direction()
     test_measured_lone_vote_can_confirm()
     test_lone_vote_cannot_confirm()
     asyncio.run(_test_all_votes_graded())
