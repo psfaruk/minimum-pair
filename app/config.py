@@ -41,16 +41,16 @@ MIN_CONFIDENCE = _float("MIN_CONFIDENCE", 0.65)
 MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS", 1)
 QUALITY_FLOOR = _float("QUALITY_FLOOR", 0.65)
 
-# Candle history still grows without bound regardless of how many signals
-# fire — 16 pairs at one 60s candle each is ~23k candle rows/day, forever,
-# with no cleanup. Left unbounded this both grows the Railway volume
-# indefinitely and makes /api/patterns and /api/winrate (full-table scans)
-# slower every day. pattern_stats (the compact aggregate weights.py
-# actually learns from) is never pruned — only the raw per-candle/
-# per-signal log rows are, so pruning does not erase what a source has
-# learned. PENDING signals are never pruned regardless of age; only rows
-# already graded (WIN/LOSS/DRAW) or plain candle history count against
-# the window.
+# Every pair fires a signal row on every 60s candle close (the per-candle
+# guarantee — see app/decision.py's _fallback_decision()) — 16 pairs is
+# ~23k candles and ~23k signals per day, forever, with no cleanup. Left
+# unbounded this both grows the Railway volume indefinitely and makes
+# /api/patterns and /api/winrate (full-table scans) slower every day.
+# pattern_stats (the compact aggregate weights.py actually learns from)
+# is never pruned — only the raw per-candle/per-signal log rows are, so
+# pruning does not erase what a source has learned. PENDING signals are
+# never pruned regardless of age; only rows already graded (WIN/LOSS/
+# DRAW) or plain candle history count against the window.
 CANDLE_RETENTION_DAYS = _int("CANDLE_RETENTION_DAYS", 30)
 SIGNAL_RETENTION_DAYS = _int("SIGNAL_RETENTION_DAYS", 60)
 PRUNE_INTERVAL_SECONDS = _int("PRUNE_INTERVAL_SECONDS", 3600)

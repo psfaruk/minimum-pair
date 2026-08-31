@@ -188,12 +188,11 @@ async def _connection_watchdog() -> None:
 
 
 async def _prune_loop() -> None:
-    """Keeps the candles/signals tables from growing forever. Candle
-    history alone is 16 pairs writing a row per pair per 60s close —
-    tens of thousands of rows a day, unbounded, on a billed Railway
-    volume, regardless of how many of those candles fire a signal.
-    pattern_stats (what weights.py actually learns from) is a
-    separate aggregate table this never touches."""
+    """Keeps the candles/signals tables from growing forever. With the
+    per-candle guarantee, 16 pairs write a row per pair per 60s candle
+    close — tens of thousands of rows a day, unbounded, on a billed
+    Railway volume. pattern_stats (what weights.py actually learns
+    from) is a separate aggregate table this never touches."""
     while True:
         # Sleep first: running immediately at boot would pile a DELETE
         # sweep on top of the bootstrap burst (16 pairs' history backfill
@@ -315,15 +314,15 @@ async def live_signals(tier: str | None = None):
     already graded. Meant for external scripts/bots to poll instead of
     holding a WebSocket connection open.
 
-    Every signal is now a quality-gated `tier=confirmed` call — the old
-    `noise` filler tier (a coin-flip fired on every candle regardless of
-    quality) has been removed; a candle that doesn't earn a confirmed
-    signal produces no row at all. `tier=noise` may still appear on
-    signals fired before this change if old rows haven't aged out yet.
-    `age_seconds` is how long ago the call was made — a pair whose
-    stream has stalled, or simply hasn't had a fresh confirmed signal,
-    will keep returning its last one, and without the age there's no way
-    to tell that from a fresh one (see `stale`).
+    Every real finalized candle fires a signal — the per-candle
+    guarantee. `tier=confirmed` returns only signals that passed the
+    quality gates. Everything else is `tier=fallback`: the best-effort
+    filler that exists so each pair always shows *something*, and which
+    carries no measured confidence. (Rows fired before 2026-08-30 may
+    carry the old tier name `noise` for the same concept.) `age_seconds`
+    is how long ago the call was made — a pair whose stream has stalled
+    will keep returning its last signal, and without the age there's no
+    way to tell that from a fresh one.
     """
     now = int(time.time())
     rows = await db.latest_signals()
@@ -414,21 +413,20 @@ def _format_signal_row(r: dict) -> dict:
 async def signals_all(tier: str | None = None):
     """All pairs' latest CALL/PUT signal, open to anyone.
 
-    Every signal fired now is `tier=confirmed` — it passed every quality
-    gate (regime-weighted confluence, structural weight, veto checks,
-    and measured confidence once there's enough graded history). The
-    old `tier=noise` filler that fired on every candle regardless of
-    quality has been removed; `tier=noise` may still appear on rows
-    fired before this change until they age out of SIGNAL_RETENTION_DAYS.
+    Per the per-candle guarantee, every real finalized candle fires a
+    signal — either `confirmed` (passed the quality gates: regime-
+    weighted confluence, structural weight, veto checks, and measured
+    confidence once there's enough graded history) or `fallback` (the
+    best-effort filler that exists so each pair always shows
+    *something*, no better than the engine's best guess).
 
     Query params:
-      tier=confirmed  — only quality-gated signals (the only tier new
-                        signals can have)
-      tier=noise      — only legacy pre-removal filler rows, if any remain
+      tier=confirmed  — only quality-gated signals
+      tier=fallback   — only the best-effort filler (no quality gate)
 
     Each row includes:
       pair, direction (CALL|PUT), confidence (0..1 or null),
-      tier (confirmed|noise), result (PENDING|WIN|LOSS|DRAW),
+      tier (confirmed|fallback), result (PENDING|WIN|LOSS|DRAW),
       entry_ts, target_close_ts, entry_price, close_price,
       source (comma-joined), sources (list), created_at, age_seconds,
       stale (bool), expires_in_seconds (>=0).
@@ -520,7 +518,7 @@ async def strategies_registry():
             {"name": "mined_*", "family": "mined", "description": "Self-learned 2-candle sequences promoted via FDR correction"},
         ],
         "fallback_sources": [
-            {"name": "fallback_color", "family": "fallback", "description": "Backtest-only reference baseline (previous candle's color) — never fires a live signal"},
+            {"name": "fallback_color", "family": "fallback", "description": "Per-candle-guarantee last resort: previous candle's color (fallback tier only, used when nothing else fired)"},
         ],
     }
 

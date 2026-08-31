@@ -1,10 +1,12 @@
 """Hand-weighted microstructure scorer: blends candle color, body
 strength, wick imbalance, short trend, and same-color streak into a
-single directional score. Used in decision.py as a veto check: a
-confident microstructure read that disagrees with the vote pool's
-direction blocks the signal from confirming (see MICRO_AGREEMENT_FLOOR)
-— it only vetoes above that confidence floor, since microstructure is a
-rough, noisy read on its own.
+single directional score. Used two ways in decision.py:
+  1. as the per-candle-guarantee fallback source when nothing else fires
+  2. as a veto check — a confident microstructure read that disagrees
+     with the vote pool's direction demotes the signal to the fallback
+     tier rather than confirming it outright (see MICRO_AGREEMENT_FLOOR
+     — it only vetoes above that confidence floor, since microstructure
+     is a rough, noisy read on its own).
 
 2026-08 — regime-aware follow/fade. The scorer used to be pure
 momentum: it followed the last candle's colour unconditionally. On a

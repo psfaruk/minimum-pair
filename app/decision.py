@@ -6,6 +6,7 @@ from typing import Any
 from app import candle_reaction, config, db, microstructure, pattern_miner, patterns, regime, weights
 
 MICRO_AGREEMENT_FLOOR = 0.30  # microstructure must be this confident to veto
+MICRO_FALLBACK_FLOOR = 0.15  # microstructure must be at least this confident to act as fallback
 
 PATTERN_PERF_CACHE_TTL = 55.0
 
@@ -24,6 +25,7 @@ CONFIDENCE_MIN_SAMPLES = 25
 LONE_VOTE_MIN_WEIGHT = 0.80
 
 TIER_CONFIRMED = "confirmed"
+TIER_FALLBACK = "fallback"
 
 # (source, pair) -> (wins, losses). Per pair, because a pattern that
 # works on EUR/USD has no claim on USD/BDT OTC — they aren't the same
@@ -59,7 +61,7 @@ class Decision:
     confidence: float | None  # None until there's enough graded history to mean anything
     confirmations: int
     sources: list[str]
-    tier: str  # always TIER_CONFIRMED — evaluate() returns None instead of a Decision when the gates fail
+    tier: str  # TIER_CONFIRMED (passed every gate) or TIER_FALLBACK (per-candle guarantee filler)
     regime: str = regime.REGIME_NEUTRAL  # market regime the vote pool was weighed under
     all_votes: list[tuple[str, str]] = field(default_factory=list)  # EVERY vote, both sides
 
@@ -158,11 +160,12 @@ def _pattern_miner_vote(pair: str, candles: list[dict[str, Any]]) -> Vote | None
 
 
 def _fallback_vote(candles: list[dict[str, Any]]) -> Vote:
-    """Last-candle-colour direction, used only as a reference baseline by
-    app/backtest.py's `fallback_color` row — it measures what naive
-    colour-following would have scored, for comparison against sources
-    that actually earned their weight. Never used to fire a live signal:
-    evaluate() no longer has a fallback path at all."""
+    """Last-candle-colour direction. Used two ways: (1) as the very last
+    resort inside evaluate()'s fallback path, when literally nothing else
+    fired for this candle — see TIER_FALLBACK; (2) as a reference
+    baseline by app/backtest.py's `fallback_color` row, measuring what
+    naive colour-following alone would have scored, for comparison
+    against sources that actually earned their weight."""
     last = candles[-1] if candles else None
     if last is not None and last["close"] != last["open"]:
         direction = "CALL" if last["close"] > last["open"] else "PUT"
@@ -213,19 +216,27 @@ async def _measured_win_rate(pair: str, sources: list[str]) -> tuple[float, int]
 
 
 async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]) -> Decision | None:
+    # Two requirements that pull in opposite directions, both explicit
+    # user asks: every pair must show a signal on every candle ("প্রত্যেক
+    # ক্যান্ডেল এ সিগন্যাল আসতে হবে"), AND that guarantee must never again
+    # look like the old undifferentiated coin-flip flood ("এত পরিমাণে
+    # প্রেডিকশন হয় যা অগ্রহণযোগ্য"). Reconciled the same way as before:
+    # the guarantee stays absolute, but every gate failure below routes
+    # through _fallback_decision() and is tagged TIER_FALLBACK, honestly
+    # distinct from TIER_CONFIRMED — poll `tier=confirmed` for only the
+    # gate-passing calls.
+    #
     # No `ind["ready"]` gate needed here: _indicator_votes() degrades to
     # zero votes on an unready `ind` safely (every field access goes
     # through .get()), and the pattern/candle-reaction/miner/
-    # microstructure sources below only need the raw candle list, not
-    # the indicator snapshot. During bootstrap (before SMA_SLOW candles
-    # exist) the reduced vote pool simply makes the quality gates below
-    # harder to pass, which is the correct behaviour — no signal fires
-    # until there's enough to actually judge.
+    # microstructure/fallback sources below only need the raw candle
+    # list, not the indicator snapshot.
     #
-    # Returns None whenever there is nothing worth calling: zero candles
-    # (the very first bootstrap call), or any quality gate below fails.
-    # There is no filler tier any more — a candle that doesn't earn a
-    # confirmed signal produces no signal at all.
+    # Returns None ONLY when there are zero candles (the very first
+    # bootstrap call before any history exists). Once at least one
+    # candle is present, every code path that would otherwise return
+    # nothing routes through _fallback_decision(), which always returns
+    # a Decision — that's the per-candle signal guarantee.
     if not candles:
         return None
 
@@ -234,7 +245,9 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
     # evaluate() is only ever called once per finalized candle (see
     # feed.py's _finalize_candle), so there's no risk of double-firing
     # within a candle — no separate cooldown gate is needed on top of
-    # that.
+    # that, and the per-candle guarantee means every pair fires every
+    # candle with no exceptions, so a cooldown would only ever work
+    # against that.
 
     cr_hit = candle_reaction.detect(candles, ind)
 
@@ -280,41 +293,77 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
 
     micro = microstructure.score(candles, fade=fade)
 
-    # Every gate below returns None on failure, not a filler: a candle
-    # that doesn't earn a confirmed signal produces no signal at all —
-    # only real, gate-passing trading-strategy calls reach the caller.
+    def _fallback_decision() -> Decision:
+        """The per-candle-guarantee filler: some direction, always,
+        tagged for exactly what it is. It passes no gate and carries no
+        confidence, because there is nothing here to be confident about.
+
+        The direction is the BEST available read, not a coin flip.
+        Priority here:
+          1. the regime-weighted, measured-weight ensemble's own net
+             direction — the best aggregate estimate the engine has,
+             even when a gate refused it the confirmed tier;
+          2. the regime-aware (fade-aware) microstructure read;
+          3. a literal wick rejection, if one fired;
+          4. last-candle colour, only when literally nothing else fired.
+
+        A veto demotes the TIER (the evidence is not confirmed-quality)
+        but does not override the direction: the vetoing source already
+        had its vote inside the pool — the pool weighed it and moved on.
+        """
+        if net_direction is not None and contributing:
+            direction, sources_ = net_direction, [v.source for v in contributing]
+        elif micro["direction"] is not None and micro["strength"] >= MICRO_FALLBACK_FLOOR:
+            direction, sources_ = micro["direction"], [microstructure.PATTERN_NAME]
+        elif cr_hit is not None:
+            direction, sources_ = cr_hit[1], [cr_hit[0]]
+        else:
+            fb = _fallback_vote(candles)
+            direction, sources_ = fb.direction, [fb.source]
+        return Decision(
+            direction=direction,
+            confidence=None,
+            confirmations=1,
+            sources=sources_,
+            tier=TIER_FALLBACK,
+            regime=regime_read["regime"],
+            all_votes=[(v.source, v.direction) for v in votes],
+        )
 
     if not contributing or len(contributing) < config.MIN_CONFIRMATIONS:
-        return None
+        return _fallback_decision()
 
     if conflict and len(contributing) < config.MIN_CONFIRMATIONS:
-        return None  # ambiguous market
+        return _fallback_decision()  # ambiguous market
 
     # A lone vote can only confirm when its source has proven itself on
-    # this pair (see LONE_VOTE_MIN_WEIGHT). An unmeasured lone vote is
-    # not enough on its own.
+    # this pair (see LONE_VOTE_MIN_WEIGHT). An unmeasured lone vote still
+    # fires — as best-effort fallback carrying the same direction.
     if len(contributing) == 1 and contributing[0].weight < LONE_VOTE_MIN_WEIGHT:
-        return None
+        return _fallback_decision()
 
-    # Veto: a confident opposing microstructure read.
+    # Veto: a confident opposing microstructure read. The veto still
+    # means "this is not a confirmed call" — it demotes to fallback
+    # instead of vanishing, since the guarantee requires something to
+    # come back either way.
     if (
         micro["direction"] is not None
         and micro["direction"] != net_direction
         and micro["strength"] >= MICRO_AGREEMENT_FLOOR
     ):
-        return None
+        return _fallback_decision()
 
     # Veto: an actual wick-rejection against the proposed direction, even
     # if other sources outweighed it.
     if cr_hit is not None and cr_hit[1] != net_direction:
-        return None
+        return _fallback_decision()
 
     sources = [v.source for v in contributing]
     total_possible = sum(v.weight for v in votes) or 1.0
     structural_weight = min(sum(v.weight for v in contributing) / total_possible, 1.0)
 
     if structural_weight < config.QUALITY_FLOOR:
-        return None
+        return _fallback_decision()
 
     # Confidence is a measurement or it is nothing. The old formula mixed
     # a hard-coded 0.55 prior with a "how much did the votes agree" score,
@@ -330,7 +379,7 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
     # Only gate on confidence once it's real. An unmeasured signal is
     # still a confirmed one — it just doesn't get to claim a number.
     if confidence is not None and confidence < config.MIN_CONFIDENCE:
-        return None
+        return _fallback_decision()
 
     return Decision(
         direction=net_direction,
