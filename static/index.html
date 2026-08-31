@@ -1,131 +1,240 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="bn">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<meta name="theme-color" content="#0b0f14">
-<title>Signal</title>
+<meta name="theme-color" content="#060a13">
+<title>MinimumPair — লাইভ সিগন্যাল</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/css/style.css">
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
 
 <header class="topbar">
-  <div class="brand">Signal</div>
-  <div class="conn" id="connStatus"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none">
+        <path d="M3 17 L9 9 L13 13 L21 4" stroke="url(#bg1)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="21" cy="4" r="2.4" fill="#00d68f"/>
+        <defs><linearGradient id="bg1" x1="3" y1="17" x2="21" y2="4"><stop stop-color="#22d3ee"/><stop offset="1" stop-color="#6366f1"/></linearGradient></defs>
+      </svg>
+    </span>
+    <span class="brand-name">Minimum<span class="grad">Pair</span></span>
+  </div>
+  <div class="topbar-right">
+    <div class="clock" id="serverClock">--:--:--</div>
+    <div class="conn" id="connStatus"><span class="dot" id="connDot"></span><span id="connText">সংযোগ হচ্ছে…</span></div>
+  </div>
 </header>
 
 <main id="views">
 
-  <section id="view-home" class="view active">
-    <div class="card">
-      <div class="card-title">Overall Win Rate</div>
-      <div class="big-stat" id="overallWinRate">--%</div>
-      <div class="sub-stat" id="overallCounts">0W / 0L</div>
+  <!-- ═══════════════ লাইভ ═══════════════ -->
+  <section id="view-live" class="view active">
+    <div class="hero card-glass">
+      <div class="hero-ring-wrap">
+        <svg class="ring" viewBox="0 0 120 120">
+          <circle class="ring-bg" cx="60" cy="60" r="52"/>
+          <circle class="ring-fg" id="winRing" cx="60" cy="60" r="52"/>
+        </svg>
+        <div class="ring-center">
+          <div class="ring-value" id="overallWinRate">--%</div>
+          <div class="ring-label">উইন রেট</div>
+        </div>
+        <div class="ring-sub" id="overallCounts">0W / 0L</div>
+      </div>
+      <div class="hero-side">
+        <div class="dir-stat call">
+          <div class="dir-stat-head"><span class="dir-dot"></span>CALL</div>
+          <div class="dir-stat-rate" id="callWinRate">--%</div>
+          <div class="dir-bar"><i id="callBar" style="width:0%"></i></div>
+          <div class="dir-stat-counts" id="callCounts">0W / 0L</div>
+        </div>
+        <div class="dir-stat put">
+          <div class="dir-stat-head"><span class="dir-dot"></span>PUT</div>
+          <div class="dir-stat-rate" id="putWinRate">--%</div>
+          <div class="dir-bar"><i id="putBar" style="width:0%"></i></div>
+          <div class="dir-stat-counts" id="putCounts">0W / 0L</div>
+        </div>
+        <div class="hero-chips">
+          <div class="chip"><span class="chip-label">মোট</span><span class="chip-value" id="chipTotal">0</span></div>
+          <div class="chip"><span class="chip-label">পেন্ডিং</span><span class="chip-value" id="chipPending">0</span></div>
+          <div class="chip"><span class="chip-label">কনফার্মড</span><span class="chip-value" id="chipConfirmed">--%</span></div>
+        </div>
+      </div>
     </div>
 
-    <div class="card">
-      <div class="card-title">Latest Signal</div>
-      <div id="latestSignal" class="latest-signal empty">No signals yet</div>
+    <div class="filter-row">
+      <div class="seg" id="tierFilter">
+        <button type="button" class="seg-btn active" data-tier="">সব</button>
+        <button type="button" class="seg-btn" data-tier="confirmed">কনফার্মড</button>
+        <button type="button" class="seg-btn" data-tier="fallback">ফলব্যাক</button>
+      </div>
+      <div class="seg" id="dirFilter">
+        <button type="button" class="seg-btn active" data-dir="">সব</button>
+        <button type="button" class="seg-btn seg-call" data-dir="CALL">CALL</button>
+        <button type="button" class="seg-btn seg-put" data-dir="PUT">PUT</button>
+      </div>
     </div>
 
-    <div class="card">
-      <div class="card-title">Per-Pair Win Rate</div>
-      <div id="pairWinRateList" class="pair-list"></div>
-    </div>
+    <div class="live-grid" id="liveGrid"></div>
   </section>
 
+  <!-- ═══════════════ চার্ট ═══════════════ -->
   <section id="view-chart" class="view">
     <div class="chart-toolbar">
-      <select id="pairSelect" aria-label="Select pair"></select>
-      <div id="candleTimer" class="candle-timer" title="Time left in current candle">--s</div>
+      <select id="pairSelect" aria-label="পেয়ার নির্বাচন"></select>
+      <div id="candleTimer" class="candle-timer" title="বর্তমান ক্যান্ডেল শেষ হতে বাকি">--s</div>
       <div id="signalBadge" class="signal-badge hidden"></div>
     </div>
     <div class="winrate-strip">
-      <div class="winrate-chip">
-        <span class="label">This pair</span>
-        <span class="value" id="chartPairWinRate">--%</span>
-        <span class="counts" id="chartPairCounts">0W / 0L</span>
+      <div class="winrate-chip call">
+        <span class="label">এই পেয়ার CALL</span>
+        <span class="value" id="chartPairCallRate">--%</span>
+        <span class="counts" id="chartPairCallCounts">0W / 0L</span>
+      </div>
+      <div class="winrate-chip put">
+        <span class="label">এই পেয়ার PUT</span>
+        <span class="value" id="chartPairPutRate">--%</span>
+        <span class="counts" id="chartPairPutCounts">0W / 0L</span>
       </div>
       <div class="winrate-chip">
-        <span class="label">Overall</span>
-        <span class="value" id="chartOverallWinRate">--%</span>
-        <span class="counts" id="chartOverallCounts">0W / 0L</span>
+        <span class="label">এই পেয়ার সামগ্রিক</span>
+        <span class="value" id="chartPairWinRate">--%</span>
+        <span class="counts" id="chartPairCounts">0W / 0L</span>
       </div>
     </div>
     <div class="chart-layout">
       <div id="chartContainer" class="chart-container"></div>
       <div class="signals-window">
-        <div class="card-title">Signals — <span id="signalsWindowPair"></span></div>
+        <div class="card-title">সিগন্যাল — <span id="signalsWindowPair"></span></div>
         <div id="signalsWindowList" class="history-list"></div>
       </div>
     </div>
   </section>
 
-  <section id="view-history" class="view">
-    <div class="chart-toolbar">
-      <select id="historyPairFilter" aria-label="Filter history by pair">
-        <option value="">All pairs</option>
-      </select>
+  <!-- ═══════════════ স্ট্যাটস ═══════════════ -->
+  <section id="view-stats" class="view">
+    <div class="filter-row">
+      <div class="seg" id="periodFilter">
+        <button type="button" class="seg-btn" data-days="1">২৪ ঘণ্টা</button>
+        <button type="button" class="seg-btn active" data-days="7">৭ দিন</button>
+        <button type="button" class="seg-btn" data-days="30">৩০ দিন</button>
+        <button type="button" class="seg-btn" data-days="0">সব</button>
+      </div>
     </div>
-    <div id="historyList" class="history-list"></div>
+    <div class="stats-summary" id="statsSummary"></div>
+    <div class="card-glass table-card">
+      <div class="table-head">
+        <div class="card-title">প্রতি পেয়ার উইন রেট</div>
+        <select id="statsSort" class="mini-select">
+          <option value="total">সর্বাধিক সিগন্যাল</option>
+          <option value="overall">সামগ্রিক রেট</option>
+          <option value="call">CALL রেট</option>
+          <option value="put">PUT রেট</option>
+        </select>
+      </div>
+      <div class="stats-table" id="statsTable"></div>
+    </div>
   </section>
 
+  <!-- ═══════════════ হিস্টোরি ═══════════════ -->
+  <section id="view-history" class="view">
+    <div class="filter-row wrap">
+      <select id="historyPairFilter" aria-label="পেয়ার ফিল্টার">
+        <option value="">সব পেয়ার</option>
+      </select>
+      <select id="historyDirFilter" aria-label="ডিরেকশন ফিল্টার">
+        <option value="">CALL + PUT</option>
+        <option value="CALL">শুধু CALL</option>
+        <option value="PUT">শুধু PUT</option>
+      </select>
+      <select id="historyTierFilter" aria-label="টিয়ার ফিল্টার">
+        <option value="">সব টিয়ার</option>
+        <option value="confirmed">কনফার্মড</option>
+        <option value="fallback">ফলব্যাক</option>
+      </select>
+      <select id="historyResultFilter" aria-label="রেজাল্ট ফিল্টার">
+        <option value="">সব রেজাল্ট</option>
+        <option value="WIN">WIN</option>
+        <option value="LOSS">LOSS</option>
+        <option value="DRAW">DRAW</option>
+        <option value="PENDING">PENDING</option>
+      </select>
+    </div>
+    <div class="history-meta" id="historyMeta"></div>
+    <div id="historyList" class="history-list"></div>
+    <button type="button" class="load-more" id="historyMore">আরও দেখুন</button>
+  </section>
+
+  <!-- ═══════════════ সেটিংস ═══════════════ -->
   <section id="view-settings" class="view">
-    <div class="card">
-      <div class="card-title">Quotex Connection</div>
-      <div id="settingsConn" class="settings-row">checking…</div>
-      <div class="settings-row">Auth mode: <span id="settingsAuthMode">--</span></div>
-      <div class="settings-row">Token persistence: <span id="settingsPersistence">--</span></div>
-      <div class="settings-row">Feed health: <span id="settingsFeedHealth">--</span></div>
+    <div class="card-glass">
+      <div class="card-title">Quotex সংযোগ</div>
+      <div id="settingsConn" class="settings-row"><span>অবস্থা</span><span>চেক হচ্ছে…</span></div>
+      <div class="settings-row"><span>Auth মোড</span><span id="settingsAuthMode">--</span></div>
+      <div class="settings-row"><span>টোকেন সংরক্ষণ</span><span id="settingsPersistence">--</span></div>
+      <div class="settings-row"><span>ফিড হেলথ</span><span id="settingsFeedHealth">--</span></div>
       <div id="settingsError" class="error-text"></div>
     </div>
-    <div class="card">
-      <div class="card-title">Import Session Token</div>
-      <div class="settings-note settings-note-tight">Paste a Quotex SSID token — the app connects live. No admin passcode, no API keys.</div>
-      <input type="text" id="sessionToken" placeholder="Session token (SSID)" class="session-input" autocomplete="off">
-      <textarea id="sessionCookies" placeholder="Session cookies (optional, e.g. cf_clearance=...; laravel_session=...)" class="session-input session-textarea" autocomplete="off"></textarea>
-      <button id="sessionUpdateBtn" type="button" class="session-submit">Import &amp; Reconnect</button>
+    <div class="card-glass">
+      <div class="card-title">সেশন টোকেন ইমপোর্ট</div>
+      <div class="settings-note settings-note-tight">Quotex SSID টোকেন পেস্ট করুন — অ্যাপ সরাসরি লাইভ সংযোগ নেবে।</div>
+      <input type="text" id="sessionToken" placeholder="সেশন টোকেন (SSID)" class="session-input" autocomplete="off">
+      <textarea id="sessionCookies" placeholder="সেশন কুকি (ঐচ্ছিক): cf_clearance=...; laravel_session=..." class="session-input session-textarea" autocomplete="off"></textarea>
+      <button id="sessionUpdateBtn" type="button" class="session-submit">ইমপোর্ট ও রিকানেক্ট</button>
       <div id="sessionUpdateStatus" class="settings-note"></div>
     </div>
-    <div class="card">
-      <div class="card-title">Tracked Pairs</div>
-      <div id="settingsPairs" class="pair-list"></div>
+    <div class="card-glass">
+      <div class="card-title">ট্র্যাক করা পেয়ার</div>
+      <div id="settingsPairs" class="pair-chips"></div>
     </div>
-    <div class="card">
-      <div class="card-title">Signal Thresholds</div>
-      <div class="settings-row">Min confidence: <span id="settingsMinConf">--</span></div>
-      <div class="settings-note">Edit .env and restart the server to change these.</div>
+    <div class="card-glass">
+      <div class="card-title">সিগন্যাল থ্রেশহোল্ড</div>
+      <div class="settings-row"><span>Min confidence</span><span id="settingsMinConf">--</span></div>
+      <div class="settings-note">পরিবর্তন করতে .env এডিট করে সার্ভার রিস্টার্ট করুন।</div>
     </div>
-    <div class="card">
-      <div class="card-title">Strategy Performance</div>
-      <select id="patternPerfPairFilter" class="settings-select" aria-label="Filter strategy performance by pair">
-        <option value="">All pairs (combined)</option>
+    <div class="card-glass">
+      <div class="card-title">স্ট্র্যাটেজি পারফরম্যান্স</div>
+      <select id="patternPerfPairFilter" class="settings-select" aria-label="পেয়ার অনুযায়ী স্ট্র্যাটেজি">
+        <option value="">সব পেয়ার (মিলিত)</option>
       </select>
-      <div id="patternPerfList" class="pair-list"></div>
+      <div id="patternPerfList" class="strategy-list"></div>
     </div>
   </section>
 
 </main>
 
 <nav class="bottomnav">
-  <button type="button" class="navbtn active" data-view="home">
-    <span class="icon">&#8962;</span><span>Home</span>
+  <button type="button" class="navbtn active" data-view="live">
+    <svg viewBox="0 0 24 24"><path d="M13 2 4.5 13.5H11L9.5 22 19 9.5h-6.5L13 2Z"/></svg>
+    <span>লাইভ</span>
   </button>
   <button type="button" class="navbtn" data-view="chart">
-    <span class="icon">&#128200;</span><span>Signal Chart</span>
+    <svg viewBox="0 0 24 24"><path d="M4 5v14M8 5v14M8 8h5a3 3 0 0 1 0 6H8m5 0a3 3 0 0 1 0 6H8"/></svg>
+    <span>চার্ট</span>
+  </button>
+  <button type="button" class="navbtn" data-view="stats">
+    <svg viewBox="0 0 24 24"><path d="M4 20V10m5.5 10V4M15 20v-7m5 7V8"/></svg>
+    <span>স্ট্যাটস</span>
   </button>
   <button type="button" class="navbtn" data-view="history">
-    <span class="icon">&#8635;</span><span>History</span>
+    <svg viewBox="0 0 24 24"><path d="M12 8v5l3.5 2M21 12a9 9 0 1 1-2.6-6.3M21 3v5h-5"/></svg>
+    <span>হিস্টোরি</span>
   </button>
   <button type="button" class="navbtn" data-view="settings">
-    <span class="icon">&#9881;</span><span>Settings</span>
+    <svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Zm8-3.5-.2 1.6 1.7 1.4-1.5 2.6-2.1-.7-1.4 1-.3 2.1h-3l-.3-2.1-1.4-1-2.1.7-1.5-2.6 1.7-1.4L9 12l-1.7-1.4 1.5-2.6 2.1.7 1.4-1L12.6 5h3l.3 2.1 1.4 1 2.1-.7 1.5 2.6L19.2 11l.8 1Z" fill-rule="evenodd"/></svg>
+    <span>সেটিংস</span>
   </button>
 </nav>
 
 <script src="/static/js/app.js"></script>
-<script src="/static/js/home.js"></script>
+<script src="/static/js/live.js"></script>
 <script src="/static/js/chart.js"></script>
+<script src="/static/js/stats.js"></script>
 <script src="/static/js/history.js"></script>
 <script src="/static/js/settings.js"></script>
 </body>

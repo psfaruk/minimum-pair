@@ -697,23 +697,196 @@ async def win_rate(pair: str | None = None) -> list[dict[str, Any]]:
     return await asyncio.to_thread(_win_rate_sync, pair)
 
 
-def _history_sync(pair: str | None, limit: int) -> list[dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# 2026-09 — direction/tier-aware win-rate analytics.
+#
+# The user requirement: "প্রত্যেক পেয়ার ও সিগন্যাল হিস্টোরি উইন রেট আমি
+# দেখতে পারবো। Call ও put কোনো সিগন্যাল গুলো কেমন win রেট দিচ্ছে। সেই
+# গুলো আলাদা আলাদা করে নিজের মতো করে দেখতে পারবো।" — per pair, per
+# direction (CALL/PUT), per tier (confirmed/fallback), over a selectable
+# window, all in one query the UI can slice however it wants.
+# ---------------------------------------------------------------------------
+
+_WIN_RATE_EXT_SQL = """
+    SELECT pair,
+           SUM(CASE WHEN result = 'WIN' THEN 1 ELSE 0 END) AS wins,
+           SUM(CASE WHEN result = 'LOSS' THEN 1 ELSE 0 END) AS losses,
+           SUM(CASE WHEN result = 'DRAW' THEN 1 ELSE 0 END) AS draws,
+           SUM(CASE WHEN result = 'PENDING' THEN 1 ELSE 0 END) AS pending,
+           SUM(CASE WHEN result = 'WIN' AND direction = 'CALL' THEN 1 ELSE 0 END) AS call_wins,
+           SUM(CASE WHEN result = 'LOSS' AND direction = 'CALL' THEN 1 ELSE 0 END) AS call_losses,
+           SUM(CASE WHEN result = 'DRAW' AND direction = 'CALL' THEN 1 ELSE 0 END) AS call_draws,
+           SUM(CASE WHEN result = 'PENDING' AND direction = 'CALL' THEN 1 ELSE 0 END) AS call_pending,
+           SUM(CASE WHEN result = 'WIN' AND direction = 'PUT' THEN 1 ELSE 0 END) AS put_wins,
+           SUM(CASE WHEN result = 'LOSS' AND direction = 'PUT' THEN 1 ELSE 0 END) AS put_losses,
+           SUM(CASE WHEN result = 'DRAW' AND direction = 'PUT' THEN 1 ELSE 0 END) AS put_draws,
+           SUM(CASE WHEN result = 'PENDING' AND direction = 'PUT' THEN 1 ELSE 0 END) AS put_pending,
+           SUM(CASE WHEN result = 'WIN' AND tier = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_wins,
+           SUM(CASE WHEN result = 'LOSS' AND tier = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_losses,
+           SUM(CASE WHEN result = 'PENDING' AND tier = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_pending,
+           SUM(CASE WHEN result = 'WIN' AND tier IN ('fallback', 'noise') THEN 1 ELSE 0 END) AS fallback_wins,
+           SUM(CASE WHEN result = 'LOSS' AND tier IN ('fallback', 'noise') THEN 1 ELSE 0 END) AS fallback_losses,
+           SUM(CASE WHEN result = 'PENDING' AND tier IN ('fallback', 'noise') THEN 1 ELSE 0 END) AS fallback_pending
+    FROM signals{where}
+    GROUP BY pair
+"""
+
+
+def _rate(wins: int, losses: int) -> float | None:
+    total = wins + losses
+    return (wins / total) if total else None
+
+
+def _win_rate_ext_sync(pair: str | None, days: int) -> list[dict[str, Any]]:
+    clauses, params = [], []
+    if pair:
+        clauses.append("pair = ?")
+        params.append(pair)
+    if days and days > 0:
+        clauses.append("created_at >= ?")
+        params.append(int(time.time()) - days * 86400)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     with _connect() as conn:
-        if pair:
-            rows = conn.execute(
-                "SELECT * FROM signals WHERE pair = ? ORDER BY created_at DESC LIMIT ?",
-                (pair, limit),
-            ).fetchall()
+        rows = conn.execute(_WIN_RATE_EXT_SQL.format(where=where), params).fetchall()
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "pair": r["pair"],
+                "wins": r["wins"] or 0,
+                "losses": r["losses"] or 0,
+                "draws": r["draws"] or 0,
+                "pending": r["pending"] or 0,
+                "win_rate": _rate(r["wins"] or 0, r["losses"] or 0),
+                "call": {
+                    "wins": r["call_wins"] or 0,
+                    "losses": r["call_losses"] or 0,
+                    "draws": r["call_draws"] or 0,
+                    "pending": r["call_pending"] or 0,
+                    "win_rate": _rate(r["call_wins"] or 0, r["call_losses"] or 0),
+                },
+                "put": {
+                    "wins": r["put_wins"] or 0,
+                    "losses": r["put_losses"] or 0,
+                    "draws": r["put_draws"] or 0,
+                    "pending": r["put_pending"] or 0,
+                    "win_rate": _rate(r["put_wins"] or 0, r["put_losses"] or 0),
+                },
+                "confirmed": {
+                    "wins": r["confirmed_wins"] or 0,
+                    "losses": r["confirmed_losses"] or 0,
+                    "pending": r["confirmed_pending"] or 0,
+                    "win_rate": _rate(r["confirmed_wins"] or 0, r["confirmed_losses"] or 0),
+                },
+                "fallback": {
+                    "wins": r["fallback_wins"] or 0,
+                    "losses": r["fallback_losses"] or 0,
+                    "pending": r["fallback_pending"] or 0,
+                    "win_rate": _rate(r["fallback_wins"] or 0, r["fallback_losses"] or 0),
+                },
+            }
+        )
+    return out
+
+
+async def win_rate_ext(pair: str | None = None, days: int = 0) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_win_rate_ext_sync, pair, days)
+
+
+def _summary_sync(days: int) -> dict[str, Any]:
+    clauses, params = [], []
+    if days and days > 0:
+        clauses.append("created_at >= ?")
+        params.append(int(time.time()) - days * 86400)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN result = 'WIN' THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN result = 'LOSS' THEN 1 ELSE 0 END) AS losses,
+                SUM(CASE WHEN result = 'DRAW' THEN 1 ELSE 0 END) AS draws,
+                SUM(CASE WHEN result = 'PENDING' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN result = 'WIN' AND direction = 'CALL' THEN 1 ELSE 0 END) AS call_wins,
+                SUM(CASE WHEN result = 'LOSS' AND direction = 'CALL' THEN 1 ELSE 0 END) AS call_losses,
+                SUM(CASE WHEN result = 'WIN' AND direction = 'PUT' THEN 1 ELSE 0 END) AS put_wins,
+                SUM(CASE WHEN result = 'LOSS' AND direction = 'PUT' THEN 1 ELSE 0 END) AS put_losses,
+                SUM(CASE WHEN result = 'WIN' AND tier = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_wins,
+                SUM(CASE WHEN result = 'LOSS' AND tier = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_losses,
+                SUM(CASE WHEN result = 'WIN' AND tier IN ('fallback', 'noise') THEN 1 ELSE 0 END) AS fallback_wins,
+                SUM(CASE WHEN result = 'LOSS' AND tier IN ('fallback', 'noise') THEN 1 ELSE 0 END) AS fallback_losses
+            FROM signals{w}
+            """.format(w=where),
+            params,
+        ).fetchone()
+    wins, losses = row["wins"] or 0, row["losses"] or 0
+    return {
+        "days": days,
+        "wins": wins,
+        "losses": losses,
+        "draws": row["draws"] or 0,
+        "pending": row["pending"] or 0,
+        "total": wins + losses + (row["draws"] or 0) + (row["pending"] or 0),
+        "win_rate": _rate(wins, losses),
+        "call": {"wins": row["call_wins"] or 0, "losses": row["call_losses"] or 0,
+                 "win_rate": _rate(row["call_wins"] or 0, row["call_losses"] or 0)},
+        "put": {"wins": row["put_wins"] or 0, "losses": row["put_losses"] or 0,
+                "win_rate": _rate(row["put_wins"] or 0, row["put_losses"] or 0)},
+        "confirmed": {"wins": row["confirmed_wins"] or 0, "losses": row["confirmed_losses"] or 0,
+                      "win_rate": _rate(row["confirmed_wins"] or 0, row["confirmed_losses"] or 0)},
+        "fallback": {"wins": row["fallback_wins"] or 0, "losses": row["fallback_losses"] or 0,
+                     "win_rate": _rate(row["fallback_wins"] or 0, row["fallback_losses"] or 0)},
+    }
+
+
+async def summary(days: int = 0) -> dict[str, Any]:
+    return await asyncio.to_thread(_summary_sync, days)
+
+
+def _history_sync(
+    pair: str | None,
+    limit: int,
+    direction: str | None = None,
+    tier: str | None = None,
+    result: str | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    clauses, params = [], []
+    if pair:
+        clauses.append("pair = ?")
+        params.append(pair)
+    if direction in ("CALL", "PUT"):
+        clauses.append("direction = ?")
+        params.append(direction)
+    if tier:
+        if tier in ("fallback", "noise"):
+            clauses.append("tier IN ('fallback', 'noise')")
         else:
-            rows = conn.execute(
-                "SELECT * FROM signals ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            clauses.append("tier = ?")
+            params.append(tier)
+    if result in ("WIN", "LOSS", "DRAW", "PENDING"):
+        clauses.append("result = ?")
+        params.append(result)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM signals{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (*params, limit, max(0, offset)),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
-async def history(pair: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
-    return await asyncio.to_thread(_history_sync, pair, limit)
+async def history(
+    pair: str | None = None,
+    limit: int = 200,
+    direction: str | None = None,
+    tier: str | None = None,
+    result: str | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(
+        _history_sync, pair, limit, direction, tier, result, offset
+    )
 
 
 def _latest_signals_sync() -> list[dict[str, Any]]:

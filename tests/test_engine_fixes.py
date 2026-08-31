@@ -214,7 +214,12 @@ def test_measured_lone_vote_can_confirm():
     assert dec is not None
     assert dec.tier == "confirmed", f"a measured-good lone vote should confirm, got {dec.tier}"
     assert dec.direction == "CALL"
-    assert dec.confidence is not None and dec.confidence > 0.9
+    # 2026-09: confidence is the Beta posterior mean (shrunk toward 50%
+    # by weights.PRIOR_STRENGTH pseudo-trades), not the raw frequency.
+    # 100 wins / 0 losses shrinks to (100+15)/(100+30) ≈ 0.885 — still
+    # decisively above the 0.65 MIN_CONFIDENCE gate, but no longer
+    # claiming an impossible perfect record.
+    assert dec.confidence is not None and dec.confidence > 0.85, f"confidence {dec.confidence}"
     print("  decision.measured-lone-vote OK")
 
 

@@ -133,6 +133,19 @@ def _sources_firing(pair: str, history: list[Candle], miner_library: dict) -> li
     if micro["direction"] is not None:
         firing.append((microstructure.PATTERN_NAME, micro["direction"]))
 
+    # The 2026-09 engine sources, measured like everything else. The
+    # anchor votes need a regime read; streak needs nothing new.
+    regime_read = decision.regime.detect(clean_history)
+    disp = decision._anchor_displacement(clean_history)
+    for vote in decision._anchor_votes(regime_read, disp):
+        firing.append((vote.source, vote.direction))
+    streak_vote = decision._streak_exhaustion_vote(clean_history)
+    if streak_vote is not None:
+        firing.append((streak_vote.source, streak_vote.direction))
+    htf_vote = decision._htf_trend_vote(decision.htf.htf_context(clean_history))
+    if htf_vote is not None:
+        firing.append((htf_vote.source, htf_vote.direction))
+
     # The miner, applied out-of-sample against the local library.
     if miner_library and len(clean_history) >= pattern_miner.SEQUENCE_LENGTH:
         key = pattern_miner._sequence_key(clean_history[-pattern_miner.SEQUENCE_LENGTH :])

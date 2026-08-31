@@ -1,3 +1,4 @@
+/* চার্ট ভিউ — ক্যান্ডেলস্টিক + প্রতি ক্যান্ডেলে সিগন্যাল মার্কার */
 App.tabs.chart = {
   chart: null,
   series: null,
@@ -41,23 +42,25 @@ App.tabs.chart = {
     if (this.chart) return;
     const container = document.getElementById("chartContainer");
     this.chart = LightweightCharts.createChart(container, {
-      layout: { background: { color: "#131a22" }, textColor: "#e6edf3" },
-      grid: { vertLines: { color: "#223140" }, horzLines: { color: "#223140" } },
-      timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#223140" },
-      rightPriceScale: { borderColor: "#223140" },
+      layout: {
+        background: { color: "rgba(0,0,0,0)" },
+        textColor: "#8fa1b8",
+        fontFamily: "Inter, Hind Siliguri, sans-serif",
+      },
+      grid: { vertLines: { color: "rgba(148,163,184,0.07)" }, horzLines: { color: "rgba(148,163,184,0.07)" } },
+      timeScale: { timeVisible: true, secondsVisible: false, borderColor: "rgba(148,163,184,0.18)" },
+      rightPriceScale: { borderColor: "rgba(148,163,184,0.18)" },
       autoSize: true,
     });
     this.series = this.chart.addCandlestickSeries({
-      upColor: "#22c55e", downColor: "#ef4444",
-      borderUpColor: "#22c55e", borderDownColor: "#ef4444",
-      wickUpColor: "#22c55e", wickDownColor: "#ef4444",
+      upColor: "#00d68f", downColor: "#ff5470",
+      borderUpColor: "#00d68f", borderDownColor: "#ff5470",
+      wickUpColor: "#00d68f", wickDownColor: "#ff5470",
     });
     // Signal markers are attached directly to the candlestick series
     // via setMarkers() — every candle that produced a signal gets an
     // arrow on the chart. CALL = green up-arrow below the bar,
-    // PUT = red down-arrow above it. Per the user requirement
-    // ("প্রত্যেক পেয়ার এ প্রত্যেক ক্যান্ডেল এ সিগন্যাল আসতে হবে"),
-    // every candle should carry its signal visually.
+    // PUT = red down-arrow above it. প্রত্যেক ক্যান্ডেলে সিগন্যাল।
     this.signalMarkers = [];
   },
 
@@ -99,9 +102,11 @@ App.tabs.chart = {
     return {
       time: s.entry_ts,
       position: isCall ? "belowBar" : "aboveBar",
-      color: isCall ? "#22c55e" : "#ef4444",
+      color: isCall ? "#00d68f" : "#ff5470",
       shape: isCall ? "arrowUp" : "arrowDown",
-      text: `${s.direction}${s.tier === "confirmed" ? "" : " · noise"}`,
+      // No text label: every candle fires a signal, so labels pile up
+      // into an unreadable wall on a 200-bar chart. The arrow alone
+      // marks the candle; the signals window carries the details.
     };
   },
 
@@ -109,8 +114,8 @@ App.tabs.chart = {
     if (!this.series || !this.series.setMarkers) return;
     // lightweight-charts requires markers sorted ascending by time
     // and unique — sort + dedupe just in case the same candle picked
-    // up two signals (e.g. a noise fallback replaced by a confirmed
-    // one in the same minute).
+    // up two signals (e.g. a fallback replaced by a confirmed one in
+    // the same minute).
     const seen = new Set();
     const sorted = [...this.signalMarkers]
       .filter((m) => {
@@ -124,33 +129,30 @@ App.tabs.chart = {
 
   renderWinRates() {
     const pair = App.state.activePair;
-    const pairStats = App.state.winRates[pair];
-    document.getElementById("chartPairWinRate").textContent = pairStats ? App.fmtPct(pairStats.win_rate) : "--%";
-    document.getElementById("chartPairCounts").textContent = pairStats ? `${pairStats.wins}W / ${pairStats.losses}L` : "0W / 0L";
-
-    const all = Object.values(App.state.winRates);
-    let wins = 0, losses = 0;
-    for (const r of all) { wins += r.wins; losses += r.losses; }
-    const total = wins + losses;
-    document.getElementById("chartOverallWinRate").textContent = total ? App.fmtPct(wins / total) : "--%";
-    document.getElementById("chartOverallCounts").textContent = `${wins}W / ${losses}L`;
+    const stats = App.state.winRates[pair];
+    document.getElementById("chartPairWinRate").textContent = stats ? App.fmtPct(stats.win_rate) : "--%";
+    document.getElementById("chartPairCounts").textContent = stats ? `${stats.wins}W / ${stats.losses}L` : "0W / 0L";
+    document.getElementById("chartPairCallRate").textContent = stats ? App.fmtPct(stats.call.win_rate) : "--%";
+    document.getElementById("chartPairCallCounts").textContent = stats ? `${stats.call.wins}W / ${stats.call.losses}L` : "0W / 0L";
+    document.getElementById("chartPairPutRate").textContent = stats ? App.fmtPct(stats.put.win_rate) : "--%";
+    document.getElementById("chartPairPutCounts").textContent = stats ? `${stats.put.wins}W / ${stats.put.losses}L` : "0W / 0L";
   },
 
   renderSignalsWindow(highlightId) {
     const list = document.getElementById("signalsWindowList");
     if (!this.signalRows.length) {
-      list.innerHTML = `<div style="color:var(--text-dim);font-size:12px;padding:12px 0;text-align:center">No signals yet for this pair</div>`;
+      list.innerHTML = `<div class="empty-note">এই পেয়ারে এখনো সিগন্যাল আসেনি</div>`;
       return;
     }
     list.innerHTML = this.signalRows.map((s) => `
       <div class="history-row${s.id === highlightId ? " highlight" : ""}" data-id="${s.id}">
         <div class="left">
-          <span class="time">${App.fmtTime(s.entry_ts)}</span>
-          <span class="conf">${App.fmtConf(s.confidence)} · ${s.source || ""}</span>
+          <span class="time">${App.fmtTime(s.entry_ts)} · ${s.source ? s.source.split(",")[0] : ""}</span>
+          <span class="conf">${s.confidence != null ? `কনফ ${(s.confidence * 100).toFixed(0)}%` : "কনফ —"} ${s.tier && s.tier !== "confirmed" ? "· fallback" : ""}</span>
         </div>
         <div class="right">
-          <span class="dir-badge ${s.direction}">${s.direction}</span>
-          <span class="result-badge ${s.result}">${s.result}</span>
+          ${App.dirBadge(s.direction, true)}
+          ${App.resultBadge(s.result)}
         </div>
       </div>`).join("");
   },
@@ -166,7 +168,7 @@ App.tabs.chart = {
     const badge = document.getElementById("signalBadge");
     badge.classList.remove("hidden", "CALL", "PUT");
     badge.classList.add(signal.direction);
-    badge.textContent = `${signal.direction} · ${App.fmtConf(signal.confidence)}`;
+    badge.innerHTML = `${signal.direction} ${signal.confidence != null ? `· কনফ ${(signal.confidence * 100).toFixed(0)}%` : ""}`;
     this.pendingSignalId = signal.id;
   },
 

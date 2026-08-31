@@ -23,7 +23,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 # Bumped on every production-visible change so a redeploy can be verified
 # from outside: /api/status exposes it, and Railway has no other way to
 # tell which commit a running instance was built from.
-CODE_VERSION = "2026.08.20-racefix"
+CODE_VERSION = "2026.09.01-engine2-ui2"
 
 app_state: dict = {"quotex_connected": False, "error": None, "pairs": list(config.ALL_PAIRS.keys())}
 _ws_clients: set[WebSocket] = set()
@@ -373,13 +373,47 @@ async def candles(pair: str, limit: int = 200):
 
 
 @app.get("/api/history")
-async def history(pair: str | None = None, limit: int = 200):
-    return await db.history(pair, limit)
+async def history(
+    pair: str | None = None,
+    limit: int = 200,
+    direction: str | None = None,
+    tier: str | None = None,
+    result: str | None = None,
+    offset: int = 0,
+):
+    """Historical signals, newest first, with optional filters.
+
+    2026-09: `direction` (CALL|PUT), `tier` (confirmed|fallback),
+    `result` (WIN|LOSS|DRAW|PENDING) and `offset` (pagination) let the UI
+    and scripts slice the history however they want.
+    """
+    limit = max(1, min(limit, 1000))
+    return await db.history(pair, limit, direction, tier, result, offset)
 
 
 @app.get("/api/winrate")
-async def winrate(pair: str | None = None):
-    return await db.win_rate(pair)
+async def winrate(pair: str | None = None, days: int = 0):
+    """Per-pair win rates with CALL/PUT and confirmed/fallback splits.
+
+    2026-09: each row now carries `call` and `put` objects (wins, losses,
+    pending, win_rate) plus `confirmed` and `fallback` splits, so the UI
+    can show exactly which direction and which tier is paying on which
+    pair ("Call ও put কোনো সিগন্যাল গুলো কেমন win রেট দিচ্ছে"). The
+    original flat fields (wins/losses/draws/pending/win_rate) are
+    unchanged for existing consumers.
+
+    `days` limits the window (0 = all history, 1 = last 24h, 7 = week).
+    """
+    days = max(0, min(days, 90))
+    return await db.win_rate_ext(pair, days)
+
+
+@app.get("/api/winrate/summary")
+async def winrate_summary(days: int = 0):
+    """Global win-rate summary over the window: totals, CALL/PUT split,
+    confirmed/fallback split. `days` = 0 means all history."""
+    days = max(0, min(days, 90))
+    return await db.summary(days)
 
 
 # ---------------------------------------------------------------------------
@@ -465,15 +499,24 @@ async def signals_for_pair(pair: str):
 
 
 @app.get("/api/signals/history")
-async def signals_history(pair: str, limit: int = 100):
+async def signals_history(
+    pair: str,
+    limit: int = 100,
+    direction: str | None = None,
+    tier: str | None = None,
+    result: str | None = None,
+    offset: int = 0,
+):
     """Historical signals for one pair (newest first). Open to anyone.
 
     Use as: GET /api/signals/history?pair=EUR/USD&limit=100
+    Optional filters: direction=CALL|PUT, tier=confirmed|fallback,
+    result=WIN|LOSS|DRAW|PENDING, offset for pagination.
     """
     if pair not in config.ALL_PAIRS:
         raise HTTPException(status_code=404, detail=f"unknown pair: {pair}")
     limit = max(1, min(limit, 1000))
-    rows = await db.history(pair, limit)
+    rows = await db.history(pair, limit, direction, tier, result, offset)
     return {
         "pair": pair,
         "count": len(rows),
@@ -513,6 +556,12 @@ async def strategies_registry():
         ],
         "microstructure_sources": [
             {"name": "microstructure", "family": "microstructure", "description": "Blended candle color/body/wick/trend/streak score"},
+        ],
+        "regime_sources": [
+            {"name": "anchor_fade",      "family": "regime", "description": "Price stretched >= 1 ATR from its 60-candle mean → fade (range/neutral regime)"},
+            {"name": "anchor_follow",    "family": "regime", "description": "Displacement >= 1 ATR continues (confirmed trend regime)"},
+            {"name": "streak_exhaustion", "family": "regime", "description": "3+ same-colour candles in a row → fade the streak"},
+            {"name": "htf_trend",         "family": "regime", "description": "5-minute higher-timeframe leg alignment"},
         ],
         "mined_sources": [
             {"name": "mined_*", "family": "mined", "description": "Self-learned 2-candle sequences promoted via FDR correction"},

@@ -1,20 +1,8 @@
+/* সেটিংস ভিউ — সংযোগ, টোকেন, থ্রেশহোল্ড, স্ট্র্যাটেজি পারফরম্যান্স */
 App.tabs.settings = {
   patternPairFilter: "",
 
   onInit() {
-    const select = document.getElementById("patternPerfPairFilter");
-    App.allPairNames().forEach((p) => {
-      const opt = document.createElement("option");
-      opt.value = p;
-      opt.textContent = p;
-      select.appendChild(opt);
-    });
-    select.addEventListener("change", () => {
-      this.patternPairFilter = select.value;
-      this.loadPatternPerformance();
-    });
-    this.loadPatternPerformance();
-
     document.getElementById("sessionUpdateBtn").addEventListener("click", () => this.submitSessionUpdate());
   },
 
@@ -29,24 +17,24 @@ App.tabs.settings = {
     const sessionCookies = document.getElementById("sessionCookies").value.trim();
 
     if (!sessionToken) {
-      statusEl.textContent = "Session token is required.";
+      statusEl.textContent = "সেশন টোকেন দিন।";
       statusEl.className = "settings-note error-text";
       return;
     }
 
     btn.disabled = true;
-    statusEl.textContent = "Updating…";
+    statusEl.textContent = "আপডেট হচ্ছে…";
     statusEl.className = "settings-note";
     try {
       const res = await App.apiPost("/api/session", {
         session_token: sessionToken,
         session_cookies: sessionCookies,
       });
-      statusEl.textContent = res.message || "Updated, reconnecting…";
+      statusEl.textContent = res.message || "আপডেট হয়েছে, রিকানেক্ট হচ্ছে…";
       document.getElementById("sessionToken").value = "";
       document.getElementById("sessionCookies").value = "";
     } catch (e) {
-      statusEl.textContent = e.message || "Update failed";
+      statusEl.textContent = e.message || "আপডেট ব্যর্থ";
       statusEl.className = "settings-note error-text";
     } finally {
       btn.disabled = false;
@@ -55,18 +43,22 @@ App.tabs.settings = {
 
   onShow() {
     this.renderPairs();
-    this.loadPatternPerformance();
+    this.loadPatternPerf();
   },
 
   onStatus(s) {
     const conn = document.getElementById("settingsConn");
-    conn.textContent = s.quotex_connected
-      ? `Connected (${s.account_mode} account)`
-      : (s.error ? "Waiting for a valid token" : "Connecting…");
+    conn.innerHTML = `<span>অবস্থা</span><span>${
+      s.quotex_connected
+        ? `সংযুক্ত (${s.account_mode} অ্যাকাউন্ট)`
+        : s.error
+          ? "টোকেনের অপেক্ষায়"
+          : "সংযোগ হচ্ছে…"
+    }</span>`;
     document.getElementById("settingsError").textContent = s.error || "";
     document.getElementById("settingsAuthMode").textContent =
-      s.auth_mode === "session_token" ? "session token" : "no token pasted yet";
-    document.getElementById("settingsPersistence").textContent = "on (database-backed)";
+      s.auth_mode === "session_token" ? "সেশন টোকেন" : "এখনো টোকেন দেওয়া হয়নি";
+    document.getElementById("settingsPersistence").textContent = "চালু (ডাটাবেজে সংরক্ষিত)";
     document.getElementById("settingsFeedHealth").textContent = this.describeFeedHealth(s);
     document.getElementById("settingsMinConf").textContent = (s.min_confidence * 100).toFixed(0) + "%";
     this._active = s.active_pairs || [];
@@ -75,9 +67,9 @@ App.tabs.settings = {
 
   describeFeedHealth(s) {
     const reconnects = s.reconnects || 0;
-    const suffix = reconnects ? ` (${reconnects} auto-reconnect${reconnects === 1 ? "" : "s"})` : "";
-    if (s.feed_stale_seconds === null || s.feed_stale_seconds === undefined) return `not streaming${suffix}`;
-    return `last tick ${s.feed_stale_seconds}s ago${suffix}`;
+    const suffix = reconnects ? ` (${reconnects} বার অটো-রিকানেক্ট)` : "";
+    if (s.feed_stale_seconds === null || s.feed_stale_seconds === undefined) return `স্ট্রিম চলছে না${suffix}`;
+    return `শেষ টিক ${s.feed_stale_seconds}s আগে${suffix}`;
   },
 
   renderPairs() {
@@ -85,54 +77,47 @@ App.tabs.settings = {
     const names = App.allPairNames();
     const active = new Set(this._active || []);
     list.innerHTML = names.map((name) => `
-      <div class="pair-row">
-        <span class="name">${name}</span>
-        <span class="result-badge ${active.has(name) ? "WIN" : "PENDING"}">${active.has(name) ? "streaming" : "waiting"}</span>
-      </div>`).join("");
+      <span class="pair-chip ${active.has(name) ? "active" : ""}">${name}${active.has(name) ? " ●" : ""}</span>`).join("");
   },
 
-  async loadPatternPerformance() {
+  async loadPatternPerf() {
+    const sel = document.getElementById("patternPerfPairFilter");
+    this.patternPairFilter = sel ? sel.value : "";
     const q = this.patternPairFilter ? `?pair=${encodeURIComponent(this.patternPairFilter)}` : "";
     const rows = await App.api(`/api/patterns${q}`);
-    this.renderPatternPerformance(rows);
+    this.renderPatternPerf(rows);
   },
 
-  renderPatternPerformance(rows) {
+  renderPatternPerf(rows) {
     const list = document.getElementById("patternPerfList");
     if (!rows.length) {
-      const scope = this.patternPairFilter ? `for ${this.patternPairFilter}` : "yet";
-      list.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0">No signals ${scope}</div>`;
+      const scope = this.patternPairFilter ? ` (${this.patternPairFilter})` : "";
+      list.innerHTML = `<div class="empty-note">এখনো কোনো গ্রেড করা সিগন্যাল নেই${scope}</div>`;
       return;
     }
     list.innerHTML = rows.map((r) => {
       const rate = r.win_rate;
       const graded = r.wins + r.losses;
-      // The rate is computed on graded signals only, so lead with that
-      // number. Showing the fired count instead made a source measured on
-      // 68 trades look like it had 564 behind it.
-      const rateClass = rate === null ? "" : graded < 30 ? "rate-thin"
-        : rate >= 0.55 ? "rate-good" : rate <= 0.45 ? "rate-bad" : "rate-mid";
+      const rateClass = rate === null ? "rate-thin" : App.rateClass(rate, graded);
       const extras = [];
       if (r.draws) extras.push(`${r.draws} no-move`);
       if (r.pending) extras.push(`${r.pending} pending`);
       const extraNote = extras.length ? ` (${extras.join(", ")})` : "";
-      const thin = graded > 0 && graded < 30 ? ' <span class="thin-flag">too few to judge</span>' : "";
-      return `<div class="pair-row">
-        <span class="name">${r.pattern}${thin}</span>
-        <span><span class="signal-count">${graded} graded</span>
-        <span class="rate ${rateClass}">${App.fmtPct(rate)}</span>
-        <span class="counts">${r.wins}W / ${r.losses}L${extraNote}</span></span>
+      return `<div class="strategy-row">
+        <div><div class="s-name">${r.pattern}</div>
+        <div class="s-meta">${graded} graded${extraNote}</div></div>
+        <span class="s-rate ${rateClass}">${App.fmtPct(rate)}</span>
       </div>`;
     }).join("");
   },
 
   onGraded() {
-    this.loadPatternPerformance();
+    this.loadPatternPerf();
   },
 
   onSignal(msg) {
     if (!this.patternPairFilter || msg.pair === this.patternPairFilter) {
-      this.loadPatternPerformance();
+      this.loadPatternPerf();
     }
   },
 };

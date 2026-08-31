@@ -1,5 +1,86 @@
 # minimum-pair
 
+## Engine v2: correlated votes, higher-timeframe context, measured fallback (2026-09-01)
+
+Walk-forward A/B on 5 seeds × 4 synthetic generators (`tools/ab_harness.py`,
+2000 bars each; `--learn` mirrors the live grading loop). Summary of the
+multi-seed mean `win_rate_all`:
+
+| generator | old engine (learn) | new engine (learn) | old engine (raw) | new engine (raw) |
+|---|---|---|---|---|
+| mean_revert (OTC-style) | 55.5% | **57.3%** | 50.2% | **52.1%** |
+| trending | 67.6% | **68.0%** | 62.5% | **65.7%** |
+| mixed | 58.6% | **59.4%** | 54.2% | **58.0%** |
+| random_walk (honesty check) | 49.5% | 49.9% | 49.5% | 49.8% |
+| **overall** | 57.8% | **58.6%** | 54.1% | **56.4%** |
+
+The random-walk row is the honesty row: on driftless noise the engine
+must stay at ~50%, and it does — every point of the gains above comes
+from real structure, not from luck. Six root causes were found and
+fixed this round:
+
+1. **Correlated votes were counted as independent confirmations.** One
+   physical event — price bouncing off the floor — fired `rsi_oversold`
+   AND `bb_lower_bounce` AND `near_support` AND up to four rejection
+   detectors AND a candlestick pattern, all on the same candle. Five
+   "confirmations", one idea. In a downtrend those correlated reversion
+   votes systematically outvoted the single honest trend vote and the
+   signal was stamped `confirmed` on the wrong side. Votes are now
+   grouped by (strategy family, direction): the first vote in a cluster
+   carries its full earned weight, each additional vote in the same
+   cluster decays (`cap/(cap+contributed)`), and `confirmations` counts
+   distinct IDEAS, not detectors. A lone idea still needs to have
+   measurably earned `LONE_VOTE_MIN_WEIGHT` to confirm.
+
+2. **The fallback followed wrong-theory reads.** On the mean-reverting
+   OTC-style feed the fallback direction was led ~20% of the time by
+   `ema_trend_*` votes (a trend theory) that won only 32–43% of those
+   trades. New rule — the theory-opposition veto: when a confirmed
+   regime (strength ≥ 0.30) says the market is ranging but the winning
+   side is supported ONLY by trend-family votes (or the mirror image),
+   the pool's answer is skipped in the fallback path and demoted from
+   the confirmed tier.
+
+3. **A reversion fade fighting a live higher-timeframe leg.** RSI-extreme
+   lone-vote fallbacks fired against a running 5-minute trend won ~30%
+   of them (measured on trending + mixed feeds). New HTF-opposition
+   check: outside a range regime, a direction supported only by
+   reversion-family votes while the 5-minute leg clearly runs the other
+   way (strength ≥ 0.40) is vetoed from confirming and skipped in the
+   fallback chain.
+
+4. **No higher-timeframe context at all.** New `app/htf.py` aggregates
+   closed 1-minute candles into 5-minute buckets and reads position vs
+   the HTF EMA, EMA slope, and net displacement — one honest
+   `htf_trend` vote (trend family), and a better-than-colour fallback
+   baseline when the 5-minute leg is clearly travelling.
+
+5. **The two strongest simple edges on OTC-style feeds had no dedicated
+   source.** Measured raw (`tools/measure_edges.py`): fading price
+   stretched ≥ 1 ATR from its 60-candle mean won 65.2%; fading a 3+
+   same-colour streak won 64.6% — while on trending feeds the SAME
+   displacement read wins by FOLLOWING (68%). New regime-conditional
+   sources: `anchor_fade` (range/neutral: fade displacement),
+   `anchor_follow` (confirmed trend: follow it), and a strengthened
+   `streak_exhaustion` fade. In the fallback chain, the last-resort
+   colour read is now INVERTED when the regime says the market fades
+   moves (colour-follow wins ~45% there — the fade wins ~55%).
+
+6. **Confidence overstated small samples.** A 25-sample rate gated
+   `confirmed`. Now `CONFIDENCE_MIN_SAMPLES = 40` and the reported
+   confidence is the Beta posterior mean (`weights.shrunk_rate`), so a
+   30-for-40 run reports ~58%, not 75%.
+
+Also new: `/api/winrate` now returns per-pair CALL/PUT and
+confirmed/fallback splits (plus a `days` window param),
+`/api/winrate/summary` the global rollup, and `/api/history` gained
+`direction`/`tier`/`result`/`offset` filters. The frontend was rebuilt
+from scratch (2026-09 design system): a live signal board with
+per-pair countdown cards and CALL/PUT hero bars, a stats view with the
+per-pair × per-direction win-rate table, a filterable history, and a
+cleaned-up chart — Bengali-first UI, `tools/seed_demo.py` seeds a demo
+DB for offline UI verification.
+
 ## Per-candle guarantee, honestly tiered (2026-08-30)
 
 Two requirements landed back to back, pulling in opposite directions:
