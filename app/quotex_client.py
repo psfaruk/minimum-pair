@@ -108,6 +108,25 @@ async def get_client() -> Quotex:
             "(POST /api/session) to connect."
         )
 
+    if _client is not None:
+        # The stale client's own WebsocketClient.run_forever() keeps
+        # auto-reconnecting in the background forever, on its own
+        # schedule, even though check_connect() above just said it isn't
+        # authenticated. Building a fresh Quotex object without closing
+        # this one first orphans that loop — every retry through here
+        # (the bootstrap loop retries every RETRY_BACKOFF_SECONDS) leaks
+        # one more of them. Enough orphaned loops hammering the same WS
+        # endpoint concurrently looks like a reconnect storm from
+        # Quotex's side and gets the connection rejected outright
+        # (observed: "server rejected WebSocket connection: HTTP 403"
+        # from dozens of simultaneous reconnect attempts at wildly
+        # different attempt counts). Close it before replacing.
+        try:
+            await _client.close()
+        except Exception:
+            logger.warning("Failed to close the stale Quotex client before reconnecting", exc_info=True)
+        _client = None
+
     client = Quotex(
         email="",
         password="",
