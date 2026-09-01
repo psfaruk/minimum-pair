@@ -10,6 +10,13 @@ logger = logging.getLogger(__name__)
 _client: Quotex | None = None
 _client_unhealthy_since: float | None = None
 
+# The most informative description of why the LAST connect attempt failed
+# ("no token", pyquotex's own "Websocket connection rejected.", handshake
+# timeouts, HTTP 403s, ...). Surfaced via /api/status and /api/diagnose so
+# a silent deployed instance can be diagnosed from the outside instead of
+# everyone guessing at empty charts.
+_last_connect_detail: str = "no connection attempt made yet"
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -58,6 +65,13 @@ def auth_mode() -> str:
     """Token-only auth surface: either a token is set, or the app is
     waiting for one to be pasted via the Settings tab."""
     return "session_token" if config.QUOTEX_SESSION_TOKEN else "no_token"
+
+
+def last_connect_detail() -> str:
+    """Human-readable detail of the most recent connect attempt's failure
+    (or success). Diagnostics surface — empty charts on a deployed
+    instance are meaningless without it."""
+    return _last_connect_detail
 
 
 async def _save_session_state() -> None:
@@ -136,6 +150,8 @@ async def get_client() -> Quotex:
         _client_unhealthy_since = None
 
     if not config.QUOTEX_SESSION_TOKEN:
+        global _last_connect_detail
+        _last_connect_detail = "no session token configured"
         raise NoSessionTokenError(
             "No session token configured — paste one via the Settings tab "
             "(POST /api/session) to connect."
@@ -176,6 +192,7 @@ async def get_client() -> Quotex:
     try:
         ok, reason = await client.connect()
     except Exception as e:
+        _last_connect_detail = f"{type(e).__name__}: {e}"
         raise ConnectionError(f"Quotex connect failed: {type(e).__name__}: {e}") from e
 
     if not ok:
@@ -196,8 +213,21 @@ async def get_client() -> Quotex:
                 ok = True
                 break
         if not ok:
-            raise ConnectionError(f"Quotex connect failed: {reason}")
+            # The raw reason from pyquotex can be generic ("Websocket
+            # connection rejected."); enrich it with the server's own
+            # error string so an IP/region block or expired token is
+            # visible instead of a bare timeout.
+            raw_reason = ""
+            try:
+                raw_reason = str(client.api.state.websocket_error_reason or "")
+            except Exception:
+                pass
+            detail = reason if not raw_reason or raw_reason in reason else f"{reason} ({raw_reason})"
+            _last_connect_detail = detail
+            raise ConnectionError(f"Quotex connect failed: {detail}")
         logger.info("Connected after grace period")
+
+    _last_connect_detail = "connected ok"
 
     client.set_account_mode(config.QUOTEX_ACCOUNT_MODE)
     _client = client

@@ -100,19 +100,67 @@ function setupNav() {
 function setConnUI(connected, text) {
   const dot = document.getElementById("connDot");
   const label = document.getElementById("connText");
-  dot.classList.remove("connected", "error");
+  dot.classList.remove("connected", "error", "warn");
   if (connected === true) dot.classList.add("connected");
   else if (connected === false) dot.classList.add("error");
+  else if (connected === "warn") dot.classList.add("warn");
   label.textContent = text;
+}
+
+// The one banner that turns "empty charts" into a named problem with a
+// named fix. hidden = everything is fine or still warming up normally.
+function setFeedAlert(text, severity) {
+  const el = document.getElementById("feedAlert");
+  if (!text) {
+    el.classList.add("hidden");
+    el.textContent = "";
+    return;
+  }
+  el.classList.remove("hidden");
+  el.className = `feed-alert ${severity || "warn"}`;
+  el.innerHTML = text;
+}
+
+function shortReason(detail) {
+  if (!detail) return "";
+  const s = String(detail);
+  return s.length > 70 ? s.slice(0, 70) + "…" : s;
 }
 
 async function pollStatus() {
   try {
     const s = await App.api("/api/status");
     App.state.status = s;
-    if (s.quotex_connected) setConnUI(true, `লাইভ (${s.active_pairs.length} পেয়ার)`);
-    else if (s.error) setConnUI(false, "সংযোগ বিচ্ছিন্ন");
-    else setConnUI(null, "সংযোগ হচ্ছে…");
+    if (s.quotex_connected) {
+      if ((s.total_ticks || 0) === 0) {
+        // Connected and subscribed but not one tick received yet — either
+        // still inside the ~60s warmup, or every pair is offline. Either
+        // way the user deserves to see WHICH of the two it is.
+        setConnUI("warn", `সংযুক্ত, টিক অপেক্ষমাণ (${s.active_pairs.length} পেয়ার)`);
+        setFeedAlert(
+          `সংযোগ সফল, কিন্তু এখনো কোনো প্রাইস টিক আসেনি। বুটের পর প্রথম ডেটা আসতে ~১ মিনিট লাগে (হিস্ট্রি ওয়ার্মআপ)। <a href="#" data-goto-settings>Settings-এ ডায়াগনোসিস চালান</a> যদি ২-৩ মিনিট পরেও একই থাকে।`,
+          "warn"
+        );
+      } else {
+        setConnUI(true, `লাইভ (${s.active_pairs.length} পেয়ার)`);
+        setFeedAlert(null);
+      }
+    } else if (s.auth_mode === "no_token") {
+      setConnUI("warn", "টোকেন অপেক্ষমাণ");
+      setFeedAlert(
+        `সেশন টোকেন দেওয়া হয়নি — তাই ডেটা আসবে না। <a href="#" data-goto-settings>Settings ট্যাবে</a> Quotex SSID টোকেন পেস্ট করুন (অথবা Railway-এর Variables-এ QUOTEX_SESSION_TOKEN সেট করুন)।`,
+        "warn"
+      );
+    } else if (s.error) {
+      setConnUI(false, "সংযোগ বিচ্ছিন্ন");
+      setFeedAlert(
+        `Quotex সংযোগ কাজ করছে না: ${shortReason(s.last_connect_detail || s.error)} — <a href="#" data-goto-settings>Settings-এ ডায়াগনোসিস চালান</a> সঠিক সমাধান দেখতে।`,
+        "error"
+      );
+    } else {
+      setConnUI(null, "সংযোগ হচ্ছে…");
+      setFeedAlert(null);
+    }
     if (App.tabs.settings && App.tabs.settings.onStatus) App.tabs.settings.onStatus(s);
   } catch (e) {
     setConnUI(false, "সার্ভার পাওয়া যাচ্ছে না");
@@ -163,3 +211,11 @@ async function boot() {
 }
 
 document.addEventListener("DOMContentLoaded", boot);
+
+// Banner CTA jumps straight to Settings (diagnostics live there).
+document.addEventListener("click", (e) => {
+  const link = e.target.closest("[data-goto-settings]");
+  if (!link) return;
+  e.preventDefault();
+  switchView("settings");
+});

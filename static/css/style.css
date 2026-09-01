@@ -703,3 +703,65 @@ select:focus { border-color: rgba(79, 140, 255, 0.5); }
   select { padding: 12px; }
   .history-row { padding-top: 11px; padding-bottom: 11px; }
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   Deploy diagnostics — feed-down banner + /api/diagnose output
+   (turns "empty charts" into a named problem with a named fix)
+   ═══════════════════════════════════════════════════════════════ */
+.dot.warn { background: var(--pending); box-shadow: 0 0 8px var(--pending); }
+
+/* Generic hide (the old stylesheet only ever scoped .hidden to
+   .signal-badge, which left the feed banner and diagnose panel rendering
+   as empty visible boxes). */
+.hidden { display: none !important; }
+
+.feed-alert {
+  position: sticky;
+  top: 58px;
+  z-index: 15;
+  margin: 10px 16px 0;
+  padding: 11px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1.55;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  background: rgba(251, 191, 36, 0.09);
+  color: #fde68a;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.feed-alert.error {
+  border-color: rgba(255, 84, 112, 0.4);
+  background: rgba(255, 84, 112, 0.1);
+  color: #fda4b4;
+}
+.feed-alert a { color: inherit; font-weight: 700; text-decoration: underline; }
+
+.diagnose-btn { margin-top: 12px; background: var(--card); color: var(--text); border: 1px solid var(--card-border); }
+.diagnose-btn:hover { opacity: 1; border-color: rgba(34, 211, 238, 0.45); }
+
+.diag-panel {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--card-solid);
+  border: 1px solid var(--card-border);
+}
+.diag-running { font-size: 12.5px; color: var(--text-dim); padding: 6px 0; }
+.diag-line {
+  display: flex; justify-content: space-between; gap: 12px;
+  font-size: 12.5px; padding: 5px 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+}
+.diag-line:last-of-type { border-bottom: none; }
+.diag-line.ok { color: var(--text); }
+.diag-line.ok span:first-child::first-letter { color: var(--call); }
+.diag-line.bad { color: #fda4b4; }
+.diag-verdict {
+  margin-top: 9px; padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px; font-weight: 600; line-height: 1.55;
+}
+.diag-verdict.ok { background: var(--call-soft); color: var(--call); }
+.diag-verdict.bad { background: var(--put-soft); color: #fda4b4; }
+.diag-fix { margin-top: 7px; font-size: 12px; line-height: 1.6; color: var(--text-dim); font-weight: 400; }

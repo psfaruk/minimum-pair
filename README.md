@@ -1,5 +1,40 @@
 # minimum-pair
 
+## Deploy diagnostics: when "ডেটা আসছে না" after deploying (2026-09-02)
+
+The 2026-09-01 fixes below make the feed self-heal — but a *freshly
+deployed* instance can still show empty charts for reasons that live
+OUTSIDE the code: no session token configured on the new environment,
+the broker rejecting the token from a new datacenter IP/region, a stale
+build that never picked the fix up, or simply the ~60s warmup after
+boot. All four used to look identical in the UI: "সংযোগ হচ্ছে…" forever.
+Now they can't hide:
+
+- **`GET /api/diagnose`** runs the real broker pipeline step by step
+  INSIDE the deployment (token → connect → authorization → instrument
+  list → live price-stream probe on configured pairs → candle history)
+  on a throwaway websocket, and returns which step breaks plus an
+  actionable fix hint in Bengali. Never touches the live feed's client.
+- **`/api/status`** now exposes `last_connect_detail` (the actual
+  connect-failure reason, e.g. an HTTP 403 handshake rejection or an
+  expired token) and `total_ticks` (a live feed that stays at 0 while
+  "connected" is instantly visible), alongside the existing
+  `code_version` for stale-deploy detection.
+- **UI**: a full-width banner names the problem in Bengali with a jump
+  link to Settings (no token / connected-but-no-ticks-yet / rejected
+  with reason), the Settings tab shows `code_version` and total tick
+  count, and a "সংযোগ ডায়াগনোসিস চালান" button renders the step-by-step
+  result. `.hidden` is now a real global class (it was scoped only to
+  `.signal-badge`, which left new panels rendering as empty boxes).
+
+Deployment checklist this replaces guesswork with: Railway Variables →
+`QUOTEX_SESSION_TOKEN` (or paste it once in Settings — it persists via
+the DB volume `DB_PATH`); check `/api/status` `code_version` matches
+the commit you think is deployed; run the diagnose button; if the
+connect step fails with a rejection, try a different Railway region or
+re-paste a freshly captured SSID (a token dies when you log in again on
+the web, and two apps sharing one token can kick each other).
+
 ## Live-feed recovery: why data stopped coming, and the four fixes (2026-09-01)
 
 Symptom: *"Quotex live data আসছে না"* — the app sat there "connected"

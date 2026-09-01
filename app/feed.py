@@ -90,6 +90,12 @@ class FeedManager:
         # doesn't raise anything — the websocket just goes quiet — so
         # this silence is the only signal the watchdog has to work with.
         self.last_tick_at = time.monotonic()
+        # Lifetime counter of real ticks folded across every pair. A
+        # deployed instance that sits "connected" with total_ticks
+        # stuck at 0 is in the auth-works-but-no-stream state (region
+        # block, closed market for every pair, subscription dropped) —
+        # /api/status exposes it so that state is visible from outside.
+        self.total_ticks = 0
 
     def seconds_since_last_tick(self) -> float:
         return time.monotonic() - self.last_tick_at
@@ -443,6 +449,7 @@ class FeedManager:
 
                 if new_ticks:
                     self.last_tick_at = time.monotonic()
+                    self.total_ticks += len(new_ticks)
 
                 late_updates: dict[int, tuple[dict[str, Any], float]] = {}
                 for t in new_ticks:
