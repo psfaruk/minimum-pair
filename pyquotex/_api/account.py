@@ -58,8 +58,14 @@ class AccountMixin:
             logger.error(
                 "Websocket failed to connect or connection was rejected."
             )
-            if "token" in self.session_data:
-                self.session_data["token"] = None
+            # NOTE: the session token is deliberately NOT wiped here. The
+            # old code set session_data["token"] = None on this path, but
+            # check_connect() only grants ~2s for the server's
+            # authorization reply — a reply that routinely arrives a few
+            # seconds late on a slow handshake. Wiping the token turned a
+            # transient slow-auth into a permanent logout of the pasted
+            # session (and any retry after it had no token to present).
+            # Callers decide how long to wait for auth; the token stays.
             return False, "Websocket connection rejected."
 
         return check, reason

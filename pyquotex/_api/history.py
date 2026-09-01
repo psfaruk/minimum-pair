@@ -69,27 +69,59 @@ class HistoryMixin:
             if cached is not None:
                 return cached
 
-        index = expiration.get_timestamp()
+        index = next(_request_counter)
         self.api.candles.candles_data = None
+
+        # Correlate the response to THIS request. The old code waited on
+        # the un-indexed `candles_ready_{asset}` event, which any
+        # subscription-triggered tick payload can fire — so a deep-range
+        # request could be "answered" by the most recent window of data
+        # that happened to arrive first. The aggregated history/load reply
+        # echoes the request's `index`, and _on_message fires the indexed
+        # event `candles_ready_{asset}_{index}` for it.
+        indexed_event = f'candles_ready_{asset}_{index}'
 
         # Clear event state before requesting data to prevent
         # race with WS response
+        await self.api.event_registry.clear_event(indexed_event)
         await self.api.event_registry.clear_event(f'candles_ready_{asset}')
 
         await self.start_candles_stream(asset, period)
         await self.api.get_candles(asset, index, end_from_time, offset, period)
 
         try:
-            # Wait for WebSocket event signaling candles' arrival
+            # Wait for the reply correlated to this exact request
             history_data = await self.api.event_registry.wait_event(
-                f'candles_ready_{asset}', timeout=timeout
+                indexed_event, timeout=timeout
             )
         except TimeoutError:
-            logger.error(
-                "Timeout waiting for candles for %s after %ds",
-                asset, timeout
-            )
-            return None
+            # Fallback for servers that don't echo the index: accept an
+            # un-indexed payload, but ONLY one that isn't a reply to some
+            # other indexed request (those carry their own index).
+            try:
+                history_data = await self.api.event_registry.wait_event(
+                    f'candles_ready_{asset}', timeout=max(2, timeout // 3)
+                )
+                if (
+                        isinstance(history_data, dict)
+                        and history_data.get("index") is not None
+                        and int(history_data.get("index")) != int(index)
+                ):
+                    logger.error(
+                        "Received a candle reply for index %s while waiting "
+                        "for %s — treating it as a timeout for %s",
+                        history_data.get("index"), index, asset,
+                    )
+                    history_data = None
+            except TimeoutError:
+                history_data = None
+
+            if history_data is None:
+                logger.error(
+                    "Timeout waiting for candles for %s after %ds",
+                    asset, timeout
+                )
+                return None
 
         # Pass the asset-specific history directly to avoid
         # multi-asset state races
@@ -355,6 +387,36 @@ class HistoryMixin:
         history_data = (
             history if history is not None else self.api.candles.candles_data
         )
+
+        # The aggregated `history/load` reply carries `data` — a list of
+        # OHLC dicts — instead of the raw tick array in `history`. This is
+        # the ONLY server shape that honors deep/old time ranges (the raw
+        # tick form is capped at the most recent ~1000-1600 ticks, roughly
+        # 10-12 minutes, no matter how far back you ask). The old code
+        # never parsed it, so every deep history request silently came
+        # back empty or as the wrong window. Normalize the rows here.
+        if (
+                isinstance(history_data, dict)
+                and isinstance(history_data.get("data"), list)
+                and "history" not in history_data
+        ):
+            rows: dict[int, dict[str, Any]] = {}
+            for r in history_data["data"]:
+                if not isinstance(r, dict) or "time" not in r:
+                    continue
+                try:
+                    rows[int(r["time"])] = {
+                        "time": int(r["time"]),
+                        "open": float(r["open"]),
+                        "close": float(r["close"]),
+                        "high": float(r["high"]),
+                        "low": float(r["low"]),
+                        "ticks": int(r.get("ticks", 0) or 0),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return sorted(rows.values(), key=lambda c: c["time"])
+
         candles_data = calculate_candles(history_data, period)
         candles_v2_data = process_candles_v2(
             self.api.candle_v2_data, asset, candles_data

@@ -122,8 +122,17 @@ class Quotex(
             return state.auth_status == AuthStatus.AUTHENTICATED
 
     async def check_connect(self) -> bool:
-        """Check connection using the current API's state."""
+        """Check connection using the current API's state.
+
+        The raw socket must be OPEN as well as the auth state being
+        AUTHENTICATED: after a disconnect the socket is dead even if a
+        stale flag claims otherwise, and reporting healthy while the
+        connection delivers nothing is exactly how the live feed went
+        permanently silent without anyone noticing."""
         if self.api is None:
+            return False
+        ws_client = getattr(self.api, "websocket_client", None)
+        if ws_client is not None and not ws_client.is_alive():
             return False
         return await self._check_connect(self.api.state)
 

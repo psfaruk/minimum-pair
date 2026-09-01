@@ -8,6 +8,7 @@ from app import config, db
 logger = logging.getLogger(__name__)
 
 _client: Quotex | None = None
+_client_unhealthy_since: float | None = None
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -26,6 +27,17 @@ DEFAULT_USER_AGENT = (
 # which itself blocks ~2s per call — across a generous real-world budget
 # that spans a couple of those reconnect cycles.
 CONNECT_GRACE_SECONDS = 240
+
+# How long the singleton client may report "unhealthy" (socket dead /
+# re-auth in flight) before get_client() tears it down and rebuilds.
+# check_connect() is now honest about brief disconnects, and pyquotex's
+# auto-reconnect re-authorizes within a couple of seconds — but a caller
+# landing inside that short window must NOT trigger a full teardown:
+# closing the client kills the very auto-reconnect that would have
+# healed the feed, and the pair tasks keep polling the closed object
+# until the watchdog rebuilds everything minutes later. Past this grace
+# a rebuild IS the right move (the reconnect is genuinely stuck).
+UNHEALTHY_REBUILD_AFTER_SECONDS = 30
 
 # Persisted copies of the pasted session. Railway restarts this container
 # on every crash and redeploy, which is precisely when an in-memory token
@@ -98,9 +110,30 @@ async def get_client() -> Quotex:
     NoSessionTokenError immediately. There is no email/password login
     path to fall back to.
     """
-    global _client
-    if _client is not None and await _client.check_connect():
-        return _client
+    global _client, _client_unhealthy_since
+    if _client is not None:
+        if await _client.check_connect():
+            _client_unhealthy_since = None
+            return _client
+
+        # Brief disconnect — pyquotex's auto-reconnect (+ re-authorization)
+        # usually heals this within seconds. Give it the grace window
+        # instead of tearing the client down mid-heal.
+        now = time.monotonic()
+        if _client_unhealthy_since is None:
+            _client_unhealthy_since = now
+        if now - _client_unhealthy_since < UNHEALTHY_REBUILD_AFTER_SECONDS:
+            logger.debug(
+                "Quotex client temporarily disconnected — auto-reconnect "
+                "has %.0fs of grace left before a rebuild",
+                UNHEALTHY_REBUILD_AFTER_SECONDS - (now - _client_unhealthy_since),
+            )
+            return _client
+        logger.warning(
+            "Quotex client unhealthy for %.0fs — rebuilding it",
+            now - _client_unhealthy_since,
+        )
+        _client_unhealthy_since = None
 
     if not config.QUOTEX_SESSION_TOKEN:
         raise NoSessionTokenError(
@@ -168,6 +201,7 @@ async def get_client() -> Quotex:
 
     client.set_account_mode(config.QUOTEX_ACCOUNT_MODE)
     _client = client
+    _client_unhealthy_since = None
     logger.info("Connected to Quotex (%s account)", config.QUOTEX_ACCOUNT_MODE)
     return client
 
@@ -213,7 +247,8 @@ async def is_connected() -> bool:
 
 
 async def close_client() -> None:
-    global _client
+    global _client, _client_unhealthy_since
     if _client is not None:
         await _client.close()
         _client = None
+    _client_unhealthy_since = None

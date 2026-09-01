@@ -1,5 +1,75 @@
 # minimum-pair
 
+## Live-feed recovery: why data stopped coming, and the four fixes (2026-09-01)
+
+Symptom: *"Quotex live data আসছে না"* — the app sat there "connected"
+while no pair produced a single tick, and bootstrap history arrived
+starved. Four independent root causes were found by instrumenting the
+live websocket (every inbound frame logged, then a hard
+`transport.abort()` to simulate a network blip), and all four are fixed
+and verified live:
+
+1. **Auto-reconnect never re-authorized.** After ANY websocket drop
+   (network blip, server-side close, the stale watchdog's recycle)
+   pyquotex's `WebsocketClient` opened a brand-new engine.io session and
+   replayed the candle subscriptions — but never re-sent the SSID
+   authorization. The server ignores everything from an unauthorized
+   session, so the socket sat open and permanently silent. Measured:
+   after a forced drop, zero ticks ever resumed (`auth_sent_total`
+   stayed at 1 forever). `pyquotex/ws/client.py` now re-authorizes on
+   every reconnect BEFORE replaying subscriptions.
+   **Live-verified: ticks fully resume ~10s after a hard drop.**
+
+2. **The auth flag lied after a disconnect.** `_on_close` left
+   `auth_status = AUTHENTICATED` set, so `check_connect()` reported a
+   healthy feed for a dead connection — which is why
+   `quotex_client.get_client()` and the watchdog never reacted. Now the
+   auth state resets on close and `check_connect()` additionally
+   requires the raw socket to be alive.
+
+3. **Replays raced the session setup.** Even with re-authorization, an
+   `instruments/update` sent in the same second as `s_authorization` is
+   silently dropped by the server while it assembles the session
+   (`depth/follow` survives that race; the quote stream does not).
+   Verified live: the identical subscription message sent ~3s later
+   works instantly. The replay now waits for the auth to be accepted,
+   settles 3s, replays, then runs a second safety-net pass 5s later.
+   Related: `history/load` requests are silently dropped unless the
+   asset's subscription was re-asserted shortly before — so
+   `start_candles_stream` deliberately keeps re-sending the subscribe
+   trio on every call (the upstream library always did).
+
+4. **Bootstrap history was starved + the deep-history reply was never
+   parsed.** The broker's raw-tick history endpoint caps every reply at
+   the most recent ~1000-1600 ticks (~10-12 minutes) no matter how far
+   back you ask, so `get_candles(asset, now, 12000, 60)` returned 6-13
+   candles instead of 200 — every pair started nearly blind. The
+   AGGREGATED `history/load` reply (`data` key, ~40 candles per call)
+   does honor deep ranges (verified at 10h+ depth), but `_on_message`'s
+   `calculate_candles` only understood the raw-tick shape, and the
+   un-indexed `candles_ready_{asset}` event let any subscription-
+   triggered payload answer the wrong request. Now: `get_candles`
+   correlates replies by a unique per-request index, `prepare_candles`
+   parses the aggregated OHLC shape, and `feed.py` bootstraps each pair
+   as 5 merged 40-candle chunks. **Live-verified: 196-200 candles per
+   pair at boot (was 6-13), signals firing on all 16 pairs, grading
+   running.**
+
+App-layer hardening in the same round: `check_connect()`'s honesty
+means a 2-second blip now shows as "not connected" — so `get_client()`
+gives a transiently-unhealthy client a 30s grace window before tearing
+it down (closing it mid-heal would kill the auto-reconnect that was
+about to fix it), and the watchdog requires the disconnect to persist
+across two consecutive checks before a full feed rebuild. The token
+wipe in `AccountMixin.connect()` (a slow auth reply used to NULL the
+pasted session token — turning a transient slow handshake into a
+permanent logout) is removed; an engine.io application-level ping ("2")
+now gets its protocol pong ("3"); the heartbeat task no longer leaks
+one copy per reconnect. Tests: `tests/test_quotex_client_fixes.py`
+covers the grace window; walk-forward backtest re-run on all four
+generators stays healthy (trending 72.6% confirmed / random-walk ~50%
+honesty row).
+
 ## Engine v2: correlated votes, higher-timeframe context, measured fallback (2026-09-01)
 
 Walk-forward A/B on 5 seeds × 4 synthetic generators (`tools/ab_harness.py`,

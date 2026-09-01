@@ -29,7 +29,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
 
 from pyquotex._api._waits import backoff_sleep
-from pyquotex.global_value import WebsocketStatus
+from pyquotex.global_value import AuthStatus, WebsocketStatus
 from pyquotex.types import ReconnectPolicy
 
 logger = logging.getLogger(__name__)
@@ -143,6 +143,15 @@ class WebsocketClient:
             await self.api._on_open()
             self._open_count += 1
             if self._open_count > 1:
+                # Reconnect path: this is a brand-new engine.io session and
+                # the server considers it UNAUTHORIZED until the SSID is
+                # presented again. The old code only replayed subscriptions
+                # here — on an unauthorized session those are ignored, so
+                # the connection sat open but permanently silent (live data
+                # never resumed after any network blip). Re-authorize FIRST
+                # so the replayed subscriptions land on an authorized
+                # session, in-order on the same socket.
+                await self._reauthorize()
                 asyncio.create_task(self._replay_subscriptions())
 
             self._start_watchdog()
@@ -197,17 +206,60 @@ class WebsocketClient:
             pass
 
     # ------------------------------------------------------------------
-    # Subscription replay after reconnect
+    # Re-authorization + subscription replay after reconnect
     # ------------------------------------------------------------------
-    async def _replay_subscriptions(self) -> None:
-        """Re-issue every tracked subscription after a successful reconnect."""
+    async def _reauthorize(self) -> None:
+        """Re-send the SSID authorization on a fresh post-reconnect socket.
+
+        Every reconnect creates a new engine.io session whose only valid
+        state is "not authenticated" — the server delivers no quotes,
+        candles or balance updates until the SSID is presented again."""
+        ssid = getattr(self.api.state, "SSID", None)
+        if not ssid:
+            logger.warning(
+                "WebSocket reconnected without an SSID — cannot re-authorize; "
+                "this connection will receive no data"
+            )
+            return
         try:
-            for _ in range(40):  # ~2 s
-                if self.state.status == WebsocketStatus.CONNECTED:
+            await self.api.ssid(ssid)
+            logger.info(
+                "WebSocket reconnected — SSID authorization re-sent"
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to re-send SSID authorization after reconnect: %s", e
+            )
+
+    async def _replay_subscriptions(self) -> None:
+        """Re-issue every tracked subscription after a successful reconnect.
+
+        Two live-measured constraints shape the timing here:
+
+        1. The server silently DROPS subscription requests that arrive
+           while it is still assembling the freshly-authorized session —
+           an ``instruments/update`` sent in the same second as
+           ``s_authorization`` never activates the quote stream, while
+           the identical message sent a few seconds later works
+           instantly (``depth/follow`` survives the race; the quote
+           stream does not). So the replay waits for the auth to be
+           accepted AND for the session-setup burst to settle.
+        2. A duplicated subscription is harmless (idempotent server
+           side), but a MISSING one is a permanently silent feed — so a
+           second replay pass runs a few seconds later as a safety net.
+        """
+        try:
+            for _ in range(40):  # ~2 s: wait for the re-auth to be accepted
+                if (
+                    self.state.status == WebsocketStatus.CONNECTED
+                    and self.state.auth_status == AuthStatus.AUTHENTICATED
+                ):
                     break
                 await asyncio.sleep(0.05)
         except Exception:  # pragma: no cover
             pass
+
+        await asyncio.sleep(3)  # let the session-setup burst settle
 
         subs = list(getattr(self.api, "_subscriptions", {}).values())
         for sub in subs:
@@ -216,6 +268,19 @@ class WebsocketClient:
             except Exception as e:
                 logger.warning(
                     "Failed to replay subscription kind=%s asset=%s: %s",
+                    sub.kind, sub.asset, e,
+                )
+
+        # Safety-net second pass: if the first pass landed inside the
+        # session-setup window it was dropped silently. Re-send every
+        # subscription once more; duplicates are idempotent.
+        await asyncio.sleep(5)
+        for sub in list(getattr(self.api, "_subscriptions", {}).values()):
+            try:
+                await self._replay_one(sub)
+            except Exception as e:
+                logger.warning(
+                    "Failed replay retry kind=%s asset=%s: %s",
                     sub.kind, sub.asset, e,
                 )
 

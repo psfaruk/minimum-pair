@@ -23,7 +23,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 # Bumped on every production-visible change so a redeploy can be verified
 # from outside: /api/status exposes it, and Railway has no other way to
 # tell which commit a running instance was built from.
-CODE_VERSION = "2026.09.01-engine2-ui2"
+CODE_VERSION = "2026.09.01-livefeed-recovery"
 
 app_state: dict = {"quotex_connected": False, "error": None, "pairs": list(config.ALL_PAIRS.keys())}
 _ws_clients: set[WebSocket] = set()
@@ -150,11 +150,21 @@ async def _connection_watchdog() -> None:
     ticks back waits longer before the next attempt.
     """
     consecutive_rebuilds = 0
+    # Consecutive checks where the client reported itself disconnected
+    # while the feed wasn't stale yet. check_connect() is honest now, so
+    # a brief network blip shows up as a momentary "not connected" — but
+    # pyquotex's auto-reconnect (+ its re-authorization) heals that
+    # within seconds, long before the next check. Tearing the whole feed
+    # down on the FIRST disconnected check converted every blip into a
+    # multi-minute outage; a disconnect must persist across two checks
+    # before a full rebuild is worth its cost.
+    disconnected_checks = 0
     while True:
         await asyncio.sleep(config.CONNECTION_WATCHDOG_SECONDS)
         manager = app_state.get("feed_manager")
         if manager is None:
             consecutive_rebuilds = 0
+            disconnected_checks = 0
             app_state["consecutive_rebuild_failures"] = 0
             continue  # the bootstrap loop already owns the reconnect
 
@@ -162,8 +172,22 @@ async def _connection_watchdog() -> None:
         connected = await quotex_client.is_connected()
         if connected and stale_for < config.STALE_FEED_SECONDS:
             consecutive_rebuilds = 0
+            disconnected_checks = 0
             app_state["consecutive_rebuild_failures"] = 0
             continue
+
+        if not connected and stale_for < config.STALE_FEED_SECONDS:
+            # Momentary disconnect with the feed itself still fresh — the
+            # auto-reconnector owns this, not us. Wait for it.
+            disconnected_checks += 1
+            if disconnected_checks < 2:
+                logger.info(
+                    "Client briefly disconnected (no ticks for %.0fs) — "
+                    "giving the auto-reconnect one more cycle before a rebuild",
+                    stale_for,
+                )
+                continue
+        disconnected_checks = 0
 
         consecutive_rebuilds += 1
         app_state["consecutive_rebuild_failures"] = consecutive_rebuilds
