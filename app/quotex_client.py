@@ -110,6 +110,17 @@ async def load_persisted_state() -> None:
         logger.info("Restored a session token from the database — no token paste needed to start")
 
 
+async def _close_quietly(client: Quotex) -> None:
+    """Closes a Quotex client's background reconnect task, swallowing
+    errors — used whenever a client is being abandoned (superseded, or
+    connect() never panned out) so its WebsocketClient.run_forever()
+    doesn't keep retrying forever with nothing left to reference it."""
+    try:
+        await client.close()
+    except Exception:
+        logger.warning("Failed to close a Quotex client", exc_info=True)
+
+
 async def get_client() -> Quotex:
     """Returns a connected singleton Quotex client, connecting on first
     use.
@@ -170,10 +181,7 @@ async def get_client() -> Quotex:
         # (observed: "server rejected WebSocket connection: HTTP 403"
         # from dozens of simultaneous reconnect attempts at wildly
         # different attempt counts). Close it before replacing.
-        try:
-            await _client.close()
-        except Exception:
-            logger.warning("Failed to close the stale Quotex client before reconnecting", exc_info=True)
+        await _close_quietly(_client)
         _client = None
 
     client = Quotex(
@@ -192,6 +200,10 @@ async def get_client() -> Quotex:
     try:
         ok, reason = await client.connect()
     except Exception as e:
+        # client.connect() may have already spawned its own background
+        # WebsocketClient.run_forever() task before raising (see below) —
+        # close() is a no-op if it hasn't, so this is always safe.
+        await _close_quietly(client)
         _last_connect_detail = f"{type(e).__name__}: {e}"
         raise ConnectionError(f"Quotex connect failed: {type(e).__name__}: {e}") from e
 
@@ -213,6 +225,20 @@ async def get_client() -> Quotex:
                 ok = True
                 break
         if not ok:
+            # Giving up here must not abandon `client` — its own
+            # WebsocketClient.run_forever() task (spawned inside
+            # connect() above) has been retrying via pyquotex's
+            # ReconnectPolicy this whole grace period and keeps going
+            # forever if nothing closes it. `client` was never assigned
+            # to the module-level `_client`, so without this the same
+            # orphaned-reconnect-loop leak this function was already
+            # fixed for elsewhere reappears here: every failed
+            # CONNECT_GRACE_SECONDS-long attempt (the bootstrap loop
+            # retries every RETRY_BACKOFF_SECONDS on top of that) leaks
+            # one more loop hammering Quotex's websocket endpoint,
+            # eventually getting the connection rejected with HTTP 403
+            # regardless of how fresh the session token is.
+            await _close_quietly(client)
             # The raw reason from pyquotex can be generic ("Websocket
             # connection rejected."); enrich it with the server's own
             # error string so an IP/region block or expired token is
