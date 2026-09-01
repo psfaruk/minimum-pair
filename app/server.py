@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,7 +24,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 # Bumped on every production-visible change so a redeploy can be verified
 # from outside: /api/status exposes it, and Railway has no other way to
 # tell which commit a running instance was built from.
-CODE_VERSION = "2026.09.01-engine2-ui2"
+CODE_VERSION = "2026.09.02-deploy-diagnostics"
 
 app_state: dict = {"quotex_connected": False, "error": None, "pairs": list(config.ALL_PAIRS.keys())}
 _ws_clients: set[WebSocket] = set()
@@ -150,11 +151,21 @@ async def _connection_watchdog() -> None:
     ticks back waits longer before the next attempt.
     """
     consecutive_rebuilds = 0
+    # Consecutive checks where the client reported itself disconnected
+    # while the feed wasn't stale yet. check_connect() is honest now, so
+    # a brief network blip shows up as a momentary "not connected" — but
+    # pyquotex's auto-reconnect (+ its re-authorization) heals that
+    # within seconds, long before the next check. Tearing the whole feed
+    # down on the FIRST disconnected check converted every blip into a
+    # multi-minute outage; a disconnect must persist across two checks
+    # before a full rebuild is worth its cost.
+    disconnected_checks = 0
     while True:
         await asyncio.sleep(config.CONNECTION_WATCHDOG_SECONDS)
         manager = app_state.get("feed_manager")
         if manager is None:
             consecutive_rebuilds = 0
+            disconnected_checks = 0
             app_state["consecutive_rebuild_failures"] = 0
             continue  # the bootstrap loop already owns the reconnect
 
@@ -162,8 +173,22 @@ async def _connection_watchdog() -> None:
         connected = await quotex_client.is_connected()
         if connected and stale_for < config.STALE_FEED_SECONDS:
             consecutive_rebuilds = 0
+            disconnected_checks = 0
             app_state["consecutive_rebuild_failures"] = 0
             continue
+
+        if not connected and stale_for < config.STALE_FEED_SECONDS:
+            # Momentary disconnect with the feed itself still fresh — the
+            # auto-reconnector owns this, not us. Wait for it.
+            disconnected_checks += 1
+            if disconnected_checks < 2:
+                logger.info(
+                    "Client briefly disconnected (no ticks for %.0fs) — "
+                    "giving the auto-reconnect one more cycle before a rebuild",
+                    stale_for,
+                )
+                continue
+        disconnected_checks = 0
 
         consecutive_rebuilds += 1
         app_state["consecutive_rebuild_failures"] = consecutive_rebuilds
@@ -255,6 +280,13 @@ async def status():
         "auth_mode": quotex_client.auth_mode(),
         "reconnects": app_state.get("reconnects", 0),
         "consecutive_rebuild_failures": app_state.get("consecutive_rebuild_failures", 0),
+        # The most informative description of the last connect attempt's
+        # outcome. Without it, a deployed instance showing no data is
+        # indistinguishable from one that is simply still warming up.
+        "last_connect_detail": quotex_client.last_connect_detail(),
+        "total_ticks": (
+            app_state["feed_manager"].total_ticks if app_state.get("feed_manager") else 0
+        ),
         # Set by the boot migration once the one-time repair + dedupe
         # recount of pattern_stats has run — proves the new code booted
         # and repaired this instance's database.
@@ -270,6 +302,241 @@ async def status():
             int(app_state["feed_manager"].seconds_since_last_tick()) if app_state.get("feed_manager") else None
         ),
     }
+
+
+# --- Deployment self-diagnostics -------------------------------------------
+#
+# "Deploy করার পর ডেটা আসছে না" has exactly five distinct causes and the UI
+# used to show the same "সংযোগ হচ্ছে…" for all of them. /api/diagnose runs
+# the real pipeline step by step INSIDE whatever environment this instance
+# lives in (Railway container, VPS, laptop) and reports which step breaks:
+#
+#   1. token      — env var / persisted token present?
+#   2. connect    — websocket handshake + SSID authorization accepted?
+#   3. assets     — instrument list received?
+#   4. stream     — price frames pushed after instruments/update?
+#   5. history    — candle history endpoint answering?
+#
+# Each step short-circuits the next: if auth is rejected there is no point
+# probing the stream. The verdict includes an actionable fix hint in
+# Bengali, because the person staring at empty charts reads Bengali —
+# that is the whole point of this endpoint.
+
+DIAGNOSE_STREAM_PROBE_SECONDS = 12
+DIAGNOSE_HISTORY_TIMEOUT_SECONDS = 10
+
+
+def _verdict(ok: bool, problem_bn: str, fix_bn: str, step_failed: str | None = None) -> dict:
+    v = {
+        "ok": ok,
+        "problem_bn": problem_bn if not ok else None,
+        "fix_bn": fix_bn if not ok else None,
+    }
+    if step_failed:
+        v["failed_step"] = step_failed
+    return v
+
+
+async def _diagnose_stream_probe(client, assets: list[str]) -> dict:
+    """Subscribes to up to two assets and counts raw price frames pushed
+    over the wire — the closest possible probe of what _run_pair consumes
+    without touching the live feed's own client."""
+    target = assets[:2]
+    counts = {a: 0 for a in target}
+    before = {a: len(client.api.realtime_price.get(a, [])) for a in target}
+
+    for a in target:
+        try:
+            await client.api.subscribe_realtime_candle(a, config.CANDLE_PERIOD_SECONDS)
+            await client.api.chart_notification(a)
+            await client.api.follow_candle(a)
+        except Exception as e:  # send failure — socket already dead
+            return {"assets": target, "error": f"subscribe send failed: {type(e).__name__}: {e}"}
+
+    await asyncio.sleep(DIAGNOSE_STREAM_PROBE_SECONDS)
+
+    details = {}
+    for a in target:
+        now = len(client.api.realtime_price.get(a, []))
+        counts[a] = max(0, now - before[a])
+        details[a] = counts[a]
+    return {"assets": target, "ticks": details, "total": sum(counts.values())}
+
+
+@app.get("/api/diagnose")
+async def diagnose():
+    """Runs the full broker pipeline inside this deployment and reports
+    exactly which step fails. Read-only: uses a throwaway client on its
+    own websocket so the live feed is never disturbed."""
+    steps: dict = {}
+    started = time.monotonic()
+
+    # Step 1: token presence (env var first, then DB-persisted paste).
+    # os.environ is consulted directly so a runtime-pasted token isn't
+    # mislabeled as an env-var one.
+    token_env = bool(os.environ.get("QUOTEX_SESSION_TOKEN"))
+    token_pasted = bool(config.QUOTEX_SESSION_TOKEN)
+    token_db = False
+    if not token_pasted:
+        try:
+            state = await db.get_state("quotex_session_token")
+            token_db = bool(state.get("quotex_session_token"))
+        except Exception:
+            token_db = False
+    steps["token"] = {
+        "source": ("env" if token_env else "pasted") if token_pasted else ("database" if token_db else None),
+        "present": token_pasted or token_db,
+    }
+    if not token_pasted and not token_db:
+        steps["verdict"] = _verdict(
+            False,
+            "সেশন টোকেন দেওয়া হয়নি — তাই কোনো ডেটা আসবে না।",
+            "Railway-এর Variables-এ QUOTEX_SESSION_TOKEN সেট করুন, অথবা অ্যাপের Settings ট্যাবে সেশন টোকেন পেস্ট করুন।",
+            "token",
+        )
+        return {**steps, "elapsed_seconds": round(time.monotonic() - started, 1)}
+
+    # Step 2-5: live pipeline probe on a throwaway client.
+    from pyquotex.stable_api import Quotex
+
+    client = Quotex(
+        email="",
+        password="",
+        lang=config.QUOTEX_LANG,
+        root_path=str(config.SESSION_ROOT),
+    )
+    client.set_session(
+        user_agent=config.QUOTEX_USER_AGENT or quotex_client.DEFAULT_USER_AGENT,
+        cookies=config.QUOTEX_SESSION_COOKIES or None,
+        ssid=config.QUOTEX_SESSION_TOKEN,
+    )
+
+    t0 = time.monotonic()
+    try:
+        ok, reason = await client.connect()
+    except Exception as e:
+        ok, reason = False, f"{type(e).__name__}: {e}"
+    steps["connect"] = {
+        "ok": ok,
+        "reason": reason,
+        "seconds": round(time.monotonic() - t0, 1),
+    }
+
+    if not ok:
+        # Give the socket a short grace to authorize (mirrors get_client's
+        # logic, compressed — diagnostics must stay fast).
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if await client.check_connect():
+                ok = True
+                break
+        steps["connect"]["ok"] = ok
+        if not ok:
+            raw = ""
+            try:
+                raw = str(client.api.state.websocket_error_reason or "")
+            except Exception:
+                pass
+            detail = f"{reason} ({raw})" if raw and raw not in reason else reason
+            steps["connect"]["reason"] = detail
+            steps["verdict"] = _verdict(
+                False,
+                "Quotex সার্ভার সংযোগ/লগইন রিজেক্ট করেছে — এটাই ডেটা না আসার কারণ।",
+                "১) টোকেনটি কি এখনও বৈধ? নতুন করে qxbroker.com-এ লগইন করে সদ্য কপি করা SSID টোকেন Settings-এ পেস্ট করুন। "
+                "২) Railway-এর region পরিবর্তন করে দেখুন (broker কিছু datacenter IP/রিজিওন ব্লক করে)। "
+                "৩) একই টোকেন একাধিক জায়গায় (লোকাল + সার্ভার) একসাথে চালাবেন না।",
+                "connect",
+            )
+            try:
+                await client.close()
+            except Exception:
+                pass
+            return {**steps, "elapsed_seconds": round(time.monotonic() - started, 1)}
+
+    steps["authorized"] = {"ok": True}
+
+    # Step 3: instrument list.
+    try:
+        assets = await client.get_all_assets()
+    except Exception as e:
+        assets = []
+        steps["assets"] = {"count": 0, "error": f"{type(e).__name__}: {e}"}
+    steps["assets"] = {"count": len(assets)}
+    if not assets:
+        steps["verdict"] = _verdict(
+            False,
+            "লগইন সফল, কিন্তু ব্রোকারের ইনস্ট্রুমেন্ট তালিকা আসেনি।",
+            "৩০ সেকেন্ড পর আবার ডায়াগনোসিস চালান; বারবার একই হলে Railway region পরিবর্তন করুন।",
+            "assets",
+        )
+        try:
+            await client.close()
+        except Exception:
+            pass
+        return {**steps, "elapsed_seconds": round(time.monotonic() - started, 1)}
+
+    # Step 4: live price-stream probe on a configured pair the broker lists.
+    probe_candidates = []
+    for candidates in config.ALL_PAIRS.values():
+        for code in candidates:
+            if code in assets and code not in probe_candidates:
+                probe_candidates.append(code)
+    probe = await _diagnose_stream_probe(client, probe_candidates or list(assets)[:2])
+    steps["stream"] = probe
+    stream_total = probe.get("total", 0)
+    if stream_total <= 0:
+        steps["verdict"] = _verdict(
+            False,
+            "লগইন ও সাবস্ক্রিপশন ঠিক, কিন্তু ব্রোকার কোনো প্রাইস টিক পাঠাচ্ছে না (টেস্ট করা পেয়ারগুলো সম্ভবত বন্ধ বা এই সার্ভার IP-তে স্ট্রিম ব্লকড)।",
+            "১) Railway-এর ভিন্ন region-এ redeploy করুন। ২) qxbroker.com ওয়েবসাইটে ওই পেয়ারের চার্ট খুলে দেখুন মার্কেট খোলা আছে কি না। "
+            "৩) সব পেয়ার বন্ধ থাকলে (মার্কেট ক্লোজ) ডেটা না আসা স্বাভাবিক — মার্কেট খুললেই আসবে।",
+            "stream",
+        )
+        try:
+            await client.close()
+        except Exception:
+            pass
+        return {**steps, "elapsed_seconds": round(time.monotonic() - started, 1)}
+
+    # Step 5: candle-history endpoint answers?
+    probe_asset = (probe.get("assets") or [None])[0]
+    history_ok, history_count = False, 0
+    if probe_asset:
+        try:
+            rows = await client.get_candles(
+                probe_asset,
+                int(time.time()),
+                config.CANDLE_PERIOD_SECONDS * 40,
+                config.CANDLE_PERIOD_SECONDS,
+                timeout=DIAGNOSE_HISTORY_TIMEOUT_SECONDS,
+            )
+            history_count = len(rows or [])
+            history_ok = history_count > 0
+        except Exception:
+            history_ok = False
+    steps["history"] = {"ok": history_ok, "candles": history_count, "asset": probe_asset}
+    if not history_ok:
+        steps["verdict"] = _verdict(
+            False,
+            "লাইভ টিক আসছে, কিন্তু ক্যান্ডেল-হিস্ট্রি এন্ডপয়েন্ট সাড়া দিচ্ছে না — চার্ট ও সিগন্যাল শুরু হতে দেরি হবে।",
+            "এটি সাধারণত কিছুক্ষণ পরেই ঠিক হয়ে যায় (ওয়ার্মআপ)। ৫ মিনিট পর আবার ডায়াগনোসিস চালান।",
+            "history",
+        )
+    else:
+        steps["verdict"] = _verdict(
+            True,
+            None,
+            None,
+        )
+        steps["verdict"]["all_ok_bn"] = (
+            "সব ধাপ পাস — টোকেন, লগইন, স্ট্রিম, হিস্ট্রি সব ঠিক আছে। ডেটা এখন আসা উচিত।"
+        )
+
+    try:
+        await client.close()
+    except Exception:
+        pass
+    return {**steps, "elapsed_seconds": round(time.monotonic() - started, 1)}
 
 
 class SessionUpdate(BaseModel):

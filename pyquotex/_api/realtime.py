@@ -370,7 +370,17 @@ class RealtimeMixin:
     async def start_candles_stream(
             self, asset: str = "EURUSD", period: int = 0
     ) -> None:
-        """Start streaming candle data for a specified asset."""
+        """Start streaming candle data for a specified asset.
+
+        NOTE: deliberately NOT idempotent — every call re-sends the
+        subscribe trio. Live-measured: the server silently DROPS
+        ``history/load`` requests for an asset whose subscription wasn't
+        re-asserted shortly before, so re-subscribing here is what primes
+        it to actually answer the candle-history request that follows
+        (a chunked backfill without the re-subscribe sees its 2nd..Nth
+        requests go unanswered). Three small frames per call is the
+        price of reliable history replies; the upstream library has
+        always paid it."""
         if self.api:
             self.api.current_asset = asset
             await self.api.subscribe_realtime_candle(asset, period)

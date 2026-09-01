@@ -8,6 +8,14 @@ from app import config, db
 logger = logging.getLogger(__name__)
 
 _client: Quotex | None = None
+_client_unhealthy_since: float | None = None
+
+# The most informative description of why the LAST connect attempt failed
+# ("no token", pyquotex's own "Websocket connection rejected.", handshake
+# timeouts, HTTP 403s, ...). Surfaced via /api/status and /api/diagnose so
+# a silent deployed instance can be diagnosed from the outside instead of
+# everyone guessing at empty charts.
+_last_connect_detail: str = "no connection attempt made yet"
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -26,6 +34,17 @@ DEFAULT_USER_AGENT = (
 # which itself blocks ~2s per call — across a generous real-world budget
 # that spans a couple of those reconnect cycles.
 CONNECT_GRACE_SECONDS = 240
+
+# How long the singleton client may report "unhealthy" (socket dead /
+# re-auth in flight) before get_client() tears it down and rebuilds.
+# check_connect() is now honest about brief disconnects, and pyquotex's
+# auto-reconnect re-authorizes within a couple of seconds — but a caller
+# landing inside that short window must NOT trigger a full teardown:
+# closing the client kills the very auto-reconnect that would have
+# healed the feed, and the pair tasks keep polling the closed object
+# until the watchdog rebuilds everything minutes later. Past this grace
+# a rebuild IS the right move (the reconnect is genuinely stuck).
+UNHEALTHY_REBUILD_AFTER_SECONDS = 30
 
 # Persisted copies of the pasted session. Railway restarts this container
 # on every crash and redeploy, which is precisely when an in-memory token
@@ -46,6 +65,13 @@ def auth_mode() -> str:
     """Token-only auth surface: either a token is set, or the app is
     waiting for one to be pasted via the Settings tab."""
     return "session_token" if config.QUOTEX_SESSION_TOKEN else "no_token"
+
+
+def last_connect_detail() -> str:
+    """Human-readable detail of the most recent connect attempt's failure
+    (or success). Diagnostics surface — empty charts on a deployed
+    instance are meaningless without it."""
+    return _last_connect_detail
 
 
 async def _save_session_state() -> None:
@@ -109,11 +135,34 @@ async def get_client() -> Quotex:
     NoSessionTokenError immediately. There is no email/password login
     path to fall back to.
     """
-    global _client
-    if _client is not None and await _client.check_connect():
-        return _client
+    global _client, _client_unhealthy_since
+    if _client is not None:
+        if await _client.check_connect():
+            _client_unhealthy_since = None
+            return _client
+
+        # Brief disconnect — pyquotex's auto-reconnect (+ re-authorization)
+        # usually heals this within seconds. Give it the grace window
+        # instead of tearing the client down mid-heal.
+        now = time.monotonic()
+        if _client_unhealthy_since is None:
+            _client_unhealthy_since = now
+        if now - _client_unhealthy_since < UNHEALTHY_REBUILD_AFTER_SECONDS:
+            logger.debug(
+                "Quotex client temporarily disconnected — auto-reconnect "
+                "has %.0fs of grace left before a rebuild",
+                UNHEALTHY_REBUILD_AFTER_SECONDS - (now - _client_unhealthy_since),
+            )
+            return _client
+        logger.warning(
+            "Quotex client unhealthy for %.0fs — rebuilding it",
+            now - _client_unhealthy_since,
+        )
+        _client_unhealthy_since = None
 
     if not config.QUOTEX_SESSION_TOKEN:
+        global _last_connect_detail
+        _last_connect_detail = "no session token configured"
         raise NoSessionTokenError(
             "No session token configured — paste one via the Settings tab "
             "(POST /api/session) to connect."
@@ -155,6 +204,7 @@ async def get_client() -> Quotex:
         # WebsocketClient.run_forever() task before raising (see below) —
         # close() is a no-op if it hasn't, so this is always safe.
         await _close_quietly(client)
+        _last_connect_detail = f"{type(e).__name__}: {e}"
         raise ConnectionError(f"Quotex connect failed: {type(e).__name__}: {e}") from e
 
     if not ok:
@@ -189,11 +239,25 @@ async def get_client() -> Quotex:
             # eventually getting the connection rejected with HTTP 403
             # regardless of how fresh the session token is.
             await _close_quietly(client)
-            raise ConnectionError(f"Quotex connect failed: {reason}")
+            # The raw reason from pyquotex can be generic ("Websocket
+            # connection rejected."); enrich it with the server's own
+            # error string so an IP/region block or expired token is
+            # visible instead of a bare timeout.
+            raw_reason = ""
+            try:
+                raw_reason = str(client.api.state.websocket_error_reason or "")
+            except Exception:
+                pass
+            detail = reason if not raw_reason or raw_reason in reason else f"{reason} ({raw_reason})"
+            _last_connect_detail = detail
+            raise ConnectionError(f"Quotex connect failed: {detail}")
         logger.info("Connected after grace period")
+
+    _last_connect_detail = "connected ok"
 
     client.set_account_mode(config.QUOTEX_ACCOUNT_MODE)
     _client = client
+    _client_unhealthy_since = None
     logger.info("Connected to Quotex (%s account)", config.QUOTEX_ACCOUNT_MODE)
     return client
 
@@ -239,7 +303,8 @@ async def is_connected() -> bool:
 
 
 async def close_client() -> None:
-    global _client
+    global _client, _client_unhealthy_since
     if _client is not None:
         await _client.close()
         _client = None
+    _client_unhealthy_since = None

@@ -30,6 +30,11 @@
   </div>
 </header>
 
+<!-- Full-width actionable alert for feed-down states. Empty charts with
+     no explanation was the whole "deploy-এর পর ডেটা আসছে না" bug — this
+     banner names the reason and where to fix it, in Bengali. -->
+<div id="feedAlert" class="feed-alert hidden"></div>
+
 <main id="views">
 
   <!-- ═══════════════ লাইভ ═══════════════ -->
@@ -178,7 +183,10 @@
       <div class="settings-row"><span>Auth মোড</span><span id="settingsAuthMode">--</span></div>
       <div class="settings-row"><span>টোকেন সংরক্ষণ</span><span id="settingsPersistence">--</span></div>
       <div class="settings-row"><span>ফিড হেলথ</span><span id="settingsFeedHealth">--</span></div>
+      <div class="settings-row"><span>কোড ভার্সন</span><span id="settingsCodeVersion">--</span></div>
       <div id="settingsError" class="error-text"></div>
+      <button id="diagnoseBtn" type="button" class="session-submit diagnose-btn">সংযোগ ডায়াগনোসিস চালান</button>
+      <div id="diagnoseOutput" class="diag-panel hidden"></div>
     </div>
     <div class="card-glass">
       <div class="card-title">সেশন টোকেন ইমপোর্ট</div>

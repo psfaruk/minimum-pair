@@ -17,6 +17,18 @@ TICK_POLL_SECONDS = 0.05
 BOOTSTRAP_CANDLES = 200
 IN_MEMORY_CANDLES = 300
 
+# The broker's raw-tick history endpoint caps each reply at the most
+# recent ~1000-1600 ticks (~10-12 minutes) regardless of the requested
+# window, so a single get_candles(asset, now, 12000, 60) call returned
+# only 6-13 candles instead of the full 200-candle warmup the engine
+# needs — every pair started nearly blind and the indicator/pattern
+# stack starved. The AGGREGATED history endpoint does honor deep ranges
+# (~40 candles per request, verified at 10h+ depth), so bootstrap pulls
+# the full window as consecutive chunks and merges them.
+BOOTSTRAP_CHUNKS = 5
+BOOTSTRAP_CANDLES_PER_CHUNK = 40  # 5 x 40 = 200 candles ≈ 3.3 hours
+BOOTSTRAP_CHUNK_TIMEOUT_SECONDS = 10
+
 # How stale a tick may be and still be folded into its (already
 # finalized) candle. Quotex OTC ticks can arrive late — in bursts after
 # a brief websocket stall — and a tick timestamped inside a minute that
@@ -78,6 +90,12 @@ class FeedManager:
         # doesn't raise anything — the websocket just goes quiet — so
         # this silence is the only signal the watchdog has to work with.
         self.last_tick_at = time.monotonic()
+        # Lifetime counter of real ticks folded across every pair. A
+        # deployed instance that sits "connected" with total_ticks
+        # stuck at 0 is in the auth-works-but-no-stream state (region
+        # block, closed market for every pair, subscription dropped) —
+        # /api/status exposes it so that state is visible from outside.
+        self.total_ticks = 0
 
     def seconds_since_last_tick(self) -> float:
         return time.monotonic() - self.last_tick_at
@@ -95,23 +113,77 @@ class FeedManager:
         if not self.pairs:
             raise ConnectionError("Connected to Quotex but failed to start streaming for every pair")
 
+    async def _bootstrap_history(self, asset_code: str, client) -> list[dict[str, Any]]:
+        """Fetches the full 200-candle warmup window as consecutive
+        merged chunks (see BOOTSTRAP_CHUNKS for why single-request
+        history cannot deliver this). Falls back to one wide request if
+        the chunked path yields nothing."""
+        period = config.CANDLE_PERIOD_SECONDS
+        chunk_seconds = BOOTSTRAP_CANDLES_PER_CHUNK * period
+        merged: dict[int, dict[str, Any]] = {}
+        end_ts = int(time.time())
+
+        for i in range(BOOTSTRAP_CHUNKS):
+            chunk_end = end_ts - i * chunk_seconds
+            try:
+                rows = await client.get_candles(
+                    asset_code,
+                    chunk_end,
+                    chunk_seconds,
+                    period,
+                    timeout=BOOTSTRAP_CHUNK_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                logger.warning(
+                    "Bootstrap history chunk %d failed for %s",
+                    i, asset_code, exc_info=True,
+                )
+                rows = None
+            for c in rows or []:
+                try:
+                    ts = int(c["time"])
+                    merged[ts] = {
+                        "ts": ts,
+                        "open": float(c["open"]),
+                        "high": float(c["high"]),
+                        "low": float(c["low"]),
+                        "close": float(c["close"]),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+        if not merged:
+            # Last resort: the legacy single wide request (returns only
+            # the recent tick-capped window, but better than nothing).
+            try:
+                rows = await client.get_candles(
+                    asset_code, end_ts, BOOTSTRAP_CANDLES * period, period
+                )
+            except Exception:
+                rows = None
+            for c in rows or []:
+                try:
+                    ts = int(c["time"])
+                    merged[ts] = {
+                        "ts": ts,
+                        "open": float(c["open"]),
+                        "high": float(c["high"]),
+                        "low": float(c["low"]),
+                        "close": float(c["close"]),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+        return [merged[ts] for ts in sorted(merged)]
+
     async def _start_pair(self, display_name: str, asset_code: str, client) -> None:
         state = PairState(display_name=display_name, asset_code=asset_code)
 
-        history = await client.get_candles(
-            asset_code, time.time(), BOOTSTRAP_CANDLES * 60, config.CANDLE_PERIOD_SECONDS
-        )
-        for c in history or []:
-            candle = {
-                "ts": int(c["time"]),
-                "open": float(c["open"]),
-                "high": float(c["high"]),
-                "low": float(c["low"]),
-                "close": float(c["close"]),
-            }
-            state.candles.append(candle)
+        history = await self._bootstrap_history(asset_code, client)
+        for c in history:
+            state.candles.append(c)
             await db.save_candle(
-                display_name, candle["ts"], candle["open"], candle["high"], candle["low"], candle["close"]
+                display_name, c["ts"], c["open"], c["high"], c["low"], c["close"]
             )
         state.candles = state.candles[-IN_MEMORY_CANDLES:]
         if not history:
@@ -377,6 +449,7 @@ class FeedManager:
 
                 if new_ticks:
                     self.last_tick_at = time.monotonic()
+                    self.total_ticks += len(new_ticks)
 
                 late_updates: dict[int, tuple[dict[str, Any], float]] = {}
                 for t in new_ticks:

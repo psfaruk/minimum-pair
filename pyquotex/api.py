@@ -234,7 +234,10 @@ class QuotexAPI:
         self.state.status = WebsocketStatus.CONNECTED
         await self.event_registry.set_event("status_changed", self.state.status)
 
-        # Start Heartbeat task to keep connection alive and stream active
+        # Start Heartbeat task to keep connection alive and stream active.
+        # Cancel any task left over from a previous connection first —
+        # every reconnect used to pile one more eternal loop on top of
+        # the last one (task leak).
         async def heartbeat() -> None:
             while self.state.status == WebsocketStatus.CONNECTED:
                 try:
@@ -249,6 +252,8 @@ class QuotexAPI:
                 # added that retries on transient send failures.
                 await asyncio.sleep(5)
 
+        if self.heartbeat_task and not self.heartbeat_task.done():
+            self.heartbeat_task.cancel()
         self.heartbeat_task = asyncio.create_task(heartbeat())
 
         await self.websocket.send('42["indicator/list"]')
@@ -292,6 +297,19 @@ class QuotexAPI:
                 await self.event_registry.set_event(
                     "status_changed", self.state.status
                 )
+                return
+
+            # Engine.IO v3 application-level ping: the server sends "2" and
+            # expects the raw "3" pong. Replying keeps the transport alive
+            # even when no other traffic is flowing (e.g. an authorized but
+            # idle session). Without this the server may drop the socket
+            # after pingInterval + pingTimeout of silence.
+            if msg_str == "2":
+                try:
+                    if self.websocket is not None:
+                        await self.websocket.send("3")
+                except Exception:
+                    pass
                 return
 
             # Detect Socket.IO prefix
@@ -596,6 +614,14 @@ class QuotexAPI:
             self.heartbeat_task = None
 
         self.state.status = WebsocketStatus.DISCONNECTED
+        # Reset the auth state too: a closed websocket is NOT
+        # authenticated, and the next socket will be a brand-new engine.io
+        # session the server treats as unauthorized until the SSID is
+        # presented again. Keeping the stale AUTHENTICATED flag here made
+        # check_connect() report a healthy feed while the connection
+        # delivered nothing at all — the single biggest reason live data
+        # appeared to "stop coming" without any error being raised.
+        self.state.auth_status = AuthStatus.NOT_AUTHENTICATED
         try:
             loop = asyncio.get_running_loop()
             if loop.is_running():
