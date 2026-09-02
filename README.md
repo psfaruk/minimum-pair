@@ -1,5 +1,39 @@
 # minimum-pair
 
+## Confluence v3 — signals fire ONLY on qualified multi-strategy agreement (2026-09-02)
+
+The engine no longer produces a signal on every candle. The per-candle
+guarantee (and its `fallback` tier — a best-guess filler that flooded
+history with ~23k noise rows a day) is **gone**, together with every
+post-hoc override (microstructure veto, wick-rejection veto,
+theory-opposed direction replacement). A signal exists only when ALL of
+these pass, otherwise the engine is silent — silence is normal and
+healthy:
+
+1. >= 80 clean closed candles of history;
+2. at least `MIN_CONFLUENCE_STRATEGIES` (default 2) independent strategy
+   FAMILIES agree on the direction (correlated detectors inside one
+   family are one idea — cluster cap);
+3. the winning side carries >= `QUALITY_FLOOR` (0.65) of the total vote
+   weight;
+4. the direction does not fight the market's regime (a trend regime
+   requires a trend-family vote on the winning side, a range regime a
+   reversion-family one);
+5. measured confidence: once the exact confluence (its `signature`:
+   direction|regime|families) or its source mix has >= 40 graded outcomes
+   on the pair, its shrunk win rate must be >= `MIN_CONFIDENCE` (0.65);
+   losing confluences go silent on their own. Unmeasured confluences
+   need >= `BOOTSTRAP_AGREEMENT` (0.75) structural dominance to fire
+   while their record builds.
+
+Accuracy guarantees behind history/win-rate: one signal per (pair,
+entry-minute) is now enforced by a UNIQUE database index; grading is a
+guarded PENDING->final transition (a re-grade can never double-count);
+entry minutes that start late (> `SIGNAL_MAX_LATE_SECONDS`, default 5s)
+fire nothing, so every recorded signal describes a trade a follower
+could actually have taken. Full audit: `PROBLEMS_AND_FIXES.md`.
+
+
 ## Deploy diagnostics: when "ডেটা আসছে না" after deploying (2026-09-02)
 
 The 2026-09-01 fixes below make the feed self-heal — but a *freshly

@@ -123,6 +123,22 @@ def _init_sync() -> None:
             )
             """
         )
+        # 2026-09 (confluence v3) — per-confluence-strategy record. A
+        # "signature" names an exact strategy the engine composed:
+        # direction | regime | agreeing families. Learning THIS — instead
+        # of only per-source averages — is what lets the engine fire only
+        # the confluences that have actually paid on this pair.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_stats (
+                signature TEXT NOT NULL,
+                pair TEXT NOT NULL,
+                wins INTEGER NOT NULL DEFAULT 0,
+                losses INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (signature, pair)
+            )
+            """
+        )
 
 
 def _rebuild_pattern_stats(conn: sqlite3.Connection) -> None:
@@ -179,6 +195,37 @@ def _rebuild_pattern_stats(conn: sqlite3.Connection) -> None:
     conn.executemany(
         "INSERT INTO pattern_stats (pattern, pair, wins, losses) VALUES (?, ?, ?, ?)",
         [(source, pair, w, l) for (source, pair), (w, l) in tally.items()],
+    )
+
+
+def _rebuild_signal_stats(conn: sqlite3.Connection) -> None:
+    """Recomputes every per-confluence tally from the signals table.
+
+    Only rows that carry a signature (confluence v3 and later) count;
+    legacy rows had no signature and there is no honest way to
+    reconstruct one. Draws are excluded (stake refunded — no evidence),
+    and the table is deduped by (pair, entry_ts) exactly like
+    _rebuild_pattern_stats.
+    """
+    conn.execute("DELETE FROM signal_stats")
+    rows = conn.execute(
+        """
+        SELECT pair, signature, direction, result FROM (
+            SELECT pair, entry_ts, signature, direction, result,
+                   ROW_NUMBER() OVER (PARTITION BY pair, entry_ts ORDER BY id) AS rn
+            FROM signals
+            WHERE result IN ('WIN', 'LOSS') AND signature IS NOT NULL
+        )
+        WHERE rn = 1
+        """
+    ).fetchall()
+    tally: dict[tuple[str, str], list[int]] = {}
+    for r in rows:
+        entry = tally.setdefault((r["signature"], r["pair"]), [0, 0])
+        entry[0 if r["result"] == "WIN" else 1] += 1
+    conn.executemany(
+        "INSERT INTO signal_stats (signature, pair, wins, losses) VALUES (?, ?, ?, ?)",
+        [(sig, pair, w, l) for (sig, pair), (w, l) in tally.items()],
     )
 
 
@@ -243,6 +290,60 @@ def _migrate_sync() -> None:
         signal_cols = {r["name"] for r in conn.execute("PRAGMA table_info(signals)")}
         if signal_cols and "all_sources" not in signal_cols:
             conn.execute("ALTER TABLE signals ADD COLUMN all_sources TEXT")
+
+        # 2026-09 (confluence v3) — each signal carries the stable name of
+        # the confluence-strategy that produced it (signature) and the
+        # agreeing families (families, JSON list). Legacy rows stay NULL;
+        # they simply never contribute to signature learning.
+        if signal_cols and "signature" not in signal_cols:
+            conn.execute("ALTER TABLE signals ADD COLUMN signature TEXT")
+        if signal_cols and "families" not in signal_cols:
+            conn.execute("ALTER TABLE signals ADD COLUMN families TEXT")
+
+        # Hard integrity guarantee for history accuracy: one signal per
+        # (pair, entry minute), enforced by the database itself — the
+        # application-level signal_exists() check has always been racing
+        # a finalize/restart replay. Older databases are deduped first
+        # (the feed race fired 2-4 copies of the same entry minute),
+        # keeping the FIRST row per (pair, entry_ts) — the one fired at
+        # the boundary off the real candle — then the unique index is
+        # created so a duplicate can never be inserted again.
+        deduped_v4 = conn.execute(
+            "SELECT 1 FROM app_state WHERE key = 'signals_deduped_v4'"
+        ).fetchone()
+        if not deduped_v4:
+            conn.execute(
+                """
+                DELETE FROM signals
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM signals GROUP BY pair, entry_ts
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO app_state (key, value, updated_at)
+                VALUES ('signals_deduped_v4', '1', ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (int(time.time()),),
+            )
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_pair_entry_ts ON signals(pair, entry_ts)"
+            )
+        except sqlite3.IntegrityError:
+            logger.warning(
+                "Could not create the unique (pair, entry_ts) index — "
+                "duplicate signals still present; history accuracy degraded"
+            )
+
+        # signal_stats is a running total like pattern_stats: rebuilt once
+        # when the rule lands, maintained incrementally by the evaluator
+        # afterwards. The rebuild itself runs AFTER the tie/synthetic
+        # repairs below (see the pattern_stats rebuild block) so repaired
+        # rows are counted with their final grade.
 
         # Repair the ties, whether they came from the legacy table or from
         # a newer database graded before this rule landed.
@@ -315,6 +416,24 @@ def _migrate_sync() -> None:
             logger.info("Re-graded %d signals whose outcome candle never had real data -> DRAW", regraded)
         if repaired:
             logger.info("Re-graded %d flat-tie signals -> DRAW", repaired)
+
+        # signal_stats rebuild — deliberately AFTER the tie and synthetic
+        # repairs above, so every repaired row is tallied with its final
+        # grade.
+        signal_stats_built = conn.execute(
+            "SELECT 1 FROM app_state WHERE key = 'signal_stats_built_v4'"
+        ).fetchone()
+        if not signal_stats_built:
+            _rebuild_signal_stats(conn)
+            conn.execute(
+                """
+                INSERT INTO app_state (key, value, updated_at)
+                VALUES ('signal_stats_built_v4', '1', ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (int(time.time()),),
+            )
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_pair ON signals(pair)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_result ON signals(result)")
@@ -426,14 +545,17 @@ def _insert_signal_sync(
     entry_price: float | None,
     tier: str,
     all_sources: str | None,
+    signature: str | None,
+    families: str | None,
 ) -> int:
     with _connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO signals
                 (pair, direction, created_at, entry_ts, target_close_ts,
-                 confidence, source, entry_price, tier, all_sources)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 confidence, source, entry_price, tier, all_sources,
+                 signature, families)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 pair,
@@ -446,6 +568,8 @@ def _insert_signal_sync(
                 entry_price,
                 tier,
                 all_sources,
+                signature,
+                families,
             ),
         )
         return cur.lastrowid
@@ -461,16 +585,25 @@ async def insert_signal(
     entry_price: float | None,
     tier: str = "confirmed",
     all_sources: list[dict[str, str]] | None = None,
+    signature: str | None = None,
+    families: list[str] | None = None,
 ) -> int:
     """`all_sources` carries EVERY vote fired on the signal candle — both
     the contributing majority AND the outvoted minority, each with its own
     direction. The evaluator grades all of them, so a source that keeps
     voting the wrong side finally accumulates losses and loses weight,
     instead of being invisible to the learning loop whenever the crowd
-    outvoted it."""
+    outvoted it.
+
+    `signature` names the exact confluence-strategy that produced the
+    signal (direction|regime|families) and `families` is the sorted list
+    of agreeing families — the evaluator learns both per pair, which is
+    what lets the engine fire only proven confluences.
+    """
     import json as _json
 
     payload = _json.dumps(all_sources, ensure_ascii=False) if all_sources else None
+    families_payload = _json.dumps(families, ensure_ascii=False) if families else None
     async with _write_lock:
         return await asyncio.to_thread(
             _insert_signal_sync,
@@ -483,6 +616,8 @@ async def insert_signal(
             entry_price,
             tier,
             payload,
+            signature,
+            families_payload,
         )
 
 
@@ -541,17 +676,25 @@ async def pending_signals_due(now_ts: int) -> list[dict[str, Any]]:
     return await asyncio.to_thread(_pending_signals_due_sync, now_ts)
 
 
-def _grade_signal_sync(signal_id: int, close_price: float, result: str) -> None:
+def _grade_signal_sync(signal_id: int, close_price: float, result: str) -> bool:
+    """Transitions a PENDING signal to its final grade. Returns False if
+    the row was already graded (or vanished) — the caller must then NOT
+    count its stats again, or a single trade would be tallied twice and
+    every win rate it touches would be quietly wrong."""
     with _connect() as conn:
-        conn.execute(
-            "UPDATE signals SET close_price = ?, result = ? WHERE id = ?",
+        cur = conn.execute(
+            """
+            UPDATE signals SET close_price = ?, result = ?
+            WHERE id = ? AND result = 'PENDING'
+            """,
             (close_price, result, signal_id),
         )
+        return cur.rowcount > 0
 
 
-async def grade_signal(signal_id: int, close_price: float, result: str) -> None:
+async def grade_signal(signal_id: int, close_price: float, result: str) -> bool:
     async with _write_lock:
-        await asyncio.to_thread(_grade_signal_sync, signal_id, close_price, result)
+        return await asyncio.to_thread(_grade_signal_sync, signal_id, close_price, result)
 
 
 def _bump_pattern_stat_sync(pattern: str, pair: str, won: bool) -> None:
@@ -597,6 +740,49 @@ async def all_pattern_stats() -> dict[tuple[str, str], tuple[int, int]]:
     the decision engine needs the whole table on every candle to weight
     its votes."""
     return await asyncio.to_thread(_all_pattern_stats_sync)
+
+
+def _bump_signal_stat_sync(signature: str, pair: str, won: bool) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO signal_stats (signature, pair, wins, losses)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(signature, pair) DO UPDATE SET
+                wins = wins + excluded.wins,
+                losses = losses + excluded.losses
+            """,
+            (signature, pair, 1 if won else 0, 0 if won else 1),
+        )
+
+
+async def bump_signal_stat(signature: str, pair: str, won: bool) -> None:
+    async with _write_lock:
+        await asyncio.to_thread(_bump_signal_stat_sync, signature, pair, won)
+
+
+def _signal_stats_sync(signature: str, pair: str) -> tuple[int, int]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT wins, losses FROM signal_stats WHERE signature = ? AND pair = ?",
+            (signature, pair),
+        ).fetchone()
+    return (row["wins"], row["losses"]) if row else (0, 0)
+
+
+async def signal_stats(signature: str, pair: str) -> tuple[int, int]:
+    return await asyncio.to_thread(_signal_stats_sync, signature, pair)
+
+
+def _all_signal_stats_sync() -> dict[tuple[str, str], tuple[int, int]]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT signature, pair, wins, losses FROM signal_stats").fetchall()
+    return {(r["signature"], r["pair"]): (r["wins"], r["losses"]) for r in rows}
+
+
+async def all_signal_stats() -> dict[tuple[str, str], tuple[int, int]]:
+    """Every confluence-strategy's record, keyed by (signature, pair)."""
+    return await asyncio.to_thread(_all_signal_stats_sync)
 
 
 def _pattern_performance_sync(pair: str | None) -> list[dict[str, Any]]:

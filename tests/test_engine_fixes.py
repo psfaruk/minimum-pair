@@ -1,4 +1,4 @@
-"""Unit tests for the 2026-08 engine fixes.
+"""Unit tests for the engine fixes (updated for confluence v3, 2026-09).
 
 Covers:
   1. regime.detect — trending series reads "trend", oscillating reads
@@ -8,11 +8,15 @@ Covers:
   3. indicators bb_squeeze — now relative to the band's own recent
      width history (the old absolute 0.5 test was always true).
   4. recent_fractal_levels — only the most recent swings survive.
-  5. decision fallback path — the ensemble's own net direction is used
-     as the fallback direction instead of being thrown away.
-  6. decision lone-vote rule — a single unmeasured vote fires fallback,
-     not confirmed; a strong measured lone vote confirms.
-  7. evaluator all-votes grading — outvoted minority sources
+  5. decision confluence gates — a lone unmeasured vote stays SILENT
+     (no fallback tier exists any more); two agreeing families confirm
+     under the bootstrap rule; a measured-bad confluence goes silent;
+     a regime-opposed pool goes silent.
+  6. signature learning — the evaluator bumps signal_stats, and the
+     engine gates on a mature signature's own record.
+  7. grading accuracy — double-grading cannot double-count stats; the
+     (pair, entry_ts) unique index rejects duplicate signals.
+  8. evaluator all-votes grading — outvoted minority sources
      accumulate losses, which the old majority-only rule never let
      happen.
 
@@ -29,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app import decision, db, evaluator, indicators, regime  # noqa: E402
+from app import config, decision, db, evaluator, indicators, regime  # noqa: E402
 from app.candle_shape import recent_fractal_levels  # noqa: E402
 
 
@@ -155,9 +159,11 @@ def test_recent_fractal_levels():
     print("  recent_fractal_levels OK")
 
 
-def test_fallback_uses_ensemble_direction():
-    """A below-quality-floor vote pool must still steer the fallback
-    signal by its own net direction, not by last-candle colour."""
+def test_fallback_tier_is_gone():
+    """The user requirement is absolute: NO fallback signals, NO
+    overrides. A lone unmeasured vote (the old engine's 'confirmed by
+    one doji' and later 'fallback with the ensemble direction' cases)
+    must now produce NO decision at all — silence, not a filler row."""
     tmp = Path(tempfile.mkdtemp())
     db.DB_PATH = tmp / "t3.db"
     asyncio.run(db.init_db())
@@ -169,68 +175,209 @@ def test_fallback_uses_ensemble_direction():
     # indicator snapshot carries only the RSI field.
     ind = {"rsi": 30.0}
 
+    def _neutral(_candles):
+        return {"regime": regime.REGIME_NEUTRAL, "strength": 0.0, "score": 0.0,
+                "efficiency_ratio": 0.0, "autocorr": 0.0, "samples": 0}
+
     with (
+        patch.object(decision.config, "MIN_HISTORY_CANDLES", 3),
         patch.object(decision.patterns, "detect", return_value=[]),
         patch.object(decision.candle_reaction, "detect", return_value=None),
         patch.object(decision.pattern_miner, "predict", return_value=None),
+        patch.object(decision.microstructure, "score", return_value={"direction": None, "strength": 0.0}),
+        patch.object(decision.regime, "detect", side_effect=_neutral),
+        patch.object(decision.htf, "htf_context", return_value={"trend": "flat", "strength": 0.0}),
     ):
         dec = asyncio.run(decision.evaluate("TESTPAIR", mild, ind))
-    assert dec is not None
-    # A lone oversold vote (weight 0.5 < 0.8) cannot confirm — but the
-    # fired fallback signal must carry the ensemble's direction (CALL,
-    # the reversion read), NOT the colour-follow PUT.
-    assert dec.tier == "fallback", f"lone unmeasured vote must be fallback, got {dec.tier}"
-    assert dec.direction == "CALL", f"fallback should carry the ensemble's direction, got {dec.direction}"
-    assert dec.sources == ["rsi_oversold"]
-    print("  decision.fallback-uses-ensemble OK")
+    assert dec is None, f"a lone unmeasured vote must stay silent, got {dec}"
+    print("  decision.lone-unmeasured-silent OK")
 
 
-def test_measured_lone_vote_can_confirm():
-    """The flip side of the lone-vote rule: a source that has MEASURED
-    well on this pair may confirm on its own (the dc131a9 intent)."""
+def test_two_family_confluence_confirms():
+    """The heart of the confluence requirement: TWO independent strategy
+    families agreeing (reversion via RSI + microstructure read) passes
+    the gates and fires a confirmed signal — with confidence=None while
+    the confluence is still unmeasured (bootstrap rule: structural
+    agreement 1.0 >= BOOTSTRAP_AGREEMENT)."""
     tmp = Path(tempfile.mkdtemp())
-    db.DB_PATH = tmp / "t4.db"
+    db.DB_PATH = tmp / "t5.db"
     asyncio.run(db.init_db())
-
-    async def seed():
-        for _ in range(100):
-            await db.bump_pattern_stat("rsi_oversold", "TESTPAIR", True)
-
-    asyncio.run(seed())
 
     from unittest.mock import patch
 
     mild = [_candle(1.0, 1.0001), _candle(1.0001, 1.00005), _candle(1.00005, 1.0002)]
     ind = {"rsi": 30.0}
 
+    def _neutral(_candles):
+        return {"regime": regime.REGIME_NEUTRAL, "strength": 0.0, "score": 0.0,
+                "efficiency_ratio": 0.0, "autocorr": 0.0, "samples": 0}
+
     with (
+        patch.object(decision.config, "MIN_HISTORY_CANDLES", 3),
         patch.object(decision.patterns, "detect", return_value=[]),
         patch.object(decision.candle_reaction, "detect", return_value=None),
         patch.object(decision.pattern_miner, "predict", return_value=None),
+        patch.object(decision.regime, "detect", side_effect=_neutral),
+        patch.object(decision.htf, "htf_context", return_value={"trend": "flat", "strength": 0.0}),
     ):
-        # Drop the cache so the freshly seeded stats are read.
-        decision._pattern_perf_cache_ts = 0.0
-        dec = asyncio.run(decision.evaluate("TESTPAIR", mild, ind))
-    assert dec is not None
-    assert dec.tier == "confirmed", f"a measured-good lone vote should confirm, got {dec.tier}"
+        dec = asyncio.run(decision.evaluate("TESTPAIR2", mild, ind))
+    assert dec is not None, "two agreeing families must fire under the bootstrap rule"
+    assert dec.tier == "confirmed"
     assert dec.direction == "CALL"
-    # 2026-09: confidence is the Beta posterior mean (shrunk toward 50%
-    # by weights.PRIOR_STRENGTH pseudo-trades), not the raw frequency.
-    # 100 wins / 0 losses shrinks to (100+15)/(100+30) ≈ 0.885 — still
-    # decisively above the 0.65 MIN_CONFIDENCE gate, but no longer
-    # claiming an impossible perfect record.
-    assert dec.confidence is not None and dec.confidence > 0.85, f"confidence {dec.confidence}"
-    print("  decision.measured-lone-vote OK")
+    assert dec.confirmations >= 2, f"confirmations={dec.confirmations}"
+    assert "mean_reversion" in dec.families and decision.FAMILY_MICRO in dec.families
+    assert dec.signature.startswith("CALL|neutral|")
+    assert dec.confidence is None  # unmeasured — no invented number
+    print("  decision.two-family-confluence OK")
+
+
+def test_measured_bad_confluence_goes_silent():
+    """Once a confluence's source mix has a mature record BELOW the
+    confidence bar on this pair, the engine stays silent instead of
+    degrading into a weak signal."""
+    tmp = Path(tempfile.mkdtemp())
+    db.DB_PATH = tmp / "t6.db"
+    asyncio.run(db.init_db())
+
+    async def seed_bad():
+        for _ in range(40):
+            await db.bump_pattern_stat("rsi_oversold", "TESTPAIR3", True)
+            await db.bump_pattern_stat("rsi_oversold", "TESTPAIR3", False)
+            await db.bump_pattern_stat("rsi_oversold", "TESTPAIR3", False)
+            await db.bump_pattern_stat("rsi_oversold", "TESTPAIR3", False)
+        # microstructure measured at coin-flip
+        for _ in range(40):
+            await db.bump_pattern_stat("microstructure", "TESTPAIR3", True)
+            await db.bump_pattern_stat("microstructure", "TESTPAIR3", False)
+
+    asyncio.run(seed_bad())
+
+    from unittest.mock import patch
+
+    mild = [_candle(1.0, 1.0001), _candle(1.0001, 1.00005), _candle(1.00005, 1.0002)]
+    ind = {"rsi": 30.0}
+
+    def _neutral(_candles):
+        return {"regime": regime.REGIME_NEUTRAL, "strength": 0.0, "score": 0.0,
+                "efficiency_ratio": 0.0, "autocorr": 0.0, "samples": 0}
+
+    with (
+        patch.object(decision.config, "MIN_HISTORY_CANDLES", 3),
+        patch.object(decision.patterns, "detect", return_value=[]),
+        patch.object(decision.candle_reaction, "detect", return_value=None),
+        patch.object(decision.pattern_miner, "predict", return_value=None),
+        patch.object(decision.regime, "detect", side_effect=_neutral),
+        patch.object(decision.htf, "htf_context", return_value={"trend": "flat", "strength": 0.0}),
+    ):
+        decision._perf_cache_ts = 0.0
+        dec = asyncio.run(decision.evaluate("TESTPAIR3", mild, ind))
+    # rsi at 25% shrunk ≈ (10+15)/(40+30) ≈ 0.357; micro at 50% ≈ 0.5 —
+    # both below MIN_CONFIDENCE → the whole signal is silent.
+    assert dec is None, f"a measured-bad confluence must stay silent, got {dec}"
+    print("  decision.measured-bad-silent OK")
+
+
+def test_regime_opposed_pool_goes_silent():
+    """A direction supported only by reversion votes inside a CONFIRMED
+    TREND is the classic wrong-side read: the alignment gate must keep
+    the engine silent (no flip, no fallback, no veto — just silence)."""
+    tmp = Path(tempfile.mkdtemp())
+    db.DB_PATH = tmp / "t7.db"
+    asyncio.run(db.init_db())
+
+    from unittest.mock import patch
+
+    mild = [_candle(1.0, 1.0001), _candle(1.0001, 1.00005), _candle(1.00005, 1.0002)]
+    ind = {"rsi": 30.0}
+
+    def _trend(_candles):
+        return {"regime": regime.REGIME_TREND, "strength": 0.6, "score": 0.6,
+                "efficiency_ratio": 0.5, "autocorr": 0.3, "samples": 2}
+
+    with (
+        patch.object(decision.config, "MIN_HISTORY_CANDLES", 3),
+        patch.object(decision.patterns, "detect", return_value=[]),
+        patch.object(decision.candle_reaction, "detect", return_value=None),
+        patch.object(decision.pattern_miner, "predict", return_value=None),
+        patch.object(decision.regime, "detect", side_effect=_trend),
+        patch.object(decision.htf, "htf_context", return_value={"trend": "flat", "strength": 0.0}),
+    ):
+        decision._perf_cache_ts = 0.0
+        dec = asyncio.run(decision.evaluate("TESTPAIR4", mild, ind))
+    assert dec is None, f"regime-opposed confluence must stay silent, got {dec}"
+    print("  decision.regime-opposed-silent OK")
 
 
 def test_lone_vote_cannot_confirm():
     votes = [decision.Vote("CALL", 0.5, "rsi_oversold", regime.FAMILY_REVERSION)]
-    # Below LONE_VOTE_MIN_WEIGHT -> fallback; at/above -> confirmed
+    # Below LONE_VOTE_MIN_WEIGHT -> silent; at/above -> confirmed
     # happens in evaluate(); here we assert the threshold logic directly.
     assert votes[0].weight < decision.LONE_VOTE_MIN_WEIGHT
     strong = decision.Vote("CALL", decision.LONE_VOTE_MIN_WEIGHT, "measured_source")
     assert strong.weight >= decision.LONE_VOTE_MIN_WEIGHT
+    # The default confluence bar is TWO agreeing families.
+    assert config.MIN_CONFLUENCE_STRATEGIES >= 2, "confluence default must be >= 2"
     print("  decision.lone-vote-threshold OK")
+
+
+async def _test_signature_learning():
+    """The evaluator must teach signal_stats, and a mature signature's
+    own record must gate the engine (the 'best strategy wins' layer)."""
+    tmp = Path(tempfile.mkdtemp())
+    db.DB_PATH = tmp / "t8.db"
+    await db.init_db()
+
+    sig = "CALL|neutral|mean_reversion+microstructure"
+    await db.insert_signal(
+        pair="S", direction="CALL", entry_ts=1000, target_close_ts=1060,
+        confidence=None, source="rsi_oversold,microstructure", entry_price=1.1,
+        tier="confirmed", signature=sig, families=["mean_reversion", "microstructure"],
+    )
+    await db.save_candle("S", 1000, 1.1, 1.108, 1.0995, 1.106)  # CALL wins
+
+    signals = await db.pending_signals_due(int(time.time()) + 9999)
+    target = next(s for s in signals if s["pair"] == "S")
+    graded = []
+
+    async def on_graded(g):
+        graded.append(g)
+
+    ok = await evaluator._grade_one(target, on_graded)
+    assert ok and graded[0]["result"] == "WIN"
+    w, l = await db.signal_stats(sig, "S")
+    assert (w, l) == (1, 0), f"signature must learn the win, got ({w}, {l})"
+
+    # Grading the SAME row again must be a no-op — no double counting.
+    ok2 = await evaluator._grade_one(target, on_graded)
+    assert not ok2, "a second grade of the same signal must not transition"
+    w, l = await db.signal_stats(sig, "S")
+    assert (w, l) == (1, 0), f"double-grade must not double-count, got ({w}, {l})"
+    print("  evaluator.signature-learning OK")
+
+
+async def _test_unique_index_blocks_duplicates():
+    """The (pair, entry_ts) unique index is the hard guarantee behind
+    accurate history: the same entry minute can never carry two signals
+    (the old feed race graded the same trade twice)."""
+    tmp = Path(tempfile.mkdtemp())
+    db.DB_PATH = tmp / "t9.db"
+    await db.init_db()
+
+    await db.insert_signal(
+        pair="U", direction="CALL", entry_ts=5000, target_close_ts=5060,
+        confidence=None, source="rsi_oversold", entry_price=1.0,
+    )
+    import sqlite3
+
+    try:
+        await db.insert_signal(
+            pair="U", direction="PUT", entry_ts=5000, target_close_ts=5060,
+            confidence=None, source="bb_upper_rejection", entry_price=1.0,
+        )
+        raise AssertionError("duplicate (pair, entry_ts) insert must fail")
+    except sqlite3.IntegrityError:
+        pass
+    print("  db.unique-index-duplicate-block OK")
 
 
 async def _test_all_votes_graded():
@@ -310,9 +457,13 @@ if __name__ == "__main__":
     test_regime_family_multiplier()
     test_bb_squeeze_relative()
     test_recent_fractal_levels()
-    test_fallback_uses_ensemble_direction()
-    test_measured_lone_vote_can_confirm()
+    test_fallback_tier_is_gone()
+    test_two_family_confluence_confirms()
+    test_measured_bad_confluence_goes_silent()
+    test_regime_opposed_pool_goes_silent()
     test_lone_vote_cannot_confirm()
     asyncio.run(_test_all_votes_graded())
     asyncio.run(_test_legacy_rows_still_grade())
+    asyncio.run(_test_signature_learning())
+    asyncio.run(_test_unique_index_blocks_duplicates())
     print("ALL ENGINE-FIX TESTS PASSED")

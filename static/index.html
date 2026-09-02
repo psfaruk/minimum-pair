@@ -76,7 +76,7 @@
       <div class="seg" id="tierFilter">
         <button type="button" class="seg-btn active" data-tier="">সব</button>
         <button type="button" class="seg-btn" data-tier="confirmed">কনফার্মড</button>
-        <button type="button" class="seg-btn" data-tier="fallback">ফলব্যাক</button>
+        <button type="button" class="seg-btn" data-tier="fallback">ফলব্যাক (পুরানো)</button>
       </div>
       <div class="seg" id="dirFilter">
         <button type="button" class="seg-btn active" data-dir="">সব</button>
@@ -160,7 +160,7 @@
       <select id="historyTierFilter" aria-label="টিয়ার ফিল্টার">
         <option value="">সব টিয়ার</option>
         <option value="confirmed">কনফার্মড</option>
-        <option value="fallback">ফলব্যাক</option>
+        <option value="fallback">ফলব্যাক (পুরানো)</option>
       </select>
       <select id="historyResultFilter" aria-label="রেজাল্ট ফিল্টার">
         <option value="">সব রেজাল্ট</option>
@@ -203,7 +203,7 @@
     <div class="card-glass">
       <div class="card-title">সিগন্যাল থ্রেশহোল্ড</div>
       <div class="settings-row"><span>Min confidence</span><span id="settingsMinConf">--</span></div>
-      <div class="settings-note">পরিবর্তন করতে .env এডিট করে সার্ভার রিস্টার্ট করুন।</div>
+      <div class="settings-note">সিগন্যাল শুধুমাত্র তখনই আসে যখন একাধিক স্বাধীন স্ট্র্যাটেজি একই দিকে একমত হয়, রেজিমেন্টের সাথে সাংঘর্ষিক না হয়, এবং পরিমাপকৃত কনফিডেন্স থ্রেশহোল্ড পাস করে। কোনো ফলব্যাক বা ওভাররাইড নেই — গেট পাস না করলে সাইলেন্স। .env এডিট করে থ্রেশহোল্ড পরিবর্তন করুন (MIN_CONFLUENCE_STRATEGIES, MIN_CONFIDENCE, QUALITY_FLOOR)।</div>
     </div>
     <div class="card-glass">
       <div class="card-title">স্ট্র্যাটেজি পারফরম্যান্স</div>

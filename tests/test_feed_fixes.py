@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -37,6 +38,17 @@ async def main() -> None:
     db.DB_PATH = tmp / "test.db"
 
     await db.init_db()
+
+    # This suite exercises the FEED race behaviour, not the engine's
+    # confluence gates — lift the engine gates so the tiny 1-2 candle
+    # buffers here still produce signals through the full pipeline.
+    patches = [
+        patch.object(config, "MIN_HISTORY_CANDLES", 1),
+        patch.object(config, "MIN_CONFLUENCE_STRATEGIES", 1),
+        patch.object(feed.decision, "LONE_VOTE_MIN_WEIGHT", 0.4),
+    ]
+    for p in patches:
+        p.start()
 
     signals = []
 
@@ -106,14 +118,24 @@ async def main() -> None:
     await fm._finalize_candle(state, stale)
     assert len(signals) == 2, "a stale candle must not fire a signal"
 
-    # --- scenario 5: repair migration re-grades race leftovers + dedupes stats
+    # --- scenario 5: repair migration re-grades race leftovers; the
+    # unique (pair, entry_ts) index rejects duplicates at insert time
     await db.save_candle("TEST", base + 180, 1.0, 1.0, 1.0, 1.0, synthetic=True)
     sid = await db.insert_signal("TEST", "CALL", base + 180, base + 240, None, "doji_reversal", 1.0)
-    await db.grade_signal(sid, 2.0, "WIN")  # graded against a synthetic outcome -> race leftover
+    assert await db.grade_signal(sid, 2.0, "WIN") is True  # graded against a synthetic outcome -> race leftover
 
-    for _ in range(2):  # two WIN rows for the SAME entry minute (duplicates)
-        d = await db.insert_signal("TEST", "CALL", base + 300, base + 360, None, "hammer", 2.0)
-        await db.grade_signal(d, 2.5, "WIN")
+    d = await db.insert_signal("TEST", "CALL", base + 300, base + 360, None, "hammer", 2.0)
+    await db.grade_signal(d, 2.5, "WIN")
+    # The old feed race fired 2+ signals for the same entry minute and
+    # graded the same trade twice. The unique index now makes that
+    # impossible at the database layer — the hard accuracy guarantee.
+    import sqlite3
+
+    try:
+        await db.insert_signal("TEST", "CALL", base + 300, base + 360, None, "hammer", 2.0)
+        raise AssertionError("duplicate (pair, entry_ts) insert must be rejected by the unique index")
+    except sqlite3.IntegrityError:
+        pass
     d3 = await db.insert_signal("TEST", "CALL", base + 420, base + 480, None, "hammer", 2.0)
     await db.grade_signal(d3, 1.5, "LOSS")
 
@@ -125,13 +147,19 @@ async def main() -> None:
 
     wins, losses = await db.pattern_stats("hammer", "TEST")
     assert (wins, losses) == (1, 1), \
-        f"duplicate WIN pair must collapse to one sample, got ({wins}, {losses})"
+        f"one WIN + one LOSS must tally exactly once, got ({wins}, {losses})"
     dwins, dlosses = await db.pattern_stats("doji_reversal", "TEST")
     assert (dwins, dlosses) == (0, 0), "re-graded DRAW must drop out of stats"
 
     # The two feed signals stayed PENDING and untouched.
     pending = [r for r in await db.history("TEST", 20) if r["result"] == "PENDING"]
     assert len(pending) == 2
+
+    # Double-grading a signal must be impossible (accuracy guard): the
+    # second grade returns False and stats stay untouched.
+    assert await db.grade_signal(d, 9.9, "WIN") is False, "an already-graded signal must not re-grade"
+    wins2, _ = await db.pattern_stats("hammer", "TEST")
+    assert (wins2, _) == (1, 1)
 
     print("ALL FEED-FIX TESTS PASSED")
 

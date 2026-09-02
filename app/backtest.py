@@ -37,9 +37,12 @@ from app.stats import block_signflip_p_value, fdr_pass_mask, wilson_interval
 
 Candle = dict[str, Any]
 
-# Candles needed before the indicators mean anything (EMA_PERIOD is the
-# longest window in indicators.compute).
-WARMUP = 60
+# Candles needed before the indicators mean anything. EMA_PERIOD is 50,
+# but the regime read (120), the BB width percentile (120) and the
+# fractal/S/R windows (120) all need MORE — the old WARMUP of 60 let
+# backtests score sources on degraded early-window indicator values,
+# skewing every measured edge. 130 covers all of them.
+WARMUP = 130
 
 # The miner is retrained every this many candles on the preceding window,
 # then only ever applied to candles it has not seen — otherwise it would

@@ -255,23 +255,31 @@ class FeedManager:
             )
             return
 
-        # A candle finalized this far past its boundary (event-loop
-        # stall, deploy freeze, DB congestion) would produce a signal
-        # whose entry minute has already closed. It would be graded
-        # instantly against a candle nobody predicted and shown as
-        # though it were current — a lie either way. Honest to skip it.
-        if time.time() - entry_ts >= config.CANDLE_PERIOD_SECONDS:
+        # A candle finalized more than SIGNAL_MAX_LATE_SECONDS past its
+        # boundary would produce a signal whose entry minute has already
+        # started: a follower entering "now" gets a different price than
+        # the recorded entry_price, so the graded result stops describing
+        # a trade anyone could actually have taken. (The old guard allowed
+        # a FULL MINUTE of lateness — history could then contain trades
+        # nobody traded.) Honest to skip it; the engine simply waits for
+        # the next boundary.
+        late_seconds = time.time() - entry_ts
+        if late_seconds >= config.SIGNAL_MAX_LATE_SECONDS:
             logger.warning(
-                "Candle %s @ %s finalized %ds late — entry minute already closed, skipping signal",
-                state.display_name, candle["ts"], int(time.time() - entry_ts),
+                "Candle %s @ %s finalized %.1fs late (>%ds) — entry minute already started, skipping signal",
+                state.display_name, candle["ts"], late_seconds, config.SIGNAL_MAX_LATE_SECONDS,
             )
             return
 
         clean_candles = [c for c in state.candles if not c.get("synthetic")]
         ind = indicators.compute(clean_candles)
         dec = await decision.evaluate(state.display_name, clean_candles, ind)
+        # The regime read is refreshed on EVERY candle — not only when a
+        # signal fires — so /api/status reflects what the engine believes
+        # the market is doing even while it is silently waiting for a
+        # qualified confluence.
+        state.last_regime = decision.last_regime_by_pair.get(state.display_name, state.last_regime)
         if dec is not None:
-            state.last_regime = dec.regime
             target_close_ts = entry_ts + config.CANDLE_PERIOD_SECONDS
             signal_id = await db.insert_signal(
                 pair=state.display_name,
@@ -283,6 +291,8 @@ class FeedManager:
                 entry_price=candle["close"],
                 tier=dec.tier,
                 all_sources=[{"source": s, "direction": d} for s, d in dec.all_votes],
+                signature=dec.signature,
+                families=dec.families,
             )
             await self.on_signal(
                 state.display_name,
@@ -293,6 +303,8 @@ class FeedManager:
                     "confidence": dec.confidence,
                     "confirmations": dec.confirmations,
                     "sources": dec.sources,
+                    "strategies": dec.families,
+                    "signature": dec.signature,
                     "tier": dec.tier,
                     "regime": dec.regime,
                     "entry_ts": entry_ts,

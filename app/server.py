@@ -24,7 +24,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 # Bumped on every production-visible change so a redeploy can be verified
 # from outside: /api/status exposes it, and Railway has no other way to
 # tell which commit a running instance was built from.
-CODE_VERSION = "2026.09.02-deploy-diagnostics"
+CODE_VERSION = "2026.09.02-confluence-v3"
 
 app_state: dict = {"quotex_connected": False, "error": None, "pairs": list(config.ALL_PAIRS.keys())}
 _ws_clients: set[WebSocket] = set()
@@ -581,15 +581,15 @@ async def live_signals(tier: str | None = None):
     already graded. Meant for external scripts/bots to poll instead of
     holding a WebSocket connection open.
 
-    Every real finalized candle fires a signal — the per-candle
-    guarantee. `tier=confirmed` returns only signals that passed the
-    quality gates. Everything else is `tier=fallback`: the best-effort
-    filler that exists so each pair always shows *something*, and which
-    carries no measured confidence. (Rows fired before 2026-08-30 may
-    carry the old tier name `noise` for the same concept.) `age_seconds`
-    is how long ago the call was made — a pair whose stream has stalled
-    will keep returning its last signal, and without the age there's no
-    way to tell that from a fresh one.
+    2026-09 (confluence v3): signals fire ONLY on qualified multi-
+    strategy confluence — every row passed every quality gate, and there
+    is no fallback tier any more. `tier=confirmed` still works for older
+    consumers; rows with the legacy `fallback`/`noise` tier can only
+    appear in databases that predate this change.
+
+    `actionable` is the field bots should trade on: true only when the
+    entry minute is still open (`entry_ts <= now < target_close_ts`), so
+    an hours-old signal can never be mistaken for a live call.
     """
     now = int(time.time())
     rows = await db.latest_signals()
@@ -607,6 +607,8 @@ async def live_signals(tier: str | None = None):
             "source": r["source"],
             "created_at": r["created_at"],
             "age_seconds": now - r["created_at"],
+            "actionable": r["entry_ts"] <= now < r["target_close_ts"] and r["result"] == "PENDING",
+            "expired": now >= r["target_close_ts"],
             "stale": now - r["created_at"] > 3 * config.CANDLE_PERIOD_SECONDS,
         }
         for r in rows
@@ -703,8 +705,11 @@ def _format_signal_row(r: dict) -> dict:
         "close_price": r["close_price"],
         "source": r["source"],
         "sources": [s for s in (r["source"] or "").split(",") if s],
+        "signature": r.get("signature"),
         "created_at": r["created_at"],
         "age_seconds": now - r["created_at"],
+        "actionable": r["entry_ts"] <= now < r["target_close_ts"] and r["result"] == "PENDING",
+        "expired": now >= r["target_close_ts"],
         "stale": now - r["created_at"] > 3 * config.CANDLE_PERIOD_SECONDS,
         "expires_in_seconds": max(0, r["target_close_ts"] - now),
     }
@@ -714,23 +719,24 @@ def _format_signal_row(r: dict) -> dict:
 async def signals_all(tier: str | None = None):
     """All pairs' latest CALL/PUT signal, open to anyone.
 
-    Per the per-candle guarantee, every real finalized candle fires a
-    signal — either `confirmed` (passed the quality gates: regime-
-    weighted confluence, structural weight, veto checks, and measured
-    confidence once there's enough graded history) or `fallback` (the
-    best-effort filler that exists so each pair always shows
-    *something*, no better than the engine's best guess).
+    2026-09 (confluence v3): every signal passed the full quality gate —
+    multi-strategy confluence (>= MIN_CONFLUENCE_STRATEGIES independent
+    families agreeing), agreement dominance, regime alignment, and the
+    measured-confidence gate once history exists. There is NO fallback
+    tier: no qualifying confluence means no signal for that pair.
 
     Query params:
-      tier=confirmed  — only quality-gated signals
-      tier=fallback   — only the best-effort filler (no quality gate)
+      tier=confirmed  — only quality-gated signals (all new signals are)
 
     Each row includes:
-      pair, direction (CALL|PUT), confidence (0..1 or null),
-      tier (confirmed|fallback), result (PENDING|WIN|LOSS|DRAW),
+      pair, direction (CALL|PUT), confidence (0..1 or null while the
+      confluence is still unmeasured), tier (legacy rows may say
+      'fallback'), result (PENDING|WIN|LOSS|DRAW),
       entry_ts, target_close_ts, entry_price, close_price,
-      source (comma-joined), sources (list), created_at, age_seconds,
-      stale (bool), expires_in_seconds (>=0).
+      source (comma-joined), sources (list), signature (the
+      confluence-strategy's stable name), created_at, age_seconds,
+      actionable (entry minute still open — trade only on this),
+      expired, stale, expires_in_seconds.
 
     This is the same payload as /api/live but with extra convenience
     fields (sources list, expires_in_seconds) for direct bot/script use.
@@ -834,8 +840,12 @@ async def strategies_registry():
             {"name": "mined_*", "family": "mined", "description": "Self-learned 2-candle sequences promoted via FDR correction"},
         ],
         "fallback_sources": [
-            {"name": "fallback_color", "family": "fallback", "description": "Per-candle-guarantee last resort: previous candle's color (fallback tier only, used when nothing else fired)"},
+            {"name": "fallback_color", "family": "fallback", "description": "NOT a live source — measured by app/backtest.py only, as the naive colour-following baseline"},
         ],
+        "engine": {
+            "name": "confluence-v3",
+            "description": "Signals fire ONLY when >= MIN_CONFLUENCE_STRATEGIES independent strategy families agree, agreement dominates, the regime aligns, and measured confidence clears the bar. No fallback tier, no overrides — silence otherwise.",
+        },
     }
 
 

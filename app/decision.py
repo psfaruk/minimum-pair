@@ -1,45 +1,61 @@
-import random
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from app import candle_reaction, config, db, htf, microstructure, pattern_miner, patterns, regime, weights
 
-MICRO_AGREEMENT_FLOOR = 0.30  # microstructure must be this confident to veto
-MICRO_FALLBACK_FLOOR = 0.15  # microstructure must be at least this confident to act as fallback
+# 2026-09 (confluence v3) — the veto system is gone. The old engine let
+# microstructure (a rough blended read) and candle-reaction (a single
+# wick) OVERRIDE the whole weighted vote pool after the fact, and routed
+# every gate failure into _fallback_decision(), which fired a best-guess
+# signal on every candle of every pair (~23k rows/day, most of them noise).
+# Both mechanisms are overrides in the user's sense of the word: a
+# decision the confluence itself did not make.
+#
+# The engine is now pure confluence: every read votes, the pool decides,
+# and a signal exists ONLY when the gates below all pass. Anything less
+# is silence — no filler, no fallback tier, no overrides.
+#
+# The microstructure read is a VOTE like every other (family
+# "microstructure"), so its information still reaches the pool — it just
+# can no longer block or replace the pool's answer.
 
 PATTERN_PERF_CACHE_TTL = 55.0
 
-# How much graded history a source needs before its measured rate is
-# reported as confidence. Below this the app says nothing rather than
-# quoting a made-up prior. (2026-09: raised from 25 — a 25-sample rate
-# has a ±20-point confidence interval and was gating "confirmed" on
-# noise.)
+# How much graded history a source (or confluence signature) needs before
+# its measured rate is reported as confidence. Below this the app says
+# nothing rather than quoting a made-up prior. A 25-sample rate has a
+# ±20-point confidence interval and was gating "confirmed" on noise.
 CONFIDENCE_MIN_SAMPLES = 40
 
-# A lone vote can only confirm the signal if its source has actually
-# EARNED a strong weight on this pair. Under the old rule any single
-# unmeasured detector firing alone produced a "confirmed" signal — one
-# doji on one candle was presented with the same authority as a
-# multi-source, regime-aligned, measured-good confluence. A lone source
-# still carries weight 0.5 (the unmeasured baseline), so it needs to have
-# measured well above coin-flip to confirm by itself.
+# Only relevant when MIN_CONFLUENCE_STRATEGIES is configured as 1: a lone
+# vote can then only confirm the signal if its source has actually EARNED
+# a strong weight on this pair (measured well above coin-flip). With the
+# default of 2+ agreeing families this rule never triggers.
 LONE_VOTE_MIN_WEIGHT = 0.80
 
+# microstructure only votes when its blended read clears this strength —
+# below it the score is noise.
+MICRO_VOTE_FLOOR = 0.15
+
 TIER_CONFIRMED = "confirmed"
-TIER_FALLBACK = "fallback"
+
+# The microstructure read gets its own strategy family: it is an
+# independent composite of colour/body/wick/streak momentum, not an
+# oscillator or a pattern-library member.
+FAMILY_MICRO = "microstructure"
 
 # ---------------------------------------------------------------------------
-# Idea clustering — the anti-double-counting layer (2026-09)
+# Idea clustering — the anti-double-counting layer
 #
-# The vote pool used to count every detector as independent evidence. It
-# is not. One physical event — "price bounced off the floor" — fires
-# rsi_oversold AND bb_lower_bounce AND near_support AND
-# fractal/ema/bb/round-number rejection_bottom AND hammer, all on the
-# SAME candle. Five "confirmations", one idea. In a downtrend those five
-# correlated reversion votes systematically outvoted the single honest
-# trend vote, which is exactly how an anti-trend call got presented as a
-# strong confirmed signal.
+# The vote pool must not count every detector as independent evidence.
+# One physical event — "price bounced off the floor" — fires rsi_oversold
+# AND bb_lower_bounce AND near_support AND fractal/ema/bb/round-number
+# rejection_bottom AND hammer, all on the SAME candle. Five
+# "confirmations", one idea. In a downtrend those five correlated
+# reversion votes systematically outvoted the single honest trend vote,
+# which is exactly how an anti-trend call got presented as a strong
+# confirmed signal.
 #
 # The fix: votes are grouped by (strategy family, direction). The FIRST
 # vote in a cluster carries its full earned weight; every ADDITIONAL vote
@@ -47,8 +63,8 @@ TIER_FALLBACK = "fallback"
 # contributed)) — one idea, one vote, no matter how many detectors saw
 # it. A source that has measurably earned a heavy weight is never capped
 # below its own record, because its first-in-cluster contribution is
-# always its full weight. Confirmations are then counted as distinct
-# IDEAS on the winning side, not raw detector counts.
+# always its full weight. Confirmations are counted as distinct IDEAS
+# (families) on the winning side, not raw detector counts.
 # ---------------------------------------------------------------------------
 CLUSTER_CAP_MULTIPLE = 2.3  # × BASE_WEIGHT — where a cluster's extra votes saturate
 
@@ -56,20 +72,44 @@ CLUSTER_CAP_MULTIPLE = 2.3  # × BASE_WEIGHT — where a cluster's extra votes s
 # works on EUR/USD has no claim on USD/BDT OTC — they aren't the same
 # market and the old global tally quietly assumed they were.
 _pattern_perf_cache: dict[tuple[str, str], tuple[int, int]] = {}
-_pattern_perf_cache_ts: float = 0.0
+# (signature, pair) -> (wins, losses) — the record of each CONFLUENCE
+# (a named strategy the engine composed itself) on that pair. This is the
+# "the app makes its own strategies and fires only the best ones" layer:
+# once a signature has enough graded outcomes, its own measured win rate
+# gates whether it may fire again.
+_signature_perf_cache: dict[tuple[str, str], tuple[int, int]] = {}
+_perf_cache_ts: float = 0.0
+
+# Latest regime read per pair, refreshed on EVERY finalized candle (not
+# only when a signal fires) so /api/status stays honest even while the
+# engine is silently waiting for a confluence.
+last_regime_by_pair: dict[str, str] = {}
 
 
-async def _refresh_pattern_perf_cache() -> None:
-    global _pattern_perf_cache, _pattern_perf_cache_ts
+async def _refresh_perf_caches() -> None:
+    global _pattern_perf_cache, _signature_perf_cache, _perf_cache_ts
     now = time.time()
-    if now - _pattern_perf_cache_ts < PATTERN_PERF_CACHE_TTL:
+    if now - _perf_cache_ts < PATTERN_PERF_CACHE_TTL:
         return
     _pattern_perf_cache = await db.all_pattern_stats()
-    _pattern_perf_cache_ts = now
+    _signature_perf_cache = await db.all_signal_stats()
+    _perf_cache_ts = now
 
 
 def source_record(pair: str, source: str) -> tuple[int, int]:
     return _pattern_perf_cache.get((source, pair), (0, 0))
+
+
+def signature_record(pair: str, signature: str) -> tuple[int, int]:
+    return _signature_perf_cache.get((signature, pair), (0, 0))
+
+
+def confluence_signature(direction: str, regime_name: str, families: list[str]) -> str:
+    """The stable name of a confluence-strategy: which direction, under
+    which market regime, which strategy families agreed. Sources inside a
+    family churn (mined keys retrain, detectors fire alternately) — the
+    FAMILY SET is the durable identity of the strategy."""
+    return f"{direction}|{regime_name}|{'+'.join(families)}"
 
 
 @dataclass
@@ -77,18 +117,20 @@ class Vote:
     direction: str  # "CALL" or "PUT"
     weight: float
     source: str
-    family: str = ""  # regime.FAMILY_* — which theory this vote belongs to
+    family: str = ""  # regime.FAMILY_* / FAMILY_MICRO / "" (miner — own family)
 
 
 @dataclass
 class Decision:
     direction: str
     confidence: float | None  # None until there's enough graded history to mean anything
-    confirmations: int  # distinct idea clusters on the winning side (2026-09: was raw detector count)
+    confirmations: int  # distinct strategy families on the winning side
     sources: list[str]
-    tier: str  # TIER_CONFIRMED (passed every gate) or TIER_FALLBACK (per-candle guarantee filler)
+    tier: str  # always TIER_CONFIRMED — a Decision only exists when every gate passed
     regime: str = regime.REGIME_NEUTRAL  # market regime the vote pool was weighed under
     all_votes: list[tuple[str, str]] = field(default_factory=list)  # EVERY vote, both sides
+    families: list[str] = field(default_factory=list)  # sorted families that agreed
+    signature: str = ""  # the confluence's stable name (learned per pair)
 
 
 # Every source is born equal. The weight it actually votes with is
@@ -257,8 +299,8 @@ def _streak_exhaustion_vote(candles: list[dict[str, Any]]) -> Vote | None:
     if streak < 3:
         return None
     direction = "PUT" if up else "CALL"
-    # 2026-09: strengthened — measured at 64.6% win rate on streaks of 3+
-    # on OTC-style feeds (tools/measure_edges.py); the old 0.8x start
+    # Strengthened after measuring 64.6% win rate on streaks of 3+ on
+    # OTC-style feeds (tools/measure_edges.py); the old 0.8x start
     # undersold the engine's most reliable reversion read.
     weight = min(weights.BASE_WEIGHT * (1.0 + 0.3 * (streak - 3)), weights.BASE_WEIGHT * 1.9)
     return Vote(direction, weight, "streak_exhaustion", regime.FAMILY_REVERSION)
@@ -275,12 +317,12 @@ def _htf_trend_vote(context: dict[str, Any]) -> Vote | None:
 
 
 def _fallback_vote(candles: list[dict[str, Any]]) -> Vote:
-    """Last-candle-colour direction. Used two ways: (1) as the very last
-    resort inside evaluate()'s fallback path, when literally nothing else
-    fired for this candle — see TIER_FALLBACK; (2) as a reference
-    baseline by app/backtest.py's `fallback_color` row, measuring what
-    naive colour-following alone would have scored, for comparison
-    against sources that actually earned their weight."""
+    """Last-candle-colour direction. NOT a live signal source any more —
+    kept purely as a reference baseline that app/backtest.py measures
+    (`fallback_color` row), so the numbers show what naive
+    colour-following alone would have scored on the same data."""
+    import random
+
     last = candles[-1] if candles else None
     if last is not None and last["close"] != last["open"]:
         direction = "CALL" if last["close"] > last["open"] else "PUT"
@@ -300,7 +342,7 @@ async def _apply_measured_weights(pair: str, votes: list[Vote]) -> list[Vote]:
     can't promote one. Nothing is ever weighted to zero — a silent source
     stops being graded, and would never get the chance to recover.
     """
-    await _refresh_pattern_perf_cache()
+    await _refresh_perf_caches()
     return [
         Vote(v.direction, weights.weight_for(*source_record(pair, v.source)), v.source, v.family)
         for v in votes
@@ -352,50 +394,55 @@ def _capped_contributions(votes: list[Vote]) -> list[tuple[Vote, float]]:
 
 
 async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]) -> Decision | None:
-    # Two requirements that pull in opposite directions, both explicit
-    # user asks: every pair must show a signal on every candle ("প্রত্যেক
-    # ক্যান্ডেল এ সিগন্যাল আসতে হবে"), AND that guarantee must never again
-    # look like the old undifferentiated coin-flip flood ("এত পরিমাণে
-    # প্রেডিকশন হয় যা অগ্রহণযোগ্য"). Reconciled the same way as before:
-    # the guarantee stays absolute, but every gate failure now routes
-    # through _fallback_decision() and is tagged TIER_FALLBACK, honestly
-    # distinct from TIER_CONFIRMED — poll `tier=confirmed` for only the
-    # gate-passing signals.
-    #
-    # No `ind["ready"]` gate needed here: _indicator_votes() degrades to
-    # zero votes on an unready `ind` safely (every field access goes
-    # through .get()), and the pattern/candle-reaction/miner/htf/streak/
-    # microstructure/fallback sources below only need the raw candle
-    # list, not the indicator snapshot.
-    #
-    # Returns None ONLY when there are zero candles (the very first
-    # bootstrap call before any history exists). Once at least one
-    # candle is present, every code path that would otherwise return
-    # nothing routes through _fallback_decision(), which always returns
-    # a Decision — that's the per-candle signal guarantee.
-    if not candles:
+    """Confluence-only decision — confluence v3 (2026-09).
+
+    Returns a Decision ONLY when every gate below passes. Any other
+    outcome is silence: no fallback tier, no filler signal, no best
+    guess. The gates, in order:
+
+      0. Enough clean history (MIN_HISTORY_CANDLES) — degraded reads
+         must never trade.
+      1. The weighted pool has a net direction at all.
+      2. At least MIN_CONFLUENCE_STRATEGIES distinct strategy FAMILIES
+         agree on the winning side ("বেশ কয়েকটি স্ট্রাটেজি একমত").
+         Correlated detectors inside one family are one idea (cluster
+         cap), so this counts independent theories, not repeat voters.
+      3. The winning side carries at least QUALITY_FLOOR of the total
+         vote weight — real dominance, not a coin-flip split.
+      4. Regime alignment ("এটা অবস্থান বোঝে সিদ্ধান্ত নিবে"): when the
+         regime read is confident (trend or range), the winning side
+         must include the family whose theory matches that regime.
+      5. Measured confidence: once this exact confluence (signature) or
+         the source mix has >= CONFIDENCE_MIN_SAMPLES graded outcomes on
+         this pair, its shrunk win rate must be >= MIN_CONFIDENCE — a
+         strategy that has proven itself unreliable here goes silent.
+         While unmeasured, the bootstrap rule demands structural
+         agreement >= BOOTSTRAP_AGREEMENT instead.
+
+    There are deliberately NO post-hoc overrides: no veto can flip or
+    block the pool's answer, no fallback path invents a direction.
+    """
+    clean_n = sum(1 for c in candles if not c.get("synthetic"))
+    if clean_n < config.MIN_HISTORY_CANDLES:
+        last_regime_by_pair[pair] = regime.detect(candles)["regime"] if candles else regime.REGIME_NEUTRAL
         return None
 
     pattern_miner.maybe_retrain(pair, candles)
 
     # evaluate() is only ever called once per finalized candle (see
     # feed.py's _finalize_candle), so there's no risk of double-firing
-    # within a candle — no separate cooldown gate is needed on top of
-    # that, and the per-candle guarantee means every pair fires every
-    # candle with no exceptions, so a cooldown would only ever work
-    # against that.
-
+    # within a candle.
     cr_hit = candle_reaction.detect(candles, ind)
 
     # THE market read comes first: is this pair currently travelling
     # (trend) or oscillating (range)? Every vote is then weighed by how
     # well its theory matches that condition — see app/regime.py.
     regime_read = regime.detect(candles)
+    last_regime_by_pair[pair] = regime_read["regime"]
     fade = regime.fade_last_move(regime_read)
 
     # Zoomed-out read: what is the 5-minute leg doing? Adds one
-    # higher-timeframe vote to the pool (trend family) and gives the
-    # fallback path a better-than-colour baseline.
+    # higher-timeframe vote to the pool (trend family).
     htf_read = htf.htf_context(candles)
 
     votes = _indicator_votes(ind)
@@ -406,6 +453,16 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
     miner_vote = _pattern_miner_vote(pair, candles)
     if miner_vote:
         votes.append(miner_vote)
+    micro = microstructure.score(candles, fade=fade)
+    if micro["direction"] is not None and micro["strength"] >= MICRO_VOTE_FLOOR:
+        votes.append(
+            Vote(
+                micro["direction"],
+                weights.BASE_WEIGHT * (0.75 + 0.5 * min(micro["strength"], 1.0)),
+                microstructure.PATTERN_NAME,
+                FAMILY_MICRO,
+            )
+        )
     streak_vote = _streak_exhaustion_vote(candles)
     if streak_vote:
         votes.append(streak_vote)
@@ -443,185 +500,91 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
     contributing = [
         (v, c) for v, c in capped if net_direction is not None and v.direction == net_direction and c > 0.02
     ]
-    conf_clusters = {(v.family or "own") for v, _ in contributing}
+    families = sorted({(v.family or "own") for v, _ in contributing})
 
-    micro = microstructure.score(candles, fade=fade)
+    total_capped = sum(c for _, c in capped) or 1.0
+    structural_weight = min(sum(c for _, c in contributing) / total_capped, 1.0)
 
-    # Theory-opposition check: does the winning side argue the OPPOSITE
-    # of the theory the market is currently exhibiting? A direction
-    # supported ONLY by trend-family votes inside a confirmed range (or
-    # only by reversion votes inside a confirmed trend) is the classic
-    # wrong-side read — on the mean-reverting OTC feed those lone
-    # ema_trend signals won ~32-40% of the time. When it happens, the
-    # fallback path skips the pool's net direction entirely and falls
-    # through to reads that match the regime.
-    def _theory_opposed() -> bool:
-        if regime_read["regime"] not in (regime.REGIME_TREND, regime.REGIME_RANGE):
-            pass  # fall through to the HTF opposition check below
-        elif regime_read["strength"] >= 0.30 and contributing:
-            live = regime.FAMILY_REVERSION if regime_read["regime"] == regime.REGIME_RANGE else regime.FAMILY_TREND
-            if all((v.family or "own") != live for v, _ in contributing):
-                return True
-        # HTF opposition: a direction supported ONLY by reversion-family
-        # votes while the 5-minute leg clearly runs the other way is a
-        # fade of a live trend — measured at ~30% win rate as a fallback
-        # direction (tools/debug_replay.py, trending + mixed feeds).
-        # In a range regime the fade IS the theory, so the check is
-        # skipped there (the 5-minute leg barely travels on a range feed
-        # anyway).
-        if (
-            regime_read["regime"] != regime.REGIME_RANGE
-            and htf_read["trend"] in ("up", "down")
-            and htf_read["strength"] >= 0.40
-            and contributing
-        ):
-            htf_dir = "CALL" if htf_read["trend"] == "up" else "PUT"
-            if net_direction != htf_dir and all(
-                v.family == regime.FAMILY_REVERSION for v, _ in contributing
-            ):
-                return True
-        return False
+    # --- GATE 1: multi-strategy confluence ---------------------------------
+    if net_direction is None or not contributing:
+        return None
+    if len(families) < config.MIN_CONFLUENCE_STRATEGIES:
+        return None
 
-    opposed = _theory_opposed()
-
-    def _fallback_decision() -> Decision:
-        """The per-candle-guarantee filler: some direction, always,
-        tagged for exactly what it is. It passes no gate and carries no
-        confidence, because there is nothing here to be confident about.
-
-        The direction is the BEST available read, not a coin flip.
-        Priority:
-          1. the cluster-capped, regime-weighted, measured-weight
-             ensemble's own net direction — the best aggregate estimate
-             the engine has, even when a gate refused it the confirmed
-             tier — UNLESS the winning side argues the opposite of the
-             regime's theory (see _theory_opposed), in which case the
-             pool's answer is skipped as the wrong-side read it is;
-          2. the regime-aware (fade-aware) microstructure read;
-          3. a literal wick rejection, if one fired;
-          4. the anchor read — price stretched >= 1 ATR from its mean is
-             faded when the market isn't in a confirmed trend;
-          5. the higher-timeframe trend, if the 5-minute leg is clearly
-             travelling — a far better baseline than colour on a
-             trending feed;
-          6. last-candle colour, only when literally nothing else fired —
-             and INVERTED when the regime says the market fades moves
-             (on the OTC-style feed, colour-following wins ~45% — the
-             fade of it wins ~55%).
-
-        A veto demotes the TIER (the evidence is not confirmed-quality)
-        but does not override the direction: the vetoing source already
-        had its vote inside the pool — the pool weighed it and moved on.
-        """
-        if net_direction is not None and contributing and not opposed:
-            direction, sources_ = net_direction, [v.source for v, _ in contributing]
-        elif micro["direction"] is not None and micro["strength"] >= MICRO_FALLBACK_FLOOR:
-            direction, sources_ = micro["direction"], [microstructure.PATTERN_NAME]
-        elif cr_hit is not None:
-            direction, sources_ = cr_hit[1], [cr_hit[0]]
-        elif (
-            abs(disp) >= 1.0
-            and regime_read["regime"] == regime.REGIME_TREND
-            and regime_read["strength"] >= 0.25
-        ):
-            # In a confirmed trend, displacement is momentum — follow it.
-            direction, sources_ = ("CALL" if disp > 0 else "PUT"), ["anchor_follow"]
-        elif abs(disp) >= 1.0 and regime_read["regime"] != regime.REGIME_TREND:
-            direction, sources_ = ("CALL" if disp < 0 else "PUT"), ["anchor_fade"]
-        elif htf_read["trend"] in ("up", "down") and htf_read["strength"] >= 0.45:
-            direction, sources_ = ("CALL" if htf_read["trend"] == "up" else "PUT"), ["htf_trend"]
-        else:
-            fb = _fallback_vote(candles)
-            direction = fb.direction
-            if fade:
-                direction = "CALL" if direction == "PUT" else "PUT"
-            sources_ = ["fallback_color_fade" if fade else "fallback_color"]
-        return Decision(
-            direction=direction,
-            confidence=None,
-            confirmations=max(1, len(conf_clusters)),
-            sources=sources_,
-            tier=TIER_FALLBACK,
-            regime=regime_read["regime"],
-            all_votes=[(v.source, v.direction) for v in votes],
-        )
-
-    if not contributing or len(conf_clusters) < config.MIN_CONFIRMATIONS:
-        return _fallback_decision()
-
-    # A lone IDEA can only confirm when the evidence behind it has proven
-    # itself on this pair (see LONE_VOTE_MIN_WEIGHT). One cluster with
-    # five correlated detectors inside is still one unproven idea — the
-    # old code read those as five confirmations and stamped "confirmed"
-    # on them. An unproven lone idea still fires — as a best-effort
-    # fallback carrying the same direction.
-    if len(conf_clusters) == 1:
-        cluster = next(iter(conf_clusters))
+    # Only meaningful when MIN_CONFLUENCE_STRATEGIES is configured as 1:
+    # a lone family must have measurably EARNED the right to confirm.
+    if len(families) == 1:
+        cluster = families[0]
         top_source_weight = max(
             (v.weight for v, _ in contributing if (v.family or "own") == cluster),
             default=0.0,
         )
         if top_source_weight < LONE_VOTE_MIN_WEIGHT:
-            return _fallback_decision()
+            return None
 
-    # Veto: a confident opposing microstructure read. The veto still
-    # means "this is not a confirmed call" — it demotes to fallback
-    # instead of vanishing, since the guarantee requires something to
-    # come back either way.
+    # --- GATE 2: agreement dominance ---------------------------------------
+    if structural_weight < config.QUALITY_FLOOR:
+        return None
+
+    # --- GATE 3: regime alignment ------------------------------------------
+    # A direction supported ONLY by families arguing the opposite of the
+    # theory the market is currently exhibiting (all trend votes inside a
+    # confirmed range, or all reversion votes inside a confirmed trend)
+    # is the classic wrong-side read — measured at ~30-40% win rate on
+    # the OTC-style feed. This is a pure gate now: it cannot flip the
+    # direction or fire anything else; the engine just stays silent.
     if (
-        micro["direction"] is not None
-        and micro["direction"] != net_direction
-        and micro["strength"] >= MICRO_AGREEMENT_FLOOR
+        regime_read["regime"] in (regime.REGIME_TREND, regime.REGIME_RANGE)
+        and regime_read["strength"] >= config.MIN_REGIME_ALIGNMENT_STRENGTH
     ):
-        return _fallback_decision()
-
-    # Veto: the winning side argues the opposite of the regime's theory
-    # (see _theory_opposed) — not confirmed-quality evidence, no matter
-    # how many correlated detectors piled onto it.
-    if opposed:
-        return _fallback_decision()
-
-    # Veto: an actual wick-rejection against the proposed direction, even
-    # if other sources outweighed it.
-    if cr_hit is not None and cr_hit[1] != net_direction:
-        return _fallback_decision()
+        live_family = (
+            regime.FAMILY_TREND
+            if regime_read["regime"] == regime.REGIME_TREND
+            else regime.FAMILY_REVERSION
+        )
+        if live_family not in families:
+            return None
 
     sources = [v.source for v, _ in contributing]
-    total_capped = sum(c for _, c in capped) or 1.0
-    structural_weight = min(sum(c for _, c in contributing) / total_capped, 1.0)
 
-    if structural_weight < config.QUALITY_FLOOR:
-        return _fallback_decision()
+    # --- GATE 4: measured confidence ---------------------------------------
+    signature = confluence_signature(net_direction, regime_read["regime"], families)
+    confidence: float | None = None
 
-    # Confidence is a measurement or it is nothing. The old formula mixed
-    # a hard-coded 0.55 prior with a "how much did the votes agree" score,
-    # neither of which knows anything about being right — and it showed:
-    # the 0.5 bucket won 39% of the time while the 0.3 bucket won 56%.
-    #
-    # 2026-09: the rate is now the Beta posterior mean (shrunk toward 50%
-    # by weights.PRIOR_STRENGTH pseudo-trades) instead of the raw
-    # frequency — a 30-sample 70% rate used to walk in claiming "70%"
-    # when its honest interval still covered 55%.
-    measured = await _measured_win_rate(pair, sources)
-    confidence = None
-    if measured is not None:
-        rate, samples = measured
-        if samples >= CONFIDENCE_MIN_SAMPLES:
-            wins = round(rate * samples)
-            losses = samples - wins
-            confidence = max(0.0, min(1.0, weights.shrunk_rate(wins, losses)))
+    await _refresh_perf_caches()
+    sig_wins, sig_losses = signature_record(pair, signature)
+    if sig_wins + sig_losses >= CONFIDENCE_MIN_SAMPLES:
+        # This exact confluence-strategy has its own graded record on
+        # this pair — trust IT above any per-source average.
+        confidence = max(0.0, min(1.0, weights.shrunk_rate(sig_wins, sig_losses)))
+    else:
+        measured = await _measured_win_rate(pair, sources)
+        if measured is not None:
+            rate, samples = measured
+            if samples >= CONFIDENCE_MIN_SAMPLES:
+                wins = round(rate * samples)
+                confidence = max(0.0, min(1.0, weights.shrunk_rate(wins, samples - wins)))
 
-    # Only gate on confidence once it's real. An unmeasured signal is
-    # still a confirmed one — it just doesn't get to claim a number.
-    if confidence is not None and confidence < config.MIN_CONFIDENCE:
-        return _fallback_decision()
+    if confidence is not None:
+        # A confluence that has measured below the bar on this pair is
+        # finished — it goes silent instead of degrading into a
+        # second-class signal.
+        if confidence < config.MIN_CONFIDENCE:
+            return None
+    else:
+        # Bootstrap: nothing measured yet. The structural confluence must
+        # be far above the ordinary bar before the engine will speak.
+        if structural_weight < config.BOOTSTRAP_AGREEMENT:
+            return None
 
     return Decision(
         direction=net_direction,
         confidence=round(confidence, 3) if confidence is not None else None,
-        confirmations=len(conf_clusters),
+        confirmations=len(families),
         sources=sources,
         tier=TIER_CONFIRMED,
         regime=regime_read["regime"],
         all_votes=[(v.source, v.direction) for v in votes],
+        families=families,
+        signature=signature,
     )

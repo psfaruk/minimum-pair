@@ -94,7 +94,7 @@ App.tabs.live = {
     const grid = document.getElementById("liveGrid");
     const names = this.visiblePairs();
     if (!names.length) {
-      grid.innerHTML = `<div class="empty-note" style="grid-column:1/-1">এখনো কোনো সিগন্যাল আসেনি — পেয়ার কানেক্ট হওয়ার সাথে সাথে প্রতিটি ক্যান্ডেলে সিগন্যাল আসবে।</div>`;
+      grid.innerHTML = `<div class="empty-note" style="grid-column:1/-1">এখনো কোনো যোগ্য সিগন্যাল হয়নি — শুধুমাত্র একাধিক স্ট্র্যাটেজি একমত হলে সিগন্যাল আসে। সিগন্যাল না আসা মানে ইঞ্জিন সাইলেন্টলি অপেক্ষা করছে, সংযোগ সমস্যা নয়।</div>`;
       return;
     }
     // Most-recent signal first so the freshest calls are always on top.
@@ -118,6 +118,13 @@ App.tabs.live = {
       ? `<span class="regime-tag ${regime}">${regime === "trend" ? "ট্রেন্ড" : regime === "range" ? "রেঞ্জ" : "নিউট্রাল"}</span>`
       : "";
 
+    // Standby/expiry semantics (confluence v3): a pair with no qualifying
+    // confluence shows "অপেক্ষা…", and a graded-or-expired signal is
+    // clearly labelled so nobody trades a dead call.
+    const nowSec = Date.now() / 1000;
+    const expired = sig && sig.target_close_ts && nowSec >= sig.target_close_ts;
+    const graded = sig && sig.result && sig.result !== "PENDING";
+
     const dirHtml = sig
       ? App.dirBadge(dir)
       : `<span class="dir-badge small" style="background:rgba(148,163,184,0.12);color:var(--text-dim)">অপেক্ষা…</span>`;
@@ -126,6 +133,12 @@ App.tabs.live = {
     const conf = sig && sig.confidence !== null && sig.confidence !== undefined
       ? `${(sig.confidence * 100).toFixed(0)}% কনফ`
       : sig ? "কনফ —" : "";
+
+    // How many independent strategies agreed on this call.
+    const stratCount = sig && Array.isArray(sig.strategies) ? sig.strategies.length : (sig ? sig.confirmations : 0);
+    const stratHtml = stratCount
+      ? `<span class="live-strat">${stratCount}টি স্ট্র্যাটেজি একমত</span>`
+      : "";
 
     const priceHtml = price !== undefined && price !== null
       ? `<span class="live-price">${App.fmtPrice(price)}</span>`
@@ -137,9 +150,15 @@ App.tabs.live = {
       ? `<span class="live-wr">রেট <b class="${App.rateClass(wr.win_rate, wr.wins + wr.losses)}">${App.fmtPct(wr.win_rate)}</b> · ${wr.wins}W/${wr.losses}L</span>`
       : `<span class="live-wr">রেট —</span>`;
 
-    const resultHtml = sig && sig.result && sig.result !== "PENDING" ? App.resultBadge(sig.result) : "";
+    const resultHtml = graded
+      ? App.resultBadge(sig.result)
+      : expired
+        ? `<span class="result-badge DRAW">মেয়াদ শেষ</span>`
+        : "";
 
-    return `<div class="live-card ${dir || ""}" data-pair="${name}">
+    const dim = expired || graded ? " dimmed" : "";
+
+    return `<div class="live-card ${dir || ""}${dim}" data-pair="${name}">
       <div class="live-head">
         <span class="live-pair">${name}</span>
         ${regimeTag}
@@ -157,7 +176,7 @@ App.tabs.live = {
         <span>${conf}</span>
       </div>
       <div class="live-foot">
-        ${wrHtml}
+        ${stratHtml || wrHtml}
         ${resultHtml || priceHtml}
       </div>
     </div>`;

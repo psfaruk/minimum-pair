@@ -55,7 +55,7 @@ App.tabs.stats = {
         <div class="s">${s.confirmed.wins}W / ${s.confirmed.losses}L</div>
       </div>
       <div class="sum-card fallback">
-        <div class="k">ফলব্যাক</div>
+        <div class="k">ফলব্যাক (লেগেসি)</div>
         <div class="v">${App.fmtPct(s.fallback.win_rate)}</div>
         <div class="s">${s.fallback.wins}W / ${s.fallback.losses}L</div>
       </div>`;

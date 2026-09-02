@@ -765,3 +765,13 @@ select:focus { border-color: rgba(79, 140, 255, 0.5); }
 .diag-verdict.ok { background: var(--call-soft); color: var(--call); }
 .diag-verdict.bad { background: var(--put-soft); color: #fda4b4; }
 .diag-fix { margin-top: 7px; font-size: 12px; line-height: 1.6; color: var(--text-dim); font-weight: 400; }
+
+/* ── confluence v3: standby/expiry states ───────────────────────────── */
+.live-card.dimmed { opacity: 0.55; }
+.live-strat {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: rgba(99, 102, 241, 0.12);
+  border-radius: 6px;
+  padding: 2px 8px;
+}

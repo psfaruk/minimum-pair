@@ -31,7 +31,14 @@ SYNTHETIC_GRACE_SECONDS = 150
 
 
 async def _grade_one(signal: dict, on_graded: Callable[[dict], Awaitable[None]]) -> bool:
-    """Attempts to grade a single pending signal. Returns True if graded."""
+    """Attempts to grade a single pending signal. Returns True if the
+    signal transitioned PENDING -> graded THIS call.
+
+    The transition guard matters for accuracy: stats (pattern_stats,
+    signal_stats) are bumped only when this call is the one that actually
+    graded the row. A re-run that finds the row already graded must not
+    count the same trade twice — one duplicated tally silently corrupts
+    every win rate it flows into."""
     pair = signal["pair"]
     candle = await db.get_candle(pair, signal["entry_ts"])
     if not candle:
@@ -44,8 +51,7 @@ async def _grade_one(signal: dict, on_graded: Callable[[dict], Awaitable[None]])
                 overdue,
                 signal["id"],
             )
-            await db.grade_signal(signal["id"], None, "DRAW")
-            return True
+            return await db.grade_signal(signal["id"], None, "DRAW")
         return False  # target candle not persisted yet, retry later
 
     entry_price = signal["entry_price"]
@@ -75,7 +81,10 @@ async def _grade_one(signal: dict, on_graded: Callable[[dict], Awaitable[None]])
     else:
         result = "WIN" if close_price < entry_price else "LOSS"
 
-    await db.grade_signal(signal["id"], close_price, result)
+    transitioned = await db.grade_signal(signal["id"], close_price, result)
+    if not transitioned:
+        # Another grader got here first — never count this trade twice.
+        return False
 
     if result != "DRAW":
         outcome_direction = (
@@ -113,6 +122,15 @@ async def _grade_one(signal: dict, on_graded: Callable[[dict], Awaitable[None]])
                 continue
             seen.add(source)
             await db.bump_pattern_stat(source, pair, direction == outcome_direction)
+
+    # 2026-09 (confluence v3) — the signal's OWN strategy (its signature:
+    # direction|regime|agreeing-families) learns from this outcome. This
+    # is the record the decision engine gates future signals on: a
+    # confluence that keeps losing on this pair falls below
+    # MIN_CONFIDENCE and goes silent, while proven confluences keep
+    # firing. Draws are skipped (stake refunded, no evidence).
+    if signal.get("signature"):
+        await db.bump_signal_stat(signal["signature"], pair, result == "WIN")
 
     graded = dict(signal)
     graded["close_price"] = close_price

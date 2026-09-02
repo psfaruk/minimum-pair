@@ -38,12 +38,44 @@ CONNECTION_WATCHDOG_SECONDS = _int("CONNECTION_WATCHDOG_SECONDS", 60)
 STALE_FEED_SECONDS = _int("STALE_FEED_SECONDS", 300)
 
 MIN_CONFIDENCE = _float("MIN_CONFIDENCE", 0.65)
-MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS", 1)
-QUALITY_FLOOR = _float("QUALITY_FLOOR", 0.65)
 
-# Every pair fires a signal row on every 60s candle close (the per-candle
-# guarantee — see app/decision.py's _fallback_decision()) — 16 pairs is
-# ~23k candles and ~23k signals per day, forever, with no cleanup. Left
+# 2026-09 (confluence v3) — the engine fires a signal ONLY when several
+# independent strategy families agree on the direction. "MIN_CONFIRMATIONS"
+# counted correlated detectors as separate confirmations; a family is the
+# honest unit (one idea, one vote — see decision.py's cluster cap). The old
+# default of 1 let a single family confirm a signal, which is the single
+# largest producer of wrong calls. The legacy env name is still honored.
+MIN_CONFLUENCE_STRATEGIES = _int("MIN_CONFLUENCE_STRATEGIES", _int("MIN_CONFIRMATIONS", 2))
+QUALITY_FLOOR = _float("QUALITY_FLOOR", 0.65)  # winning-side share of total vote weight
+
+# A signal may not fight the market's own character: when the regime read
+# is at least this strong (trend or range), the winning side must include
+# at least one strategy family whose theory MATCHES that regime.
+MIN_REGIME_ALIGNMENT_STRENGTH = _float("MIN_REGIME_ALIGNMENT_STRENGTH", 0.30)
+
+# Until a confluence (signature) has enough graded history on a pair to
+# state a measured confidence, it may only fire when the structural
+# agreement is far above the ordinary gate — the bootstrap earns trust
+# slowly, and once the record exists the measured gate (MIN_CONFIDENCE)
+# takes over completely.
+BOOTSTRAP_AGREEMENT = _float("BOOTSTRAP_AGREEMENT", 0.75)
+
+# The engine needs this many clean closed candles before any signal can
+# fire — below that every indicator/pattern/regime read is degraded and
+# the honest answer is silence.
+MIN_HISTORY_CANDLES = _int("MIN_HISTORY_CANDLES", 80)
+
+# A candle finalized this many seconds past its boundary would put the
+# follower into a market whose entry minute already started — the recorded
+# entry price no longer matches anything a human could have entered at.
+# (The old guard allowed a full 60s of lateness, so "history" could grade
+# trades nobody actually traded.) Beyond this window: no signal.
+SIGNAL_MAX_LATE_SECONDS = _int("SIGNAL_MAX_LATE_SECONDS", 5)
+
+# Signals fire only on qualified multi-strategy confluence — a fraction of
+# candles per pair (typically well under 10%). Volume is bounded anyway:
+# OTC pairs are live ~22h/day, so 16 pairs still produce thousands of
+# graded rows per day at the peak. Left
 # unbounded this both grows the Railway volume indefinitely and makes
 # /api/patterns and /api/winrate (full-table scans) slower every day.
 # pattern_stats (the compact aggregate weights.py actually learns from)
