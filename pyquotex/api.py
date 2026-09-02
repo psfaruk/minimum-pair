@@ -887,6 +887,63 @@ class QuotexAPI:
         """Alias for open_pending or similar follow request."""
         await self.open_pending(amount, asset, direction, duration, open_time)
 
+    # Cloudflare's bot-management cookie (__cf_bm) is issued to ordinary
+    # HTTPS requests and then presented by the browser on the websocket
+    # upgrade. Connecting straight to wss:// with no cookie at all is the
+    # single clearest "not a browser" signal, and it is what the
+    # deployment's 403s showed (`Cookie: None` on every rejected
+    # handshake). Fetching the trade page first — over the same client,
+    # the same TLS context and the same User-Agent — earns that cookie
+    # without the user having to paste anything, so a session token alone
+    # is enough again.
+    CF_COOKIE_TTL_SECONDS = 600  # __cf_bm lives ~30min; refresh well inside that
+
+    async def refresh_handshake_cookies(self) -> str:
+        """Returns the Cookie header value for the websocket upgrade.
+
+        An explicitly configured cookie string always wins. Otherwise a
+        Cloudflare cookie is harvested (and cached) automatically."""
+        configured = self.session_data.get("cookies") or ""
+        if configured and str(configured).lower() != "none":
+            return str(configured)
+
+        now = time.monotonic()
+        cached = getattr(self, "_cf_cookies", "")
+        fetched_at = getattr(self, "_cf_cookies_at", 0.0)
+        if cached and now - fetched_at < self.CF_COOKIE_TTL_SECONDS:
+            return cached
+
+        ua = getattr(self, "_ws_user_agent", "") or self.browser.headers.get("User-Agent", "")
+        try:
+            response = await self.browser.send_request(
+                "GET",
+                f"{self.https_url}/{self.lang}/trade",
+                headers={
+                    "User-Agent": ua,
+                    "Accept-Language": getattr(self, "_ws_accept_language", "en-US,en;q=0.9"),
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                        "image/avif,image/webp,*/*;q=0.8"
+                    ),
+                    "Upgrade-Insecure-Requests": "1",
+                },
+            )
+            cookies = self.browser.get_cookies()
+            logger.info(
+                "Cloudflare warm-up: HTTP %s, %d cookie(s) harvested%s",
+                response.status_code,
+                len(self.browser._client.cookies),
+                " (__cf_bm present)" if "__cf_bm" in cookies else " (no __cf_bm)",
+            )
+        except Exception as e:
+            logger.warning("Cloudflare warm-up request failed: %s", e)
+            return cached
+
+        if cookies:
+            self._cf_cookies = cookies
+            self._cf_cookies_at = now
+        return cookies or cached
+
     async def start_websocket(self) -> tuple[bool, str]:
         """
         Initializes and starts the WebSocket connection.
@@ -912,17 +969,39 @@ class QuotexAPI:
                    "(KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
         )
 
+        # Accept-Language must match the session's own language. The
+        # hardcoded pt-BR list went out alongside a US-Windows Chrome
+        # User-Agent and lang=en — an inconsistency Cloudflare's bot
+        # scoring reads as automation.
+        lang = (self.lang or "en").split("-")[0]
+        accept_language = (
+            "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" if lang == "pt"
+            else f"{lang}-US,{lang};q=0.9" if lang == "en"
+            else f"{lang},en-US;q=0.9,en;q=0.8"
+        )
+
         extra_headers = {
             "User-Agent": ua,
             "Origin": self.https_url,
             "Referer": f"{self.https_url}/{self.lang}/trade",
-            "Cookie": self.session_data.get("cookies", ""),
-            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Language": accept_language,
             "Accept-Encoding": "gzip, deflate, br",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
         }
+
+        # set_session(cookies=None) stores None under "cookies", so
+        # .get("cookies", "") returned None (the key exists) and the
+        # handshake literally sent `Cookie: None` — visible in the
+        # Railway logs on every rejected connect. A real browser sends
+        # either valid cookies or no Cookie header at all; the literal
+        # string "None" is a bot fingerprint. Only send it when real.
+        self._ws_accept_language = accept_language
+        self._ws_user_agent = ua
+        cookies = await self.refresh_handshake_cookies()
+        if cookies:
+            extra_headers["Cookie"] = cookies
         # Skip SSL for plain ws:// (test / proxy / dev) — the websockets
         # library expects no SSLContext on a non-TLS URL.
         ssl_ctx = (

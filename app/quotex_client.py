@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 
@@ -34,6 +35,9 @@ DEFAULT_USER_AGENT = (
 # which itself blocks ~2s per call — across a generous real-world budget
 # that spans a couple of those reconnect cycles.
 CONNECT_GRACE_SECONDS = 240
+
+# Pause between grace-window polls. Must be > 0: see the loop below.
+CONNECT_POLL_SECONDS = 1.0
 
 # How long the singleton client may report "unhealthy" (socket dead /
 # re-auth in flight) before get_client() tears it down and rebuilds.
@@ -212,6 +216,14 @@ async def get_client() -> Quotex:
             if await client.check_connect():  # blocks ~2s internally when not yet ready
                 ok = True
                 break
+            # check_connect() only awaits when the socket is OPEN: on a
+            # dead/rejected socket is_alive() is False and it returns
+            # synchronously, so this loop never yielded to the event
+            # loop and pinned it for the full 240s grace window. uvicorn
+            # could not answer GET / in that time and Railway's
+            # healthcheck failed the whole deploy ("1/1 replicas never
+            # became healthy"). Yield explicitly every iteration.
+            await asyncio.sleep(CONNECT_POLL_SECONDS)
         if not ok:
             # The raw reason from pyquotex can be generic ("Websocket
             # connection rejected."); enrich it with the server's own

@@ -128,7 +128,20 @@ class WebsocketClient:
             ssl: Any,
     ) -> None:
         """One ``connect()`` cycle. Returns when the connection ends."""
-        headers = extra_headers or {}
+        headers = extra_headers if extra_headers is not None else {}
+
+        # __cf_bm expires (~30min) and is bound to this connection's
+        # egress. Reusing the cookie captured at first connect meant every
+        # later reconnect presented a stale one — refresh before each
+        # handshake so long-lived sessions keep passing Cloudflare.
+        refresher = getattr(self.api, "refresh_handshake_cookies", None)
+        if refresher is not None:
+            try:
+                fresh = await refresher()
+                if fresh:
+                    headers["Cookie"] = fresh
+            except Exception as e:  # never block a reconnect on this
+                logger.debug("Handshake cookie refresh skipped: %s", e)
         async with websockets.connect(
             url,
             additional_headers=headers,
