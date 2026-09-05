@@ -18,6 +18,84 @@ Each finding below is tagged:
 
 ---
 
+## 2026-09-05 (later): "Websocket connection rejected. ([Errno -2] Name or service not known)" — DNS-level blocking (FIXED)
+
+User's complaint: "Quotex সংযোগ কাজ করছে না: Websocket connection
+rejected. ([Errno -2] Name or service not known)".
+
+Root cause: **that error never reached Quotex.** `[Errno -2] Name or
+service not known` is `socket.gaierror` — the machine running the app
+could not even RESOLVE the broker's hostnames. This is what an
+ISP-level DNS block on trading platforms, a broken WSL/VPS
+`resolv.conf`, or a captive firewall looks like. It is not Cloudflare,
+not a rejection, and not the token — the old message was a lie on all
+three counts, and the client then burned TWO full backoff cycles per
+candidate (DNS errors were not treated as host-specific) before trying
+the next name, which usually failed to resolve too.
+
+Fix (new module `pyquotex/dns_bootstrap.py` + wiring):
+
+1. **Classification** (`is_dns_error`): every observed spelling of
+   resolver failure across Linux/macOS/Windows (gaierror -2/-3/-5,
+   11001 "getaddrinfo failed", "Temporary failure in name resolution",
+   …). DNS failures are now HOST-SPECIFIC failures: ONE failure
+   rotates to the next candidate immediately, same as an HTTP-403
+   handshake rejection.
+2. **DNS-over-HTTPS bootstrap** (`ensure_resolvable`): before dialing
+   a candidate, the client tries the OS resolver (short timeout,
+   thread-isolated so a hanging resolver cannot stall the loop). If it
+   fails, the hostname is resolved through public DoH JSON APIs
+   reached BY IP — Cloudflare `1.1.1.1`, Google `8.8.8.8`, Quad9 as
+   third string — so no local DNS is involved at all. The answer is
+   installed as a process-wide `socket.getaddrinfo` override: every
+   connection path (websocket handshake, httpx Cloudflare warm-up)
+   transparently uses the DoH IP while TLS SNI, Host headers and
+   cookies still present the real hostname, so certificate
+   verification is untouched.
+3. **Honest errors**: `_on_error` reports DNS failures as "DNS lookup
+   failed — this network cannot resolve the broker's servers", never
+   as "connection rejected". The connect-failed detail tells the user
+   the app already retried via DoH and what to do if even that fails.
+   `/api/diagnose` gained a `dns` step showing each websocket host as
+   `local` / `doh(ip)` / `unresolvable`, with a Bengali verdict that
+   names the network as the culprit.
+4. **Token rejection is called by its name**: the broker's
+   `42["authorization/reject"]` reply now surfaces as "Session token
+   rejected by the broker — log in fresh and paste a new SSID token"
+   (it used to read as the generic "Websocket connection rejected.").
+   `get_client()` also fails FAST on an explicit reject instead of
+   letting a dead token burn the full 240s grace window.
+5. **Deployment note**: uvloop (uvicorn's default) resolves DNS in C
+   and bypasses Python's `socket.getaddrinfo`, which would silently
+   disable the DoH override — the Procfile now pins
+   `uvicorn --loop asyncio`.
+
+Verification (all green):
+
+- `tools/verify_dns_block_survival.py` — NEW survival verifier: it
+  patches the OS resolver so EVERY broker hostname raises
+  `gaierror(-2)` (a faithful ISP block), then runs the live pipeline.
+  Result: DNS block engaged → DoH override installed
+  (`ws2.qxbroker.com → 172.64.146.19`) → TLS handshake completed
+  through the DoH IP → the broker's server itself answered. (The
+  bundled test token had since been invalidated server-side —
+  `authorization/reject`, which is itself the proof of a full round
+  trip on a blocked network; paste a fresh token for the tick-stream
+  portion.)
+- `tests/test_dns_bootstrap.py` — 18 regression tests: classification
+  (5 error spellings + non-DNS negatives), immediate rotation on DNS
+  failure, fail-fast `DNSResolutionError` for unresolvable candidates,
+  override install/short-circuit, getaddrinfo override redirection,
+  DoH answer parsing (A vs CNAME) and total-failure handling, honest
+  `_on_error` messages.
+- `tools/backtest_engine.py` re-run on all four market generators —
+  unchanged results (random_walk 48.1%, mean_revert 59.6%, trending
+  71.6%, mixed 59.5%), proving the engine itself was not touched.
+- All five suites pass (`test_dns_bootstrap`, `test_engine_fixes`,
+  `test_feed_fixes`, `test_quotex_client_fixes`, `test_ws_fallback`).
+
+---
+
 ## 2026-09-05: Live data never connects — single-endpoint Cloudflare block (FIXED)
 
 User's complaint: "টোকেন দিলে সংযোগ হচ্ছে বলে অপেক্ষায় থাকে, কিন্তু

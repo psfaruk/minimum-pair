@@ -24,7 +24,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 # Bumped on every production-visible change so a redeploy can be verified
 # from outside: /api/status exposes it, and Railway has no other way to
 # tell which commit a running instance was built from.
-CODE_VERSION = "2026.09.05-ws-host-fallback"
+CODE_VERSION = "2026.09.05-doh-dns-bootstrap"
 
 app_state: dict = {"quotex_connected": False, "error": None, "pairs": list(config.ALL_PAIRS.keys())}
 _ws_clients: set[WebSocket] = set()
@@ -404,6 +404,7 @@ async def diagnose():
         return {**steps, "elapsed_seconds": round(time.monotonic() - started, 1)}
 
     # Step 2-5: live pipeline probe on a throwaway client.
+    from pyquotex.dns_bootstrap import doh_resolve, install_getaddrinfo_patch, is_dns_error
     from pyquotex.stable_api import Quotex
 
     client = Quotex(
@@ -417,6 +418,29 @@ async def diagnose():
         cookies=config.QUOTEX_SESSION_COOKIES or None,
         ssid=config.QUOTEX_SESSION_TOKEN,
     )
+
+    # Step 1.5: DNS reachability of the websocket hosts. A network whose
+    # resolver cannot answer the broker's names used to look identical
+    # to a bad token ("connection rejected"); report it for what it is,
+    # and record whether the DoH bootstrap had to step in.
+    import socket as _socket
+
+    wss_hosts = client.wss_hosts or []
+    dns_rows = {}
+    for h in wss_hosts[:5]:
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda h=h: _socket.getaddrinfo(h, 443, _socket.AF_INET)
+            )
+            dns_rows[h] = "local"
+        except Exception as e:
+            install_getaddrinfo_patch()
+            ips = await doh_resolve(h)
+            dns_rows[h] = f"doh({ips[0]})" if ips else f"unresolvable ({e})"
+    steps["dns"] = {
+        "ok": all(not v.startswith("unresolvable") for v in dns_rows.values()) if dns_rows else True,
+        "hosts": dns_rows,
+    }
 
     t0 = time.monotonic()
     try:
@@ -446,15 +470,34 @@ async def diagnose():
                 pass
             detail = f"{reason} ({raw})" if raw and raw not in reason else reason
             steps["connect"]["reason"] = detail
-            steps["verdict"] = _verdict(
-                False,
-                "Quotex সার্ভার সংযোগ/লগইন রিজেক্ট করেছে — এটাই ডেটা না আসার কারণ।",
-                "১) টোকেনটি কি এখনও বৈধ? নতুন করে লগইন করে সদ্য কপি করা SSID টোকেন Settings-এ পেস্ট করুন। "
-                "২) অ্যাপটি এখন সব ফলব্যাক হোস্ট (quotex.io, market-qx.pro) নিজে থেকেই চেষ্টা করে — সব ব্যর্থ হলে Railway-এর region পরিবর্তন করুন, "
-                "অথবা ব্রাউজার থেকে কুকি কপি করে Settings-এর cookies ঘরে পেস্ট করুন। "
-                "৩) একই টোকেন একাধিক জায়গায় (লোকাল + সার্ভার) একসাথে চালাবেন না।",
-                "connect",
-            )
+            if is_dns_error(raw) or is_dns_error(reason):
+                steps["verdict"] = _verdict(
+                    False,
+                    "এই নেটওয়ার্ক থেকে Quotex-এর সার্ভারের নাম (DNS) resolve হচ্ছে না — সংযোগ সার্ভারে পৌঁছায়নি।",
+                    "১) অ্যাপটি এখন নিজে থেকেই DNS-over-HTTPS (1.1.1.1 / 8.8.8.8) দিয়ে চেষ্টা করে — এক মিনিট পর আবার ডায়াগনোসিস চালান। "
+                    "২) তবুও ব্যর্থ হলে এই নেটওয়ার্ক Quotex সম্পূর্ণ ব্লক করে — অন্য DNS (1.1.1.1/8.8.8.8), অন্য নেটওয়ার্ক বা VPN ব্যবহার করুন। "
+                    "৩) সার্ভারে চালালে সেই সার্ভারের নেটওয়ার্ক/ফায়ারওয়াল চেক করুন।",
+                    "dns",
+                )
+            elif "authorization/reject" in raw or "token rejected" in detail.lower():
+                steps["verdict"] = _verdict(
+                    False,
+                    "ব্রোকার টোকেনটি রিজেক্ট করেছে (authorization/reject) — নেটওয়ার্ক ঠিক আছে, টোকেনটিই আর বৈধ নেই।",
+                    "১) Quotex-এ নতুন করে লগইন করুন (পুরনো লগইন থাকলে সেখান থেকে লগআউট হয়ে যাবে)। "
+                    "২) ব্রাউজারের Settings/SS — session token (SSID) সদ্য কপি করে অ্যাপের Settings ট্যাবে পেস্ট করুন। "
+                    "৩) একই টোকেন একাধিক অ্যাপ/সার্ভারে একসাথে চালাবেন না — নতুন লগইন পুরনো টোকেন বাতিল করে দেয়।",
+                    "token",
+                )
+            else:
+                steps["verdict"] = _verdict(
+                    False,
+                    "Quotex সার্ভার সংযোগ/লগইন রিজেক্ট করেছে — এটাই ডেটা না আসার কারণ।",
+                    "১) টোকেনটি কি এখনও বৈধ? নতুন করে লগইন করে সদ্য কপি করা SSID টোকেন Settings-এ পেস্ট করুন। "
+                    "২) অ্যাপটি এখন সব ফলব্যাক হোস্ট (quotex.io, market-qx.pro) নিজে থেকেই চেষ্টা করে — সব ব্যর্থ হলে Railway-এর region পরিবর্তন করুন, "
+                    "অথবা ব্রাউজার থেকে কুকি কপি করে Settings-এর cookies ঘরে পেস্ট করুন। "
+                    "৩) একই টোকেন একাধিক জায়গায় (লোকাল + সার্ভার) একসাথে চালাবেন না।",
+                    "connect",
+                )
             try:
                 await client.close()
             except Exception:

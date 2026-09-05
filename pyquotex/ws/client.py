@@ -29,6 +29,12 @@ from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidSta
 from websockets.protocol import State
 
 from pyquotex._api._waits import backoff_sleep
+from pyquotex.dns_bootstrap import (
+    DNSResolutionError,
+    ensure_resolvable,
+    is_dns_error,
+    override_for,
+)
 from pyquotex.global_value import AuthStatus, WebsocketStatus
 from pyquotex.types import ReconnectPolicy
 
@@ -116,6 +122,17 @@ class WebsocketClient:
             return code is None or int(code) >= 400
         return isinstance(exc, InvalidHandshake)
 
+    # Host-specific failures worth rotating over immediately — an
+    # endpoint whose name does not even RESOLVE is exactly as dead to
+    # us as one whose handshake is rejected. (DNS failures used to
+    # count as generic errors: two full backoff cycles per candidate
+    # before rotation, which on a DNS-blocked network turned the
+    # fallback chain into a minutes-long crawl that never reached the
+    # one resolvable host.)
+    @staticmethod
+    def _is_host_specific_failure(exc: BaseException) -> bool:
+        return WebsocketClient._is_handshake_rejection(exc) or is_dns_error(exc)
+
     def _order_candidates(self, candidates: list[dict[str, str]]) -> list[dict[str, str]]:
         """Returns the candidates with the sticky (last-known-good) host
         moved to the front, preserving the relative order of the rest."""
@@ -194,10 +211,11 @@ class WebsocketClient:
                 logger.error("WebSocket error on %s: %s", candidate.get("domain"), e)
                 self.api._on_error(e)
                 failures_on_current += 1
-                if self._is_handshake_rejection(e):
-                    # The endpoint refused the upgrade outright — retrying
-                    # it immediately is how the old code burned minutes in
-                    # the same 403 loop. Rotate on the next attempt.
+                if self._is_host_specific_failure(e):
+                    # The endpoint refused the upgrade outright, or this
+                    # network cannot even resolve its name — retrying
+                    # either immediately is how the old code burned
+                    # minutes in the same failure loop. Rotate now.
                     failures_on_current = 2
 
             if not self.policy.enabled or self._closing:
@@ -251,6 +269,21 @@ class WebsocketClient:
         domain = candidate.get("domain") or getattr(self.api, "host", "")
         headers = dict(extra_headers) if extra_headers else {}
 
+        # DNS bootstrap: make sure this host CAN be reached from this
+        # network before spending a handshake on it. On DNS-blocking
+        # networks this resolves the name via DNS-over-HTTPS and installs
+        # a transparent getaddrinfo override; if even DoH cannot answer,
+        # the candidate is dead — fail fast (as a DNS error, so the
+        # rotation logic moves to the next candidate immediately)
+        # instead of hanging in the resolver.
+        hostname = url.split("/")[2] if "//" in url else url
+        if url.startswith("wss:") or url.startswith("ws:"):
+            if not await ensure_resolvable(hostname):
+                raise DNSResolutionError(
+                    f"[dns] {hostname}: not resolvable on this network "
+                    "or via DNS-over-HTTPS"
+                )
+
         # __cf_bm expires (~30min) and is bound to this connection's
         # egress AND zone. Reusing the cookie captured at first connect
         # meant every later reconnect presented a stale one — refresh
@@ -277,6 +310,13 @@ class WebsocketClient:
         if domain:
             headers["Origin"] = f"https://{domain}"
             headers["Referer"] = f"https://{domain}/{self.api.lang}/trade"
+
+        doh_ip = override_for(hostname)
+        if doh_ip:
+            logger.info(
+                "Dialing %s via DNS-bootstrap IP %s (name not resolvable "
+                "on this network)", hostname, doh_ip,
+            )
 
         async with websockets.connect(
             url,

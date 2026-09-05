@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from .dns_bootstrap import is_dns_error
 from .global_value import AuthStatus, ConnectionState, WebsocketStatus
 from .network.history import GetHistory
 from .network.login import Login
@@ -322,7 +323,9 @@ class QuotexAPI:
             if "authorization/reject" in msg_str:
                 print(f"[DEBUG] Websocket authorization rejected: {msg_str}")
                 self.state.websocket_error_reason = (
-                    "Websocket connection rejected."
+                    "Session token rejected by the broker "
+                    "(authorization/reject) — log in fresh and paste a "
+                    "new SSID token."
                 )
                 self.state.auth_status = AuthStatus.FAILED
                 await self.event_registry.set_event(
@@ -627,11 +630,23 @@ class QuotexAPI:
         """
         Handles WebSocket errors.
 
+        The stored reason is CLASSIFIED, not dumped raw: a DNS failure
+        ("[Errno -2] Name or service not known") is not a "connection
+        rejected" — it never reached the server at all — and reporting
+        it honestly is the difference between the user checking their
+        network/DNS and hunting a phantom Cloudflare problem.
+
         Args:
             error (Exception): The error that occurred.
         """
         logger.error(error)
-        self.state.websocket_error_reason = str(error)
+        if is_dns_error(error):
+            self.state.websocket_error_reason = (
+                f"DNS lookup failed — this network cannot resolve the "
+                f"broker's servers ({error})"
+            )
+        else:
+            self.state.websocket_error_reason = str(error)
         self.state.status = WebsocketStatus.ERROR
         try:
             loop = asyncio.get_running_loop()

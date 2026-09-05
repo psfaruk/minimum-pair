@@ -60,6 +60,19 @@ Now they can't hide:
   count, and a "সংযোগ ডায়াগনোসিস চালান" button renders the step-by-step
   result. `.hidden` is now a real global class (it was scoped only to
   `.signal-badge`, which left new panels rendering as empty boxes).
+- **DNS-block survival (2026-09)**: on networks whose resolver cannot
+  answer the broker's hostnames (ISP-level blocks, broken WSL/VPS
+  resolv.conf — the classic "[Errno -2] Name or service not known"),
+  the app now resolves through DNS-over-HTTPS (1.1.1.1 / 8.8.8.8)
+  automatically, rotates past unresolvable hosts immediately, and
+  reports DNS failures honestly instead of as "connection rejected".
+  Verify locally with `python tools/verify_dns_block_survival.py --token <SSID>`.
+  NOTE: the server runs uvicorn with `--loop asyncio` (see Procfile) —
+  uvloop's C-level resolver bypasses the DoH override.
+- **Token rejection is explicit**: when the broker replies
+  `authorization/reject`, the app says the token is dead and a fresh
+  SSID must be pasted (and fails fast, instead of waiting out the full
+  connect grace window).
 
 Deployment checklist this replaces guesswork with: Railway Variables →
 `QUOTEX_SESSION_TOKEN` (or paste it once in Settings — it persists via

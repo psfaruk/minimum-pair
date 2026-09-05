@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 
+from pyquotex.dns_bootstrap import is_dns_error
 from pyquotex.stable_api import Quotex
 
 from app import config, db
@@ -230,6 +231,16 @@ async def get_client() -> Quotex:
             if await client.check_connect():  # blocks ~2s internally when not yet ready
                 ok = True
                 break
+            # Fast-fail on a dead token: the broker has explicitly
+            # refused this SSID (authorization/reject). No amount of
+            # retrying authenticates it — making the user wait out the
+            # whole grace window before saying so is cruel and useless.
+            try:
+                stale_reason = str(client.api.state.websocket_error_reason or "")
+            except Exception:
+                stale_reason = ""
+            if "authorization/reject" in stale_reason:
+                break
             # check_connect() only awaits when the socket is OPEN: on a
             # dead/rejected socket is_alive() is False and it returns
             # synchronously, so this loop never yielded to the event
@@ -242,13 +253,31 @@ async def get_client() -> Quotex:
             # The raw reason from pyquotex can be generic ("Websocket
             # connection rejected."); enrich it with the server's own
             # error string so an IP/region block or expired token is
-            # visible instead of a bare timeout.
+            # visible instead of a bare timeout. DNS failures are called
+            # what they are: the machine running the app cannot resolve
+            # the broker's names — that is a network problem, not a
+            # "rejection", and the app has already tried DNS-over-HTTPS.
             raw_reason = ""
             try:
                 raw_reason = str(client.api.state.websocket_error_reason or "")
             except Exception:
                 pass
             detail = reason if not raw_reason or raw_reason in reason else f"{reason} ({raw_reason})"
+            if is_dns_error(raw_reason) or is_dns_error(reason):
+                detail = (
+                    "DNS lookup failed — the machine running the app cannot "
+                    "resolve the broker's server names. The app already "
+                    "retried via DNS-over-HTTPS (1.1.1.1 / 8.8.8.8); if it "
+                    "still fails, this network blocks Quotex entirely — "
+                    "switch to another network or DNS, or use a VPN."
+                )
+            elif "authorization/reject" in raw_reason or "token rejected" in raw_reason.lower():
+                detail = (
+                    "The broker REJECTED this session token "
+                    "(authorization/reject). The token is expired or was "
+                    "replaced by a newer login — log in to Quotex again, "
+                    "copy the fresh SSID token, and paste it in Settings."
+                )
             _last_connect_detail = detail
             raise ConnectionError(f"Quotex connect failed: {detail}")
         logger.info("Connected after grace period")
