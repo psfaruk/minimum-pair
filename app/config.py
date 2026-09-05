@@ -20,6 +20,27 @@ def _int(name: str, default: int) -> int:
 QUOTEX_ACCOUNT_MODE = os.getenv("QUOTEX_ACCOUNT_MODE", "PRACTICE").upper()
 QUOTEX_LANG = os.getenv("QUOTEX_LANG", "en")
 
+# --- Broker host + websocket fallbacks --------------------------------------
+# QUOTEX_HOST is the SITE domain the session token belongs to (qxbroker.com
+# and quotex.io are the same platform/backend; instruments, balances and
+# SSID auth behave identically on both).
+#
+# QUOTEX_FALLBACK_HOSTS lists ALTERNATIVE site domains whose websocket
+# endpoints are tried, in order, whenever the primary host's websocket
+# handshake is rejected. Cloudflare fronts every endpoint and some zones
+# reject datacenter egress IPs (Railway etc.) outright — the classic
+# "token is valid, the app says connecting… forever" 403 loop. The
+# websocket endpoints of ALL these domains accept the same session token
+# (verified live 2026-09), so rotating hosts is a safe way around a
+# per-zone block. The endpoint that works is remembered (sticky) and
+# dialled first on every later reconnect.
+QUOTEX_HOST = os.getenv("QUOTEX_HOST", "qxbroker.com")
+QUOTEX_FALLBACK_HOSTS = [
+    h.strip()
+    for h in os.getenv("QUOTEX_FALLBACK_HOSTS", "quotex.io,market-qx.pro").split(",")
+    if h.strip()
+]
+
 # --- Token-only auth surface ---
 # The app connects to Quotex via the SSID token pasted into the Settings
 # tab (POST /api/session) — the ONLY credential the frontend ever asks

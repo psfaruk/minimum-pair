@@ -40,6 +40,7 @@ class AccountMixin:
             on_otp_callback=self.on_otp_callback,
             reconnect_policy=getattr(self, "reconnect_policy", None),
             wss_url_override=getattr(self, "wss_url_override", None),
+            wss_hosts=getattr(self, "wss_hosts", None),
         )
 
         self.api.trace_ws = self.debug_ws_enable

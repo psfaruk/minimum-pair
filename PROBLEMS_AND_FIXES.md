@@ -18,6 +18,82 @@ Each finding below is tagged:
 
 ---
 
+## 2026-09-05: Live data never connects — single-endpoint Cloudflare block (FIXED)
+
+User's complaint: "টোকেন দিলে সংযোগ হচ্ছে বলে অপেক্ষায় থাকে, কিন্তু
+কখনও কানেক্ট হয় না; শুধু শুধু ক্লাউড ফ্লেয়ারের সমস্যা দেখায়" — token
+pasted, the app waits to connect forever and keeps blaming Cloudflare.
+
+Live evidence gathered while reproducing (token + real broker):
+
+- The websocket handshake and SSID authorization WORK from many
+  networks — `s_authorization` accepted, 92 instruments, balance, and
+  ~450 price ticks/15s across 16 pairs.
+- Quotex/QXBroker's platform fronts EVERY endpoint with Cloudflare,
+  and each endpoint lives in its OWN zone. Verified endpoints that all
+  share the same backend and accept the same session token:
+  `ws2.qxbroker.com`, `ws2.quotex.io`, `ws.quotex.io`,
+  `ws.qxbroker.com`, `ws2.market-qx.pro`.
+- The old client dialed exactly ONE endpoint (`ws2.qxbroker.com`).
+  When that zone rejects a deployment's egress IP (Railway and other
+  datacenter ranges get 403 on the upgrade), the client retried the
+  same rejected door forever → the eternal "সংযোগ হচ্ছে…" loop.
+- Worse, `start_websocket()` aborted on the FIRST error tick (well
+  inside its 10s wait window) while a rotation candidate could still
+  have opened — and `send_ssid()` was skipped whenever the start
+  window reported failure, leaving even a late-opening socket
+  unauthorized (a silent feed with no error at all).
+
+Fix (connection layer only — engine logic untouched):
+
+1. **Multi-host fallback**: `Quotex(fallback_hosts=[...])` (default
+   `quotex.io,market-qx.pro`, env-tunable via `QUOTEX_FALLBACK_HOSTS`)
+   builds ordered websocket candidates. `WebsocketClient` rotates:
+   two consecutive failures on one host — or ONE outright HTTP-4xx
+   handshake rejection — advance to the next candidate with a short
+   pause instead of the full backoff.
+2. **Sticky last-known-good host** (process-wide): once a host
+   completes a session, every future connect — including full
+   `get_client()` rebuilds after watchdog teardowns — dials it FIRST.
+   A deployment that found its way through one zone keeps using it.
+3. **Per-zone Cloudflare warm-up**: `refresh_handshake_cookies(domain)`
+   harvests `__cf_bm` per domain (`ws2.quotex.io` warms
+   `quotex.io/en/trade`, not qxbroker.com), caches per zone, and
+   never ships the primary zone's cookies to a different zone.
+   Origin/Referer are rebuilt per candidate so every handshake looks
+   native to the zone it dials.
+4. **Authorization is a property of the session**: the SSID is sent on
+   EVERY fresh open (first open included), and `connect()` sends it
+   whenever a socket is alive — even if the start window expired.
+   A socket opened later than the window can no longer end up
+   connected-but-unauthorized.
+5. **Honest status**: `/api/status` now exposes `wss_host` (the zone
+   actually in use) and `wss_candidates` (the full rotation list), and
+   the connect-failed diagnosis no longer only suggests region
+   changes — the app now exhausts its own fallbacks first.
+
+Verification (all green):
+
+- `tools/verify_live_connection.py` — new standalone CLI that runs the
+  full pipeline (token → connect → auth → assets → stream → history)
+  from any shell. With the real token: ALL STEPS PASSED on the normal
+  path AND on a forced-rotation path (unreachable primary host →
+  connected via `ws2.quotex.io` in 3.3s, 54 ticks/12s).
+- `tests/test_ws_fallback.py` — 11 regression tests: sticky ordering,
+  rotation after 2 failures, immediate rotation on 403,
+  cookie-zone isolation, handshake-rejection classification.
+- Live server smoke test: `/api/status` showed `quotex_connected: true`,
+  16 active pairs, ticks climbing 1096 → 2906 over 60s;
+  `/api/diagnose` all steps passed.
+- `tools/backtest_engine.py` re-run on all four market generators
+  (mean_revert 59.8%, trending 74.3%, random_walk 45.1%, mixed 60.7%
+  — unchanged from pre-fix behavior, proving the engine itself was
+  not touched).
+- All pre-existing suites still pass (`test_engine_fixes.py`,
+  `test_feed_fixes.py`, `test_quotex_client_fixes.py`).
+
+---
+
 ## A. Why predictions were wrong — root causes
 
 | # | Problem | Class | Fix |

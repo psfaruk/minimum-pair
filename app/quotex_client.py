@@ -78,6 +78,18 @@ def last_connect_detail() -> str:
     return _last_connect_detail
 
 
+def active_wss_host() -> str:
+    """The websocket host the live connection is actually using right
+    now (the Cloudflare zone it rides), for /api/status. Empty when no
+    client exists yet."""
+    if _client is None or _client.api is None:
+        return ""
+    ws_client = getattr(_client.api, "websocket_client", None)
+    if ws_client is None:
+        return ""
+    return ws_client.current_domain()
+
+
 async def _save_session_state() -> None:
     """Persists the pasted session so a restart reuses the token even when
     Railway's API isn't configured (needs DB_PATH on a volume)."""
@@ -183,6 +195,8 @@ async def get_client() -> Quotex:
     client = Quotex(
         email="",
         password="",
+        host=config.QUOTEX_HOST,
+        fallback_hosts=config.QUOTEX_FALLBACK_HOSTS,
         lang=config.QUOTEX_LANG,
         root_path=str(config.SESSION_ROOT),
     )

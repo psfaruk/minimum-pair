@@ -41,6 +41,7 @@ class Quotex(
             on_otp_callback: Callable | None = None,
             reconnect_policy: ReconnectPolicy | None = None,
             wss_url_override: str | None = None,
+            fallback_hosts: list[str] | None = None,
     ):
         """
         Initializes the Quotex stable API wrapper.
@@ -63,6 +64,11 @@ class Quotex(
                 stale-detection configuration. Defaults to enabled with
                 exponential backoff. Pass ``ReconnectPolicy(enabled=False)``
                 to opt out.
+            fallback_hosts (list[str], optional): Alternative broker site
+                domains whose websocket endpoints are tried in order when
+                the primary host's handshake is rejected (Cloudflare
+                blocks some datacenter egress IPs per-zone). All fronts
+                share the same backend and accept the same session token.
         """
         self.size = [
             5, 10, 15, 30, 60, 120, 300, 600, 900, 1800,
@@ -94,6 +100,22 @@ class Quotex(
         self.on_otp_callback = on_otp_callback
         self.reconnect_policy = reconnect_policy or ReconnectPolicy()
         self.wss_url_override = wss_url_override
+        # Ordered websocket host candidates, de-duplicated: the primary
+        # host's ws2 endpoint first, then each fallback's ws2/ws
+        # variants, then the primary's own ws. variant. Rotation happens
+        # inside WebsocketClient across reconnect attempts; see there.
+        seen: set[str] = set()
+        hosts: list[str] = []
+        for h in (
+                [f"ws2.{host}"]
+                + [f"ws2.{h}" for h in (fallback_hosts or [])]
+                + [f"ws.{h}" for h in (fallback_hosts or [])]
+                + [f"ws.{host}"]
+        ):
+            if h not in seen:
+                seen.add(h)
+                hosts.append(h)
+        self.wss_hosts = hosts
 
     @property
     def websocket(self) -> Any:

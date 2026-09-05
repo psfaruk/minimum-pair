@@ -24,7 +24,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 # Bumped on every production-visible change so a redeploy can be verified
 # from outside: /api/status exposes it, and Railway has no other way to
 # tell which commit a running instance was built from.
-CODE_VERSION = "2026.09.02-confluence-v3"
+CODE_VERSION = "2026.09.05-ws-host-fallback"
 
 app_state: dict = {"quotex_connected": False, "error": None, "pairs": list(config.ALL_PAIRS.keys())}
 _ws_clients: set[WebSocket] = set()
@@ -278,6 +278,13 @@ async def status():
         "min_confidence": config.MIN_CONFIDENCE,
         "account_mode": config.QUOTEX_ACCOUNT_MODE,
         "auth_mode": quotex_client.auth_mode(),
+        "wss_host": quotex_client.active_wss_host(),
+        "wss_candidates": (
+            [f"ws2.{config.QUOTEX_HOST}"]
+            + [f"ws2.{h}" for h in config.QUOTEX_FALLBACK_HOSTS]
+            + [f"ws.{h}" for h in config.QUOTEX_FALLBACK_HOSTS]
+            + [f"ws.{config.QUOTEX_HOST}"]
+        ),
         "reconnects": app_state.get("reconnects", 0),
         "consecutive_rebuild_failures": app_state.get("consecutive_rebuild_failures", 0),
         # The most informative description of the last connect attempt's
@@ -442,8 +449,9 @@ async def diagnose():
             steps["verdict"] = _verdict(
                 False,
                 "Quotex সার্ভার সংযোগ/লগইন রিজেক্ট করেছে — এটাই ডেটা না আসার কারণ।",
-                "১) টোকেনটি কি এখনও বৈধ? নতুন করে qxbroker.com-এ লগইন করে সদ্য কপি করা SSID টোকেন Settings-এ পেস্ট করুন। "
-                "২) Railway-এর region পরিবর্তন করে দেখুন (broker কিছু datacenter IP/রিজিওন ব্লক করে)। "
+                "১) টোকেনটি কি এখনও বৈধ? নতুন করে লগইন করে সদ্য কপি করা SSID টোকেন Settings-এ পেস্ট করুন। "
+                "২) অ্যাপটি এখন সব ফলব্যাক হোস্ট (quotex.io, market-qx.pro) নিজে থেকেই চেষ্টা করে — সব ব্যর্থ হলে Railway-এর region পরিবর্তন করুন, "
+                "অথবা ব্রাউজার থেকে কুকি কপি করে Settings-এর cookies ঘরে পেস্ট করুন। "
                 "৩) একই টোকেন একাধিক জায়গায় (লোকাল + সার্ভার) একসাথে চালাবেন না।",
                 "connect",
             )

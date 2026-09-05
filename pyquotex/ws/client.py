@@ -25,7 +25,7 @@ import time
 from typing import Any
 
 import websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 from websockets.protocol import State
 
 from pyquotex._api._waits import backoff_sleep
@@ -33,6 +33,31 @@ from pyquotex.global_value import AuthStatus, WebsocketStatus
 from pyquotex.types import ReconnectPolicy
 
 logger = logging.getLogger(__name__)
+
+# Process-wide memory of the last websocket host that produced a working
+# session, keyed by the broker's primary site domain ("qxbroker.com").
+#
+# Why process-wide: every get_client() rebuild constructs a fresh
+# QuotexAPI + WebsocketClient, and the app's watchdog rebuilds the whole
+# chain when the feed dies. An instance-level "sticky host" would be
+# forgotten exactly when it matters — at rebuild time — and the new chain
+# would start by dialing the primary host AGAIN, paying one full
+# handshake-rejection cycle before rediscovering the fallback that
+# worked last time. Remembering it here means: once a deployment has
+# found a Cloudflare zone that lets it through, every future connect
+# tries that zone FIRST.
+_STICKY_WSS_HOST: dict[str, str] = {}
+
+
+def remember_sticky_host(site_domain: str, ws_host: str) -> None:
+    """Records ws_host as the last-known-good endpoint for site_domain."""
+    if site_domain and ws_host:
+        _STICKY_WSS_HOST[site_domain] = ws_host
+
+
+def sticky_host(site_domain: str) -> str | None:
+    """Returns the last-known-good ws host for site_domain, if any."""
+    return _STICKY_WSS_HOST.get(site_domain)
 
 
 class WebsocketClient:
@@ -59,11 +84,50 @@ class WebsocketClient:
         # Counter of successful opens; the very first open does NOT
         # replay subscriptions (there are none yet).
         self._open_count = 0
+        # Host-rotation state: the candidate currently being dialed and
+        # the ordered candidate list (sticky host first). Populated by
+        # run_forever; current_domain() surfaces it for /api/status.
+        self._candidates: list[dict[str, str]] = []
+        self._active_candidate: dict[str, str] | None = None
 
     @property
     def wss(self) -> "WebsocketClient":
         """Returns the low-level WebSocket wrapper (self)."""
         return self
+
+    def current_domain(self) -> str:
+        """Site domain of the websocket host currently being dialed.
+
+        Surfaced via /api/status so "which Cloudflare zone am I actually
+        using right now" is answerable from outside the container."""
+        if self._active_candidate:
+            return self._active_candidate.get("domain", "")
+        return ""
+
+    @staticmethod
+    def _is_handshake_rejection(exc: BaseException) -> bool:
+        """True when the failure means THIS endpoint refused the HTTP
+        upgrade (Cloudflare 403, wrong path, etc.) rather than the
+        connection dropping mid-session. These are host-specific: the
+        correct response is to rotate to the next candidate, not to
+        back off and retry the same rejected door."""
+        if isinstance(exc, InvalidStatus):
+            code = getattr(getattr(exc, "response", None), "status_code", None)
+            return code is None or int(code) >= 400
+        return isinstance(exc, InvalidHandshake)
+
+    def _order_candidates(self, candidates: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Returns the candidates with the sticky (last-known-good) host
+        moved to the front, preserving the relative order of the rest."""
+        ordered = list(candidates)
+        sticky = sticky_host(getattr(self.api, "host", ""))
+        if sticky:
+            for i, c in enumerate(ordered):
+                if c.get("url", "").startswith(f"wss://{sticky}/") or c.get("domain") == sticky:
+                    if i != 0:
+                        ordered = [ordered[i]] + ordered[:i] + ordered[i + 1:]
+                    break
+        return ordered
 
     async def send(self, data: str) -> None:
         """Send a frame; log instead of crashing if the socket is closed."""
@@ -89,19 +153,52 @@ class WebsocketClient:
         and returns when the connection ends. With auto-reconnect on, it
         keeps reconnecting until :meth:`close` is called or
         ``max_attempts`` is exceeded.
+
+        Host rotation: ``candidates`` (list of ``{"url", "domain"}``
+        dicts) may be passed to dial several broker websocket endpoints
+        in turn. They all front the SAME backend and accept the same
+        token — they differ only in which Cloudflare zone fronts them,
+        and some zones reject datacenter egress IPs outright (the
+        "token is valid but it never connects" 403 loop). A host that
+        completes a session is remembered process-wide (sticky) and
+        tried first on every future connect; a host that gets its
+        handshake rejected twice in a row (or rejected once with an
+        HTTP 4xx) is rotated past immediately.
         """
+        passed = kwargs.pop("candidates", None)
+        candidates = list(passed) if passed else [
+            {"url": url, "domain": getattr(self.api, "host", "")}
+        ]
+
+        # Sticky host first: the zone that worked last time gets the
+        # first shot, before the configured default order.
+        ordered = self._order_candidates(candidates)
+        self._candidates = ordered
+
+        idx = 0
         attempt = 0
+        failures_on_current = 0
         while True:
+            candidate = ordered[idx]
+            self._active_candidate = candidate
             try:
-                await self._connect_once(url, extra_headers, ssl)
+                await self._connect_once(candidate, extra_headers, ssl)
                 if self._closing:
                     return
                 attempt = 0  # successful run resets the backoff
+                failures_on_current = 0
             except ConnectionClosed as e:
                 self._handle_close_exception(e)
+                failures_on_current += 1
             except Exception as e:
-                logger.error("WebSocket error: %s", e)
+                logger.error("WebSocket error on %s: %s", candidate.get("domain"), e)
                 self.api._on_error(e)
+                failures_on_current += 1
+                if self._is_handshake_rejection(e):
+                    # The endpoint refused the upgrade outright — retrying
+                    # it immediately is how the old code burned minutes in
+                    # the same 403 loop. Rotate on the next attempt.
+                    failures_on_current = 2
 
             if not self.policy.enabled or self._closing:
                 return
@@ -112,36 +209,75 @@ class WebsocketClient:
                 )
                 return
 
-            logger.info("WebSocket reconnecting (attempt #%d)", attempt + 1)
-            await backoff_sleep(
-                attempt,
-                base=self.policy.base_delay,
-                cap=self.policy.max_delay,
-                jitter=self.policy.jitter,
-            )
             attempt += 1
+            if failures_on_current >= 2 and len(ordered) > 1:
+                nxt = (idx + 1) % len(ordered)
+                logger.info(
+                    "WebSocket host %s failed %d time(s) in a row — "
+                    "rotating to %s",
+                    candidate.get("domain"),
+                    failures_on_current,
+                    ordered[nxt].get("domain"),
+                )
+                idx = nxt
+                failures_on_current = 0
+                # Short pause: the next host is a DIFFERENT Cloudflare
+                # zone; the failure we're backing off from doesn't
+                # predict anything about it.
+                await backoff_sleep(
+                    0,
+                    base=min(self.policy.base_delay, 1.0),
+                    cap=min(self.policy.max_delay, 2.0),
+                    jitter=self.policy.jitter,
+                )
+            else:
+                logger.info("WebSocket reconnecting (attempt #%d)", attempt)
+                await backoff_sleep(
+                    attempt - 1,
+                    base=self.policy.base_delay,
+                    cap=self.policy.max_delay,
+                    jitter=self.policy.jitter,
+                )
 
     async def _connect_once(
             self,
-            url: str,
+            candidate: dict[str, str],
             extra_headers: dict[str, str] | None,
             ssl: Any,
     ) -> None:
-        """One ``connect()`` cycle. Returns when the connection ends."""
-        headers = extra_headers if extra_headers is not None else {}
+        """One ``connect()`` cycle to ONE candidate endpoint. Returns
+        when the connection ends."""
+        url = candidate["url"]
+        domain = candidate.get("domain") or getattr(self.api, "host", "")
+        headers = dict(extra_headers) if extra_headers else {}
 
         # __cf_bm expires (~30min) and is bound to this connection's
-        # egress. Reusing the cookie captured at first connect meant every
-        # later reconnect presented a stale one — refresh before each
-        # handshake so long-lived sessions keep passing Cloudflare.
+        # egress AND zone. Reusing the cookie captured at first connect
+        # meant every later reconnect presented a stale one — refresh
+        # before each handshake so long-lived sessions keep passing
+        # Cloudflare. The refresh is domain-aware: each candidate zone
+        # needs its OWN cookie (a qxbroker.com __cf_bm is worthless on
+        # quotex.io), so the fallback hosts warm their own domain.
         refresher = getattr(self.api, "refresh_handshake_cookies", None)
         if refresher is not None:
             try:
-                fresh = await refresher()
+                fresh = await refresher(domain)
                 if fresh:
                     headers["Cookie"] = fresh
+                elif domain != getattr(self.api, "host", ""):
+                    # Never ship the primary zone's cookies to a different
+                    # zone — Cloudflare reads mismatched cookies as a bot
+                    # fingerprint. No Cookie header beats a wrong one.
+                    headers.pop("Cookie", None)
             except Exception as e:  # never block a reconnect on this
                 logger.debug("Handshake cookie refresh skipped: %s", e)
+
+        # Origin/Referer must match the zone of the host actually dialed
+        # (ws2.quotex.io is quotex.io's zone, NOT qxbroker.com's).
+        if domain:
+            headers["Origin"] = f"https://{domain}"
+            headers["Referer"] = f"https://{domain}/{self.api.lang}/trade"
+
         async with websockets.connect(
             url,
             additional_headers=headers,
@@ -153,18 +289,34 @@ class WebsocketClient:
         ) as ws:
             self._ws = ws
             self.api.last_message_at = time.monotonic()
+            logger.info(
+                "WebSocket handshake accepted by %s (zone %s)",
+                url.split("/")[2] if "//" in url else url,
+                domain,
+            )
             await self.api._on_open()
+            # This endpoint let us through — remember it process-wide so
+            # future connects (including full get_client() rebuilds after
+            # a watchdog teardown) dial it first.
+            remember_sticky_host(getattr(self.api, "host", ""), domain)
             self._open_count += 1
+            # EVERY fresh open is a brand-new engine.io session the
+            # server considers UNAUTHORIZED until the SSID is presented —
+            # on the first open too, not just after reconnects. (The
+            # first-open send normally happens in connect(); but when
+            # host rotation opens the socket later than connect()'s own
+            # wait window, that send never ran — the session then sat
+            # open but permanently unauthorized: silent feed,
+            # "connecting…" forever. Sending it here on every open makes
+            # authorization a property of the SESSION, not of the call
+            # that happened to win the race. Duplicates are harmless —
+            # the server just re-accepts and re-replies.)
+            await self._reauthorize()
             if self._open_count > 1:
-                # Reconnect path: this is a brand-new engine.io session and
-                # the server considers it UNAUTHORIZED until the SSID is
-                # presented again. The old code only replayed subscriptions
-                # here — on an unauthorized session those are ignored, so
-                # the connection sat open but permanently silent (live data
-                # never resumed after any network blip). Re-authorize FIRST
-                # so the replayed subscriptions land on an authorized
-                # session, in-order on the same socket.
-                await self._reauthorize()
+                # Reconnect path: replay the subscriptions that were
+                # active on the previous socket — AFTER the re-authorization
+                # above, so they land on an authorized session, in-order
+                # on the same socket.
                 asyncio.create_task(self._replay_subscriptions())
 
             self._start_watchdog()
@@ -222,26 +374,26 @@ class WebsocketClient:
     # Re-authorization + subscription replay after reconnect
     # ------------------------------------------------------------------
     async def _reauthorize(self) -> None:
-        """Re-send the SSID authorization on a fresh post-reconnect socket.
+        """Presents the SSID authorization on the freshly opened socket.
 
-        Every reconnect creates a new engine.io session whose only valid
-        state is "not authenticated" — the server delivers no quotes,
-        candles or balance updates until the SSID is presented again."""
+        Every open (first or reconnect) creates a new engine.io session
+        whose only valid state is "not authenticated" — the server
+        delivers no quotes, candles or balance updates until the SSID
+        is presented. Duplicated sends (connect() also sends one on the
+        fast path) are accepted idempotently by the server."""
         ssid = getattr(self.api.state, "SSID", None)
         if not ssid:
-            logger.warning(
-                "WebSocket reconnected without an SSID — cannot re-authorize; "
-                "this connection will receive no data"
+            logger.debug(
+                "WebSocket session opened without an SSID — nothing to "
+                "authorize yet (login flow will send credentials itself)"
             )
             return
         try:
             await self.api.ssid(ssid)
-            logger.info(
-                "WebSocket reconnected — SSID authorization re-sent"
-            )
+            logger.info("SSID authorization sent on the fresh session")
         except Exception as e:
             logger.error(
-                "Failed to re-send SSID authorization after reconnect: %s", e
+                "Failed to send SSID authorization after open: %s", e
             )
 
     async def _replay_subscriptions(self) -> None:

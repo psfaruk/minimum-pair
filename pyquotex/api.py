@@ -29,6 +29,20 @@ from .ws.objects.timesync import TimeSync
 logger = logging.getLogger(__name__)
 
 
+def ws_parent_domain(ws_host: str) -> str:
+    """Returns the site domain a websocket host belongs to.
+
+    ``ws2.quotex.io`` -> ``quotex.io``, ``ws.qxbroker.com`` ->
+    ``qxbroker.com``. Cloudflare cookies are issued per site domain, so
+    the warm-up request and the Origin/Referer headers for a websocket
+    host must both target its parent domain, never the primary site's.
+    """
+    labels = ws_host.split(".")
+    if len(labels) >= 2:
+        return ".".join(labels[-2:])
+    return ws_host
+
+
 class QuotexAPI:
     """Class for communication with Quotex API."""
 
@@ -44,6 +58,7 @@ class QuotexAPI:
             on_otp_callback: Callable | None = None,
             reconnect_policy: Any = None,
             wss_url_override: str | None = None,
+            wss_hosts: list[str] | None = None,
     ):
         """
         :param str host: The hostname or ip address of a Quotex server.
@@ -57,6 +72,14 @@ class QuotexAPI:
             URL with this value. Primarily a test hook so the offline
             integration tests can point at a local replay server, but
             also useful for routing through a custom proxy.
+        :param wss_hosts: Ordered websocket host candidates (e.g.
+            ``["ws2.qxbroker.com", "ws2.quotex.io", ...]``). All of these
+            are fronts for the SAME broker backend and accept the same
+            session token — they differ only in which Cloudflare zone
+            fronts them. When one zone blocks this deployment's egress
+            IP (the classic "token is valid but it never connects" 403
+            loop), the client rotates to the next candidate instead of
+            retrying the same rejected host forever.
         """
         self.state = ConnectionState()
         self.on_otp_callback = on_otp_callback
@@ -87,11 +110,30 @@ class QuotexAPI:
 
         self.host = host
         self.https_url = f"https://{host}"
-        self.wss_url = (
-            wss_url_override
-            if wss_url_override
-            else f"wss://ws2.{host}/socket.io/?EIO=3&transport=websocket"
-        )
+
+        # Ordered websocket endpoints, tried in sequence across reconnect
+        # attempts (sticky: a host that completed a session is preferred
+        # until it starts failing again). See ws_parent_domain above for
+        # why each candidate carries its own site domain.
+        if wss_url_override:
+            self.wss_candidates: list[dict[str, str]] = [
+                {"url": wss_url_override, "domain": host}
+            ]
+        else:
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for h in list(wss_hosts or []) + [f"ws2.{host}"]:
+                if h and h not in seen:
+                    seen.add(h)
+                    ordered.append(h)
+            self.wss_candidates = [
+                {
+                    "url": f"wss://{h}/socket.io/?EIO=3&transport=websocket",
+                    "domain": ws_parent_domain(h),
+                }
+                for h in ordered
+            ]
+        self.wss_url = self.wss_candidates[0]["url"]
         self.wss_message: str | None = None
         self.websocket_client: WebsocketClient | None = None
         self._websocket_task: asyncio.Task | None = None
@@ -898,18 +940,29 @@ class QuotexAPI:
     # is enough again.
     CF_COOKIE_TTL_SECONDS = 600  # __cf_bm lives ~30min; refresh well inside that
 
-    async def refresh_handshake_cookies(self) -> str:
+    async def refresh_handshake_cookies(self, domain: str | None = None) -> str:
         """Returns the Cookie header value for the websocket upgrade.
 
-        An explicitly configured cookie string always wins. Otherwise a
-        Cloudflare cookie is harvested (and cached) automatically."""
+        An explicitly configured cookie string always wins for the
+        PRIMARY site domain (it was captured from the user's own
+        browser session there). For every domain — primary or fallback
+        — a Cloudflare ``__cf_bm`` cookie is harvested (and cached per
+        domain) by warming ``https://{domain}/{lang}/trade`` first:
+        each Cloudflare zone issues its own ``__cf_bm``, so cookies
+        earned from qxbroker.com are worthless on quotex.io.
+
+        :param domain: the site domain the websocket host belongs to.
+            Defaults to the primary ``self.host``.
+        """
+        domain = domain or self.host
         configured = self.session_data.get("cookies") or ""
-        if configured and str(configured).lower() != "none":
+        if configured and str(configured).lower() != "none" and domain == self.host:
             return str(configured)
 
+        cache = getattr(self, "_cf_cookie_cache", {})
+        cached = cache.get(domain, "")
+        fetched_at = getattr(self, "_cf_cookie_times", {}).get(domain, 0.0)
         now = time.monotonic()
-        cached = getattr(self, "_cf_cookies", "")
-        fetched_at = getattr(self, "_cf_cookies_at", 0.0)
         if cached and now - fetched_at < self.CF_COOKIE_TTL_SECONDS:
             return cached
 
@@ -917,7 +970,7 @@ class QuotexAPI:
         try:
             response = await self.browser.send_request(
                 "GET",
-                f"{self.https_url}/{self.lang}/trade",
+                f"https://{domain}/{self.lang}/trade",
                 headers={
                     "User-Agent": ua,
                     "Accept-Language": getattr(self, "_ws_accept_language", "en-US,en;q=0.9"),
@@ -930,18 +983,22 @@ class QuotexAPI:
             )
             cookies = self.browser.get_cookies()
             logger.info(
-                "Cloudflare warm-up: HTTP %s, %d cookie(s) harvested%s",
+                "Cloudflare warm-up (%s): HTTP %s, %d cookie(s) harvested%s",
+                domain,
                 response.status_code,
                 len(self.browser._client.cookies),
                 " (__cf_bm present)" if "__cf_bm" in cookies else " (no __cf_bm)",
             )
         except Exception as e:
-            logger.warning("Cloudflare warm-up request failed: %s", e)
+            logger.warning("Cloudflare warm-up request failed (%s): %s", domain, e)
             return cached
 
         if cookies:
-            self._cf_cookies = cookies
-            self._cf_cookies_at = now
+            cache[domain] = cookies
+            self._cf_cookie_cache = cache
+            times = getattr(self, "_cf_cookie_times", {})
+            times[domain] = now
+            self._cf_cookie_times = times
         return cookies or cached
 
     async def start_websocket(self) -> tuple[bool, str]:
@@ -980,26 +1037,33 @@ class QuotexAPI:
             else f"{lang},en-US;q=0.9,en;q=0.8"
         )
 
+        # set_session(cookies=None) stores None under "cookies", so
+        # .get("cookies", "") returned None (the key exists) and the
+        # handshake literally sent `Cookie: None` — visible in the
+        # Railway logs on every rejected connect. A real browser sends
+        # either valid cookies or no Cookie header at all; the literal
+        # string "None" is a bot fingerprint. refresh_handshake_cookies
+        # only ever reads real cookie strings now.
+        self._ws_accept_language = accept_language
+        self._ws_user_agent = ua
+        # Warm the PRIMARY domain up front so the first handshake
+        # attempt already carries a __cf_bm cookie; fallback domains are
+        # warmed lazily by the rotation logic right before their own
+        # first handshake (refresh_handshake_cookies is domain-aware).
         extra_headers = {
             "User-Agent": ua,
-            "Origin": self.https_url,
-            "Referer": f"{self.https_url}/{self.lang}/trade",
+            # NOTE: Origin/Referer are NOT set here — they depend on which
+            # websocket host the rotation logic dials (each candidate has
+            # its own site domain) and are built per attempt in
+            # WebsocketClient._connect_once.
             "Accept-Language": accept_language,
             "Accept-Encoding": "gzip, deflate, br",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
         }
-
-        # set_session(cookies=None) stores None under "cookies", so
-        # .get("cookies", "") returned None (the key exists) and the
-        # handshake literally sent `Cookie: None` — visible in the
-        # Railway logs on every rejected connect. A real browser sends
-        # either valid cookies or no Cookie header at all; the literal
-        # string "None" is a bot fingerprint. Only send it when real.
-        self._ws_accept_language = accept_language
-        self._ws_user_agent = ua
-        cookies = await self.refresh_handshake_cookies()
+        primary_domain = self.wss_candidates[0]["domain"]
+        cookies = await self.refresh_handshake_cookies(primary_domain)
         if cookies:
             extra_headers["Cookie"] = cookies
         # Skip SSL for plain ws:// (test / proxy / dev) — the websockets
@@ -1014,14 +1078,22 @@ class QuotexAPI:
                 url=self.wss_url,
                 extra_headers=extra_headers,
                 ssl=ssl_ctx,
+                candidates=self.wss_candidates,
             )
         )
+        # Wait for the first AUTHORIZED session, across host rotation.
+        # An intermediate candidate failure sets status=ERROR, but that
+        # must NOT abort the wait: the rotation loop immediately dials
+        # the next candidate, whose success flips status back to
+        # CONNECTED. (The old code returned on the FIRST ERROR tick —
+        # with fallback rotation that aborted the connect while the
+        # working host was still being dialed.)
         for _ in range(100):
-            if self.state.status == WebsocketStatus.ERROR:
-                return False, self.state.websocket_error_reason
             if self.state.status == WebsocketStatus.CONNECTED:
                 return True, "Connected"
             await asyncio.sleep(0.1)
+        if self.state.status == WebsocketStatus.ERROR:
+            return False, self.state.websocket_error_reason
         return False, "Timeout"
 
     async def send_ssid(self) -> bool:
@@ -1045,7 +1117,14 @@ class QuotexAPI:
             AccountType.DEMO if is_demo else AccountType.REAL
         )
         ok, reason = await self.start_websocket()
-        if ok: await self.send_ssid()
+        # Present the SSID whenever a socket is alive — even when the
+        # start window reported failure: host rotation may have opened a
+        # session right after the window closed, and an authorized
+        # session is what turns that socket into live data. (Without
+        # this, a late-opening socket sat connected but permanently
+        # unauthorized — silent feed, "connecting…" forever.)
+        if self.websocket_client and self.websocket_client.is_alive():
+            await self.send_ssid()
         return ok, reason
 
     async def close(self) -> bool:
