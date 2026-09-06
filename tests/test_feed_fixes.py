@@ -164,5 +164,12 @@ async def main() -> None:
     print("ALL FEED-FIX TESTS PASSED")
 
 
+def test_feed_race_scenarios() -> None:
+    """Pytest entry point: bare sync wrapper so a plain `pytest tests/`
+    collects and runs the async scenario script without needing an
+    async pytest plugin."""
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
     asyncio.run(main())

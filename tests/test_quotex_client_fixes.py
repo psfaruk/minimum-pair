@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app import config, quotex_client  # noqa: E402
 
 
-async def test_stale_client_closed_before_replacement() -> None:
+async def _check_stale_client_closed_before_replacement() -> None:
     """A client that has been unhealthy LONGER than the grace window is
     torn down and replaced. (Since the auto-reconnect re-authorization
     fix, a brief disconnect is healed in place — see the transient test
@@ -60,7 +60,7 @@ async def test_stale_client_closed_before_replacement() -> None:
     print("  quotex_client.stale-client-closed-before-replacement OK")
 
 
-async def test_transient_unhealthy_client_gets_grace() -> None:
+async def _check_transient_unhealthy_client_gets_grace() -> None:
     """A brief disconnect (socket dead, pyquotex auto-reconnect in
     flight) must NOT trigger a teardown: closing the client kills the
     very reconnect that would have healed it, and the pair tasks keep
@@ -88,7 +88,7 @@ async def test_transient_unhealthy_client_gets_grace() -> None:
     print("  quotex_client.transient-unhealthy-grace OK")
 
 
-async def test_healthy_client_is_reused_without_closing() -> None:
+async def _check_healthy_client_is_reused_without_closing() -> None:
     """The common case — check_connect() succeeds — must be a pure
     passthrough: no close(), no new Quotex() at all."""
     healthy = MagicMock()
@@ -108,9 +108,24 @@ async def test_healthy_client_is_reused_without_closing() -> None:
     print("  quotex_client.healthy-client-reused OK")
 
 
+# Pytest entry points: plain sync wrappers so the suite runs under a
+# bare `pytest tests/` with no async plugin installed (async test
+# functions are not natively supported by pytest itself).
+def test_stale_client_closed_before_replacement() -> None:
+    asyncio.run(_check_stale_client_closed_before_replacement())
+
+
+def test_transient_unhealthy_client_gets_grace() -> None:
+    asyncio.run(_check_transient_unhealthy_client_gets_grace())
+
+
+def test_healthy_client_is_reused_without_closing() -> None:
+    asyncio.run(_check_healthy_client_is_reused_without_closing())
+
+
 if __name__ == "__main__":
     print("quotex-client-fix tests:")
-    asyncio.run(test_stale_client_closed_before_replacement())
-    asyncio.run(test_transient_unhealthy_client_gets_grace())
-    asyncio.run(test_healthy_client_is_reused_without_closing())
+    asyncio.run(_check_stale_client_closed_before_replacement())
+    asyncio.run(_check_transient_unhealthy_client_gets_grace())
+    asyncio.run(_check_healthy_client_is_reused_without_closing())
     print("ALL QUOTEX-CLIENT-FIX TESTS PASSED")
