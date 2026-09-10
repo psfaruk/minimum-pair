@@ -28,7 +28,11 @@ import time
 from typing import Any
 
 from app import config
-from app.browser_transport import BrowserTransportUnavailable, browser_session
+from app.browser_transport import (
+    BrowserTransportUnavailable,
+    browser_available,
+    browser_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +55,7 @@ def status() -> dict[str, Any]:
     fresh = [d for d, s in _solved.items() if _fresh(d)]
     return {
         "enabled": config.CF_SOLVE_ENABLED,
+        "browser_available": browser_available(),
         "last_result": _status["last_result"],
         "last_solve_at": _status["last_solve_at"],
         "last_domain": _status["last_domain"],

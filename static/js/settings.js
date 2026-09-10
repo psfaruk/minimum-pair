@@ -78,14 +78,18 @@ App.tabs.settings = {
     if (cf.enabled === false) return "বন্ধ (CF_SOLVE_ENABLED=0)";
     const r = String(cf.last_result || "not attempted");
     const browser = cf.browser || {};
+    const availNote = cf.browser_available === false
+      ? " — ব্রাউজার ইনস্টল নেই, শুধু QUOTEX_PROXY পথ ব্যবহার হবে"
+      : "";
     if (r.startsWith("solved")) {
       const solvedAt = cf.last_solve_at ? Math.round(Date.now() / 1000 - cf.last_solve_at) : "?";
       return `সমাধান হয়েছে (~${solvedAt}s আগে; মোট ${browser.challenges_solved || 0}টি চ্যালেঞ্জ)`;
     }
     if (r === "solving…") return "এখন সলভ করছে…";
     if (r.startsWith("rate-limited")) return "রেট-লিমিটে — কিছুক্ষণ পর আবার চেষ্টা করবে";
-    if (r.startsWith("playwright not installed")) return "ইনস্টল নেই (pip install playwright)";
-    if (r.includes("failed") || r.includes("unavailable")) return `ব্যর্থ: ${r.slice(0, 60)}`;
+    if (r.startsWith("playwright not installed")) return `ইনস্টল নেই (pip install playwright)${availNote}`;
+    if (r.includes("failed") || r.includes("unavailable")) return `ব্যর্থ: ${r.slice(0, 60)}${availNote}`;
+    if (r === "not attempted" && cf.browser_available === false) return `ব্রাউজার নেই${availNote}`;
     return r;
   },
 

@@ -8,10 +8,12 @@ fake-useragent>=2.2.0
 rich>=13.7.0
 python-socks>=2.4.0
 
-# Cloudflare challenge solver / browser-hosted websocket transport
-# (optional at runtime — degrades honestly when Chromium is missing —
-# but install so the default deployment has it)
-playwright>=1.40.0
+# Cloudflare challenge solver / browser-hosted websocket transport:
+# playwright is intentionally NOT here — it is installed opportunistically
+# by nixpacks.toml (pip install playwright || WARN). The app lazy-imports
+# it, so a build without it still boots and /api/status reports the
+# solver as unavailable; the 3-tier transport degrades to the python
+# dial + QUOTEX_PROXY and token → live data still connects.
 
 # app backend
 fastapi>=0.115.0

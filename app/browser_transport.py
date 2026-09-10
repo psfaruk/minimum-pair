@@ -65,6 +65,38 @@ class BrowserTransportUnavailable(RuntimeError):
     """Raised when the browser transport cannot be established."""
 
 
+def browser_available() -> bool | None:
+    """True when playwright + its Chromium binary are importable/
+    discoverable WITHOUT launching anything. None when unknown (already
+    launched / previously failed). Cheap enough for /api/status."""
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+    except Exception:
+        return False
+    try:
+        with sync_playwright() as pw:
+            path = pw.chromium.executable_path
+            return bool(path)  # non-empty path string
+    except Exception:
+        return False
+
+
+def browser_available() -> bool:
+    """True when playwright + its Chromium binary are importable/
+    discoverable WITHOUT launching anything. Cheap enough for
+    /api/status; false is honest (solver will report unavailable)."""
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+    except Exception:
+        return False
+    try:
+        with sync_playwright() as pw:
+            path = pw.chromium.executable_path
+            return bool(path)  # non-empty path string
+    except Exception:
+        return False
+
+
 class BrowserSession:
     """One persistent headless Chromium for the whole process.
 
