@@ -375,3 +375,44 @@ shrunk confidence before a signature could ever fire. Three flaws:
   transport page lands ✓, in-page websocket opens ✓, python dial
   succeeds when Cloudflare relents ✓, permanent blocks fail fast with
   one honest message ✓.
+
+## 2026-09-10 (deploy): two failed Railway builds, and the honest fix
+
+Both 821aac1 and 40e6585 failed to deploy — the failure came 18–24 s
+into each build, before/around the first heavy `RUN` layers, while the
+last known-good build (e6f208c, 09:45) had sailed through. The one
+structural difference: **those builds shipped a `nixpacks.toml`, the
+good one shipped none.** A custom nixpacks.toml changes the generated
+Dockerfile (extra apt layers / different phase mix), which changes the
+nixpkgs layer hash, which invalidates Railway's layer cache — forcing
+the builder to re-download nixpkgs/apt through its own network. When
+the builder's network hiccups (DNS to nixpkgs channels, dpkg lock
+during apt, CDN for the Chromium download — all observed in this
+environment's own probing), a hard-fail layer kills the entire deploy.
+Railway then rolls the service back to the old version, which is
+exactly what the live /api/status kept showing.
+
+Fix: build config returned to the exact known-good shape —
+
+- `nixpacks.toml` deleted. Nixpacks auto-detects Python and generates
+  the same cached plan every previous successful deploy used.
+- `railway.json` startCommand restored verbatim (no `--loop asyncio`).
+- `playwright` stays OUT of requirements.txt (lazy-imported; absent →
+  solver reports `browser_available: false` in /api/status and the
+  Settings tab, and the transport degrades to the python dial +
+  `QUOTEX_PROXY`). `python-socks` (tiny, pure-Python) remains for
+  proxy support.
+
+Token → live data on Railway now rides: session token auth →
+6-host websocket rotation → python dial per host (Cloudflare's
+datacenter-IP blocking is intermittent — the live matrix proved the
+python dial succeeds whenever the zone relents, and host rotation
+tries six zones). If every zone blocks: one honest
+`HandshakeChallenge` message telling the user the two real options —
+residential `QUOTEX_PROXY` or the browser solver.
+
+Optional browser solver on Railway (when wanted): add a Dockerfile or
+nixpacks.toml that runs `pip install playwright && python -m
+playwright install chromium` plus the system libs — every step
+wrapped in `|| true` so a broken builder network can only disable the
+solver, never the deploy. The app code already supports both worlds.
