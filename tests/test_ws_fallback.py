@@ -99,7 +99,7 @@ class RotationTests(unittest.TestCase):
         ws = WebsocketClient(api, reconnect_policy=ReconnectPolicy(enabled=False))
         calls = []
 
-        async def fake_connect_once(candidate, headers, ssl):
+        async def fake_connect_once(candidate, headers, ssl, proxy=None):
             calls.append(candidate["domain"])
             raise RuntimeError("stop")
 
@@ -118,7 +118,7 @@ class RotationTests(unittest.TestCase):
         ws = WebsocketClient(api, reconnect_policy=ReconnectPolicy(enabled=True, base_delay=0.01, max_delay=0.02))
         calls = []
 
-        async def fake_connect_once(candidate, headers, ssl):
+        async def fake_connect_once(candidate, headers, ssl, proxy=None):
             calls.append(candidate["domain"])
             if len(calls) < 3:
                 # twice on host 1 → rotation expected for dial #3
@@ -147,7 +147,7 @@ class RotationTests(unittest.TestCase):
         ws = WebsocketClient(api, reconnect_policy=ReconnectPolicy(enabled=True, base_delay=0.01, max_delay=0.02))
         calls = []
 
-        async def fake_connect_once(candidate, headers, ssl):
+        async def fake_connect_once(candidate, headers, ssl, proxy=None):
             calls.append(candidate["domain"])
             if len(calls) < 2:
                 raise InvalidStatus(MagicMock(status_code=403))
@@ -175,7 +175,7 @@ class RotationTests(unittest.TestCase):
         ws = WebsocketClient(api, reconnect_policy=ReconnectPolicy(enabled=True, base_delay=0.01, max_delay=0.02))
         calls = []
 
-        async def fake_connect_once(candidate, headers, ssl):
+        async def fake_connect_once(candidate, headers, ssl, proxy=None):
             calls.append(candidate["domain"])
             await ws.close()
             raise ConnectionResetError("closing now")

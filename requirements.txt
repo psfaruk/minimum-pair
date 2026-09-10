@@ -6,6 +6,12 @@ pyfiglet>=1.0.2
 beautifulsoup4>=4.12.3
 fake-useragent>=2.2.0
 rich>=13.7.0
+python-socks>=2.4.0
+
+# Cloudflare challenge solver / browser-hosted websocket transport
+# (optional at runtime — degrades honestly when Chromium is missing —
+# but install so the default deployment has it)
+playwright>=1.40.0
 
 # app backend
 fastapi>=0.115.0

@@ -5,7 +5,7 @@ import time
 from pyquotex.dns_bootstrap import is_dns_error
 from pyquotex.stable_api import Quotex
 
-from app import config, db
+from app import cf_solver, config, db
 
 logger = logging.getLogger(__name__)
 
@@ -200,12 +200,25 @@ async def get_client() -> Quotex:
         fallback_hosts=config.QUOTEX_FALLBACK_HOSTS,
         lang=config.QUOTEX_LANG,
         root_path=str(config.SESSION_ROOT),
+        # The proxy is the OTHER escape hatch for the Cloudflare managed
+        # challenge: a residential/mobile egress is generally not
+        # challenged at all, so the plain python dial goes through. Both
+        # httpx (warm-up) and the websocket dial ride it.
+        proxies=config.QUOTEX_PROXY or None,
     )
     client.set_session(
         user_agent=config.QUOTEX_USER_AGENT or DEFAULT_USER_AGENT,
         cookies=config.QUOTEX_SESSION_COOKIES or None,
         ssid=config.QUOTEX_SESSION_TOKEN,
     )
+    # Cloudflare-challenge hooks (transferred to QuotexAPI by
+    # account.py's connect()):
+    #   cf_solver — solve the challenge, hand back cf_clearance+UA for
+    #     the python dial (Tier 2);
+    #   browser_transport_factory — open the websocket INSIDE the
+    #     solved browser session (Tier 3, the datacenter-proof path).
+    client.cf_solver = cf_solver.solve
+    client.browser_transport_factory = cf_solver.connect_websocket
     logger.info("Using session token (skipping login)")
 
     try:
@@ -278,6 +291,16 @@ async def get_client() -> Quotex:
                     "replaced by a newer login — log in to Quotex again, "
                     "copy the fresh SSID token, and paste it in Settings."
                 )
+            elif "challenge" in detail.lower() or "challenge" in raw_reason.lower():
+                detail = (
+                    "Cloudflare managed challenge — this server's datacenter "
+                    "IP is blocked by the broker's bot protection. The app "
+                    "already tried solving it with the built-in browser "
+                    "(solver status: " + str(cf_solver.status().get("last_result")) + "). "
+                    "Fix: set QUOTEX_PROXY to a residential/mobile proxy in "
+                    "Settings/env — that egress is not challenged — or keep "
+                    "the browser solver enabled and retry."
+                )
             _last_connect_detail = detail
             raise ConnectionError(f"Quotex connect failed: {detail}")
         logger.info("Connected after grace period")
@@ -337,3 +360,10 @@ async def close_client() -> None:
         await _client.close()
         _client = None
     _client_unhealthy_since = None
+    # The browser session is expensive (~300-500MB) and only needed
+    # while a connection is being maintained — release it with the
+    # client so a rebuild re-earns a fresh clearance deliberately.
+    try:
+        await cf_solver.close()
+    except Exception:
+        logger.warning("Failed to close the browser transport session", exc_info=True)

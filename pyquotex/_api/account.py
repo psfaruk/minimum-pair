@@ -48,6 +48,11 @@ class AccountMixin:
         self.api.current_asset = self.asset_default
         self.api.current_period = self.period_default
         self.api.state.SSID = self.session_data.get("token")
+        # Cloudflare-challenge hooks (see app/cf_solver.py): transferred
+        # from the stable wrapper to the fresh API object so they survive
+        # the full teardown/rebuild cycle the watchdog performs.
+        self.api.cf_solver = getattr(self, "cf_solver", None)
+        self.api.browser_transport_factory = getattr(self, "browser_transport_factory", None)
 
         if not self.session_data.get("token"):
             check, reason = await self.api.authenticate()

@@ -1,8 +1,11 @@
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from app import candle_reaction, config, db, htf, microstructure, pattern_miner, patterns, regime, weights
+
+logger = logging.getLogger(__name__)
 
 # 2026-09 (confluence v3) — the veto system is gone. The old engine let
 # microstructure (a rough blended read) and candle-reaction (a single
@@ -84,6 +87,73 @@ _perf_cache_ts: float = 0.0
 # only when a signal fires) so /api/status stays honest even while the
 # engine is silently waiting for a confluence.
 last_regime_by_pair: dict[str, str] = {}
+
+# Payout-aware breakeven for a pair: the win rate at which a 1-unit
+# binary stake has zero expectancy at that pair's payout. Unknown pairs
+# assume the conservative mid-range OTC payout (0.85).
+DEFAULT_PAYOUT = 0.85
+
+
+def _breakeven_win_rate(pair: str) -> float:
+    payout = config.PAIR_PAYOUT.get(pair, DEFAULT_PAYOUT)
+    return 1.0 / (1.0 + payout)
+
+
+def _required_win_rate(pair: str) -> float:
+    """The payout-aware firing bar for a measured confluence on a pair.
+
+    breakeven + EDGE_MARGIN_OVER_BREAKEVEN headroom, and never below the
+    plain breakeven. Operators who want the old strict behaviour set
+    EDGE_MARGIN_OVER_BREAKEVEN high (e.g. 0.13 restores ~0.65 on a 0.92
+    payout pair)."""
+    return _breakeven_win_rate(pair) + config.EDGE_MARGIN_OVER_BREAKEVEN
+
+
+# Probation re-arm bookkeeping: (pair, signature) -> monotonic ts of the
+# last probation signal. A signature that fell below the measured gate
+# earns ONE probe signal per PROBATION_REARM_SECONDS; if the probe wins,
+# the record climbs back naturally, and if it loses the timer resets.
+# Without this the gate was a ratchet to death: below the bar → silent
+# → never graded again → permanently sealed (7 early losses could mute
+# a signature for weeks even after the market's character changed).
+_probation_last_fired: dict[tuple[str, str], float] = {}
+
+
+def _probation_ready(pair: str, signature: str) -> bool:
+    """True when a muted signature's probation window has elapsed.
+
+    The FIRST time a signature falls below the bar the timer merely
+    STARTS (returns False — it goes silent now); only after
+    PROBATION_REARM_SECONDS of accumulated silence does one probe
+    signal earn the right to fire."""
+    import time as _time
+
+    key = (pair, signature)
+    last = _probation_last_fired.get(key)
+    now = _time.monotonic()
+    if last is None or (now - last) < config.PROBATION_REARM_SECONDS:
+        if last is None:
+            _probation_last_fired[key] = now  # mute period starts now
+        return False
+    _probation_last_fired[key] = now
+    logger.info(
+        "Probation re-arm: %s on %s measured below the bar but its "
+        "silence window elapsed — allowing one probe signal",
+        signature, pair,
+    )
+    return True
+
+
+def payout_context(pair: str) -> dict[str, float]:
+    """Payout economics surfaced with every signal decision (feed,
+    /api/status, the psychology endpoint): what a win pays, what the
+    breakeven is, and what the engine actually demands."""
+    payout = config.PAIR_PAYOUT.get(pair, DEFAULT_PAYOUT)
+    return {
+        "payout": payout,
+        "breakeven": round(_breakeven_win_rate(pair), 4),
+        "required": round(_required_win_rate(pair), 4),
+    }
 
 
 async def _refresh_perf_caches() -> None:
@@ -547,7 +617,16 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
 
     sources = [v.source for v, _ in contributing]
 
-    # --- GATE 4: measured confidence ---------------------------------------
+    # --- GATE 4: measured, payout-aware confidence ------------------------
+    # The bar a confluence must clear is NOT a fixed 0.65: it is that
+    # pair's BREAKEVEN win rate (1/(1+payout) — 0.52 at a 0.92 payout,
+    # 0.58 at a 0.72 payout) plus a small edge margin. A fixed 0.65
+    # silenced genuinely profitable strategies on high-payout OTC pairs
+    # (a true 56% at 0.92 payout is +4.6% expectancy per trade and would
+    # never fire), while letting losing ones through on low-payout pairs
+    # where 0.65 is still below real profitability needs. The engine now
+    # demands "beats the broker's take, with headroom" — the only bar
+    # that means anything in binary options.
     signature = confluence_signature(net_direction, regime_read["regime"], families)
     confidence: float | None = None
 
@@ -565,11 +644,14 @@ async def evaluate(pair: str, candles: list[dict[str, Any]], ind: dict[str, Any]
                 wins = round(rate * samples)
                 confidence = max(0.0, min(1.0, weights.shrunk_rate(wins, samples - wins)))
 
+    required = _required_win_rate(pair)
+
     if confidence is not None:
-        # A confluence that has measured below the bar on this pair is
-        # finished — it goes silent instead of degrading into a
-        # second-class signal.
-        if confidence < config.MIN_CONFIDENCE:
+        # A confluence that has measured below the payout-aware bar goes
+        # silent — but not forever (see _probation_ready): a bad early
+        # record must not seal a signature for weeks when the market's
+        # character changed.
+        if confidence < required and not _probation_ready(pair, signature):
             return None
     else:
         # Bootstrap: nothing measured yet. The structural confluence must

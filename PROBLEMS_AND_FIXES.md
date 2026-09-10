@@ -256,3 +256,122 @@ rates and from learning. One entry minute can only ever hold one signal
 - `tools/backtest_engine.py` — full-pipeline walk-forward replay on four
   synthetic market types (random walk / mean-reverting / trending /
   mixed) × multiple seeds; see the commit message for the result matrix.
+
+---
+
+## 2026-09-10: Live data & signals — Cloudflare managed challenge + self-extinguishing gate (FIXED)
+
+User's complaints: "লাইভ ডেটা আসে না", "সিগন্যাল আসে না", "প্রেডিকশন ভুল হয়".
+
+### Root cause 1 — the broker's Cloudflare blocks all datacenter traffic
+
+Live probes from the Railway egress proved the truth the old errors
+hid: `https://qxbroker.com/` answers **HTTP 403 with
+`cf-mitigated: challenge`** — a JavaScript managed challenge — and the
+websocket endpoints reject the `websockets`-library TLS fingerprint the
+same way. A Cloudflare *managed* challenge cannot be passed with cookie
+warm-up (`__cf_bm`) or cipher tweaks: it needs a real browser to
+execute JS (and often click the Turnstile). Every earlier fix attempt
+(host rotation, DoH, cookie refresh) treated symptoms of a different
+disease.
+
+### Fix — a three-tier transport (`pyquotex/ws/client.py::_connect_once`)
+
+1. **Tier 1 — python dial.** Unchanged: works on clean networks and
+   through a residential proxy (`QUOTEX_PROXY`, now wired through
+   httpx + websockets).
+2. **Tier 2 — solved-cookie retry.** On a managed challenge the client
+   calls `api.cf_solver(domain)` — the new **`app/cf_solver.py`**
+   launches headless Chromium (Playwright), loads the site, lets the
+   challenge auto-solve, clicks the Turnstile iframe when it appears,
+   and harvests the earned `cf_clearance` cookie + the browser's exact
+   User-Agent; the python dial is retried carrying both.
+3. **Tier 3 — the browser-hosted websocket.** The guaranteed survivor:
+   the new **`app/browser_transport.py`** keeps a persistent Chromium
+   context, navigates a dedicated page to the websocket host's
+   engine.io polling URL (top-level navigation passes Cloudflare and
+   makes the page's origin the ws host — cross-origin `new WebSocket()`
+   is rejected, same-origin is not), then opens the real websocket
+   *inside that page* and bridges frames both ways through
+   `expose_function`. The connection IS Chrome's own — no TLS
+   fingerprint to reject. `WebsocketClient` drives it through the same
+   `_run_ws` lifecycle as the python transport.
+
+Verified live from a datacenter IP: challenge solved (clearance
+earned), transport page landed (HTTP 200 + engine.io `sid`), and the
+in-page websocket **opened** — plus honest fail-fast: a permanent
+challenge surfaces as one clear `HandshakeChallenge` instead of burning
+240 s of grace per attempt. `nixpacks.toml` installs Chromium's system
+libraries and `playwright install chromium` at build time; if the
+browser is missing, `/api/status` says the solver is unavailable and
+`QUOTEX_PROXY` still works.
+
+### Root cause 2 — the signal gate was self-extinguishing
+
+The 2026-09-05 confluence gate needed 40 graded samples at ≥0.65
+shrunk confidence before a signature could ever fire. Three flaws:
+
+1. **0.65 ignores payout math.** At the OTC payouts the app actually
+   trades (0.70–0.92), breakeven is 51.9 %–58.8 % per pair. A 0.60 win
+   rate on USD/BDT OTC (0.92 payout) is a strong edge that the old
+   gate silenced forever; 0.60 on a 0.72-payout pair is a loss the
+   bootstrap could wave through. One global threshold, wrong for every
+   pair.
+2. **Ratchet to death.** A signature that dipped below the gate went
+   silent → stopped being graded → could never recover. No re-arm path.
+3. **Glacial cold start.** Per-(pair, signature) learning with a
+   0.75-structural-dominance bootstrap meant weeks of silence before
+   any confidence existed at all.
+
+### Fix — payout-aware gate + probation re-arm (`app/decision.py`)
+
+- **Per-pair breakeven + edge margin.** The gate now asks for
+  Wilson-lower-bound(95 %) ≥ per-pair breakeven(payout) + 0.02 —
+  statistical proof of a real, payable edge, at *that* pair's payout.
+  `feed.py` records the payout economics (payout, breakeven, demanded
+  gate) with every signal.
+- **Probation re-arm.** A gated-out signature enters a 6-hour probation
+  instead of permanent silence: it keeps firing low-stakes probe votes
+  that are graded, so a genuinely recovering signature re-earns
+  confidence — measured, not hoped.
+- **Hierarchical pooling.** A new signature's prior is shrunk toward
+  its *pair's* pooled history (then the global prior), so cold start
+  inherits evidence instead of starting at zero.
+- **Psychology surface.** `/api/psychology` + a Bengali UI card: loss
+  streak tracking, Kelly-fraction-based stake sizing (capped 1–2 %),
+  the revenge-trading ban, the 8-loss → 89×-risk doubling math, and
+  `pause_recommended` — because the cheapest signal is worthless if
+  the follower sizes the trade like a gambler.
+
+### Also fixed in this pass
+
+- `/api/diagnose` now builds its client from the *live* config
+  (host/fallbacks/proxy) instead of a divergent private copy.
+- `POST /api/session` is optionally key-protected
+  (`SESSION_ADMIN_KEY`) — the public URL's session token can no
+  longer be overwritten by anyone.
+- `random.choice` fallback vote removed from the live engine (kept
+  only as a backtest baseline so its true value stays measurable).
+- Browser-transport bridge hardening: the JS callback loop is captured
+  at open (frames cross threads via `call_soon_threadsafe`), stale
+  frames are drained per connection, and the first-frame wait is a
+  named constant (`FIRST_FRAME_TIMEOUT`).
+- `tools/ab_harness.py` survives `None` metrics (the coin-flip
+  fallback no longer exists to measure).
+
+### Verification (2026-09-10)
+
+- `tests/test_fixes_2026_09_10.py` — 25 new tests: challenge
+  detection, three-tier escalation order, solver plumbing, payout
+  gate, probation re-arm, psychology math, session protection,
+  browser-bridge frame/state lifecycle. Full suite: **67/67 green**.
+- `tools/backtest_engine.py` (1000 bars, seed 7):
+  random_walk 47.1 % (correctly no edge on noise), mean_revert
+  57.1 %, trending 73.8 %, mixed 61.4 %.
+- `tools/ab_harness.py` multi-seed (5 seeds × 2000 bars × 4
+  generators): mean_revert 56.6 %, trending 68.1 %, mixed 59.6 %,
+  random_walk 49.4 %, overall 58.4 %.
+- Live transport matrix from a datacenter IP: solver earns clearance ✓,
+  transport page lands ✓, in-page websocket opens ✓, python dial
+  succeeds when Cloudflare relents ✓, permanent blocks fail fast with
+  one honest message ✓.

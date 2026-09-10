@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app import backtest, config, db, patterns as patterns_module, quotex_client
+from app import backtest, cf_solver, config, db, patterns as patterns_module, quotex_client
 from app.evaluator import run_evaluator
 from app.feed import FeedManager
 
@@ -24,7 +24,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 # Bumped on every production-visible change so a redeploy can be verified
 # from outside: /api/status exposes it, and Railway has no other way to
 # tell which commit a running instance was built from.
-CODE_VERSION = "2026.09.05-doh-dns-bootstrap"
+CODE_VERSION = "2026.09.10-browser-transport-payout-gate"
 
 app_state: dict = {"quotex_connected": False, "error": None, "pairs": list(config.ALL_PAIRS.keys())}
 _ws_clients: set[WebSocket] = set()
@@ -294,6 +294,11 @@ async def status():
         "total_ticks": (
             app_state["feed_manager"].total_ticks if app_state.get("feed_manager") else 0
         ),
+        # The Cloudflare challenge solver / browser transport state — the
+        # difference between "blocked forever" and "auto-solved in 4s" is
+        # visible here instead of being a guess.
+        "cf_solver": cf_solver.status(),
+        "proxy_configured": bool(config.QUOTEX_PROXY),
         # Set by the boot migration once the one-time repair + dedupe
         # recount of pattern_stats has run — proves the new code booted
         # and repaired this instance's database.
@@ -407,17 +412,28 @@ async def diagnose():
     from pyquotex.dns_bootstrap import doh_resolve, install_getaddrinfo_patch, is_dns_error
     from pyquotex.stable_api import Quotex
 
+    # Built EXACTLY like the live feed's client (same host, same
+    # fallbacks, same proxy, same challenge hooks) — the old probe
+    # constructed a bare default client, so it tested qxbroker.com with
+    # no rotation and no solver: a deployment whose live client was busy
+    # solving through quotex.io reported "connect rejected" from the
+    # primary host and the verdict pointed users at the WRONG fix.
     client = Quotex(
         email="",
         password="",
+        host=config.QUOTEX_HOST,
+        fallback_hosts=config.QUOTEX_FALLBACK_HOSTS,
         lang=config.QUOTEX_LANG,
         root_path=str(config.SESSION_ROOT),
+        proxies=config.QUOTEX_PROXY or None,
     )
     client.set_session(
         user_agent=config.QUOTEX_USER_AGENT or quotex_client.DEFAULT_USER_AGENT,
         cookies=config.QUOTEX_SESSION_COOKIES or None,
         ssid=config.QUOTEX_SESSION_TOKEN,
     )
+    client.cf_solver = cf_solver.solve
+    client.browser_transport_factory = cf_solver.connect_websocket
 
     # Step 1.5: DNS reachability of the websocket hosts. A network whose
     # resolver cannot answer the broker's names used to look identical
@@ -489,15 +505,27 @@ async def diagnose():
                     "token",
                 )
             else:
-                steps["verdict"] = _verdict(
-                    False,
-                    "Quotex সার্ভার সংযোগ/লগইন রিজেক্ট করেছে — এটাই ডেটা না আসার কারণ।",
-                    "১) টোকেনটি কি এখনও বৈধ? নতুন করে লগইন করে সদ্য কপি করা SSID টোকেন Settings-এ পেস্ট করুন। "
-                    "২) অ্যাপটি এখন সব ফলব্যাক হোস্ট (quotex.io, market-qx.pro) নিজে থেকেই চেষ্টা করে — সব ব্যর্থ হলে Railway-এর region পরিবর্তন করুন, "
-                    "অথবা ব্রাউজার থেকে কুকি কপি করে Settings-এর cookies ঘরে পেস্ট করুন। "
-                    "৩) একই টোকেন একাধিক জায়গায় (লোকাল + সার্ভার) একসাথে চালাবেন না।",
-                    "connect",
-                )
+                solver_note = str(cf_solver.status().get("last_result") or "")
+                if "challenge" in detail.lower() or "challenge" in raw.lower():
+                    steps["verdict"] = _verdict(
+                        False,
+                        "Cloudflare চ্যালেঞ্জ — এই সার্ভারের ডেটাসেন্টার IP ব্রোকারের বট-প্রোটেকশনে ব্লকড। "
+                        f"ব্রাউজার সলভার অবস্থা: {solver_note}।",
+                        "১) রেসিডেনশিয়াল/মোবাইল প্রক্সি সেট করুন (Settings বা QUOTEX_PROXY env) — সেই IP-তে চ্যালেঞ্জ আসে না। "
+                        "২) ব্রাউজার সলভার চালু আছে কিনা দেখুন (CF_SOLVE_ENABLED) — Playwright+Chromium ইনস্টল থাকতে হবে। "
+                        "৩) সলভার রেট-লিমিটে গেলে কয়েক মিনিট পর আবার ডায়াগনোসিস চালান।",
+                        "connect",
+                    )
+                else:
+                    steps["verdict"] = _verdict(
+                        False,
+                        "Quotex সার্ভার সংযোগ/লগইন রিজেক্ট করেছে — এটাই ডেটা না আসার কারণ।",
+                        "১) টোকেনটি কি এখনও বৈধ? নতুন করে লগইন করে সদ্য কপি করা SSID টোকেন Settings-এ পেস্ট করুন। "
+                        "২) অ্যাপটি এখন সব ফলব্যাক হোস্ট (quotex.io, market-qx.pro) নিজে থেকেই চেষ্টা করে — সব ব্যর্থ হলে Railway-এর region পরিবর্তন করুন, "
+                        "অথবা ব্রাউজার থেকে কুকি কপি করে Settings-এর cookies ঘরে পেস্ট করুন। "
+                        "৩) একই টোকেন একাধিক জায়গায় (লোকাল + সার্ভার) একসাথে চালাবেন না।",
+                        "connect",
+                    )
             try:
                 await client.close()
             except Exception:
@@ -599,6 +627,9 @@ class SessionUpdate(BaseModel):
     # page. No admin passcode, no API keys, no other auth fields.
     session_token: str
     session_cookies: str = ""
+    # Only required when the operator set SESSION_ADMIN_KEY in the
+    # environment (write protection for a public deployment).
+    admin_key: str = ""
 
 
 @app.post("/api/session")
@@ -607,9 +638,18 @@ async def update_session(payload: SessionUpdate):
     frontend authenticates against the broker — no admin passcode, no
     API keys, nothing else is asked of the user.
 
-    Stored like a captured one so a restart keeps using it. Pasting a
-    fresh token also clears any prior one-shot password-login failure
-    flag, so the next boot is back to a clean slate."""
+    Optional write protection: when SESSION_ADMIN_KEY is set in the
+    environment, the request must carry the same value in `admin_key` —
+    the read APIs stay public, but a random stranger who finds the
+    deployed URL can no longer hijack the broker session. Unset =
+    unprotected (legacy single-user behaviour).
+
+    Stored like a captured one so a restart keeps using it."""
+    if config.SESSION_ADMIN_KEY and payload.admin_key.strip() != config.SESSION_ADMIN_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="This instance is protected — provide the admin key (SESSION_ADMIN_KEY).",
+        )
     session_token = payload.session_token.strip()
     if not session_token:
         raise HTTPException(status_code=400, detail="session_token is required")
@@ -618,6 +658,87 @@ async def update_session(payload: SessionUpdate):
 
     asyncio.create_task(_restart_feed())
     return {"ok": True, "message": "Session updated — reconnecting in the background"}
+
+
+@app.get("/api/psychology")
+async def psychology():
+    """Trading-psychology guardrails computed from THIS app's actual
+    graded history — the discipline layer the user asked for.
+
+    Binary options accounts die from position sizing and revenge
+    trading far more often than from bad entries, so this endpoint
+    turns the app's own measured numbers into the guardrails a
+    disciplined trader needs: current losing streak, the worst streak
+    on record (what drawdown to EXPECT), a conservative stake size
+    (quarter-Kelly, hard-capped at 2% of bankroll), and an explicit
+    pause recommendation when the current streak matches the
+    historical worst."""
+    try:
+        rows = await db.graded_signals(500)
+    except Exception:
+        logger.exception("Psychology endpoint could not read graded history")
+        rows = []
+
+    streak = 0
+    worst_streak = 0
+    cur = 0
+    wins = losses = draws = 0
+    for r in rows:  # newest first
+        res = r.get("result")
+        if res == "WIN":
+            wins += 1
+            cur = 0
+        elif res == "LOSS":
+            losses += 1
+            cur += 1
+            worst_streak = max(worst_streak, cur)
+        else:
+            draws += 1
+    # Current streak: consecutive losses at the head of the list (the
+    # open wound a revenge-trade decision would be made inside).
+    for r in rows:
+        if r.get("result") == "LOSS":
+            streak += 1
+        elif r.get("result") == "WIN":
+            break
+
+    total = wins + losses
+    win_rate = (wins / total) if total else None
+    payout = 0.85  # conservative mid-range OTC payout assumption
+
+    # Kelly f* = p - (1-p)/b with b = payout. Quarter-Kelly is the
+    # standard haircut for estimation error in p (our p is itself a
+    # shrunk estimate), hard-capped at 2% of bankroll regardless.
+    kelly = None
+    if win_rate is not None and total >= 30:
+        kelly = max(0.0, win_rate - (1 - win_rate) / payout)
+    stake_pct = min(0.02, round(kelly * 0.25, 4)) if kelly else 0.01
+
+    return {
+        "win_rate": round(win_rate, 4) if win_rate is not None else None,
+        "graded": {"wins": wins, "losses": losses, "draws": draws, "sample": total},
+        "current_loss_streak": streak,
+        "worst_loss_streak": worst_streak,
+        "recommended_stake_pct": stake_pct,
+        "kelly_fraction": round(kelly, 4) if kelly is not None else None,
+        "payout_assumed": payout,
+        "pause_recommended": streak >= 3 and streak >= max(worst_streak, 3),
+        "rules_bn": [
+            "প্রতি ট্রেডে ব্যাংকের ১-২% এর বেশি নয় — recommended_stake_pct সেটাই বলে দিচ্ছে।",
+            "লসের পর স্টেক বাড়াবেন না (no revenge trading) — স্ট্রিক শেষ হলে আগের স্টেকে ফিরে আসুন।",
+            f"ইতিহাসে সবচেয়ে খারাপ স্ট্রিক ছিল {worst_streak} টি পরপর লস — এমন ড্রডাউন আবার আসবেই, মানসিকভাবে প্রস্তুত থাকুন।",
+            "মার্টিনগেল/ডাবল-আপ কখনোই নয় — ৬ লসের পর ২x স্টেক মানে ৬৩ গুণ রিস্ক।",
+            "দিনে ১০-২০টির বেশি সিগন্যাল ফলো করবেন না — বেশি ট্রেড মানে বেশি নয়েজ ফলো করা।",
+            "pause_recommended সত্য হলে আজকের সেশন বন্ধ করুন — বাজার কালও থাকবে।",
+        ],
+        "engine_gates": {
+            "min_confluence_strategies": config.MIN_CONFLUENCE_STRATEGIES,
+            "quality_floor": config.QUALITY_FLOOR,
+            "bootstrap_agreement": config.BOOTSTRAP_AGREEMENT,
+            "edge_margin_over_breakeven": config.EDGE_MARGIN_OVER_BREAKEVEN,
+            "probation_rearm_seconds": config.PROBATION_REARM_SECONDS,
+        },
+    }
 
 
 @app.get("/api/pairs")

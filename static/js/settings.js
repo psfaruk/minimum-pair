@@ -61,12 +61,32 @@ App.tabs.settings = {
     document.getElementById("settingsError").textContent = s.error || "";
     document.getElementById("settingsAuthMode").textContent =
       s.auth_mode === "session_token" ? "সেশন টোকেন" : "এখনো টোকেন দেওয়া হয়নি";
-    document.getElementById("settingsPersistence").textContent = "চালু (ডাটাবেজে সংরক্ষিত)";
     document.getElementById("settingsFeedHealth").textContent = this.describeFeedHealth(s);
+    document.getElementById("settingsCfSolver").textContent = this.describeCfSolver(s);
+    document.getElementById("settingsProxy").textContent = s.proxy_configured
+      ? "কনফিগারড (QUOTEX_PROXY)"
+      : "নেই — ডেটাসেন্টার IP ব্লক হলে সলভার ব্যবহার হয়";
     document.getElementById("settingsCodeVersion").textContent = s.code_version || "--";
     document.getElementById("settingsMinConf").textContent = (s.min_confidence * 100).toFixed(0) + "%";
     this._active = s.active_pairs || [];
     this.renderPairs();
+  },
+
+  describeCfSolver(s) {
+    const cf = s.cf_solver;
+    if (!cf) return "--";
+    if (cf.enabled === false) return "বন্ধ (CF_SOLVE_ENABLED=0)";
+    const r = String(cf.last_result || "not attempted");
+    const browser = cf.browser || {};
+    if (r.startsWith("solved")) {
+      const solvedAt = cf.last_solve_at ? Math.round(Date.now() / 1000 - cf.last_solve_at) : "?";
+      return `সমাধান হয়েছে (~${solvedAt}s আগে; মোট ${browser.challenges_solved || 0}টি চ্যালেঞ্জ)`;
+    }
+    if (r === "solving…") return "এখন সলভ করছে…";
+    if (r.startsWith("rate-limited")) return "রেট-লিমিটে — কিছুক্ষণ পর আবার চেষ্টা করবে";
+    if (r.startsWith("playwright not installed")) return "ইনস্টল নেই (pip install playwright)";
+    if (r.includes("failed") || r.includes("unavailable")) return `ব্যর্থ: ${r.slice(0, 60)}`;
+    return r;
   },
 
   describeFeedHealth(s) {

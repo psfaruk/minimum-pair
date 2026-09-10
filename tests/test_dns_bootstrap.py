@@ -91,7 +91,7 @@ class RotationOnDNSTests(unittest.TestCase):
         ws = WebsocketClient(api, reconnect_policy=ReconnectPolicy(enabled=True, base_delay=0.01, max_delay=0.02))
         calls = []
 
-        async def fake_connect_once(candidate, headers, ssl):
+        async def fake_connect_once(candidate, headers, ssl, proxy=None):
             calls.append(candidate["domain"])
             if len(calls) < 2:
                 raise socket.gaierror(-2, "Name or service not known")

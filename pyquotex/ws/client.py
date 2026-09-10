@@ -40,6 +40,38 @@ from pyquotex.types import ReconnectPolicy
 
 logger = logging.getLogger(__name__)
 
+
+class HandshakeChallenge(Exception):
+    """The endpoint answered the websocket upgrade with a Cloudflare
+    managed challenge (HTTP 403 + ``cf-mitigated: challenge``).
+
+    This is NOT an ordinary rejection: the endpoint never evaluated the
+    request. Cloudflare demands JavaScript execution from this egress
+    IP before it will pass ANY traffic, so retrying the same handshake —
+    with or without warm-up cookies — cannot succeed until the challenge
+    is solved by a real browser (see app/cf_solver.py). Rotating hosts,
+    backing off and re-dialing are all wasted cycles while the block is
+    active."""
+
+
+def challenge_headers(exc: BaseException) -> dict[str, str]:
+    """Response headers of a rejected handshake, as a plain dict (empty
+    when the exception carries no response object)."""
+    resp = getattr(exc, "response", None)
+    return {str(k).lower(): str(v) for k, v in dict(getattr(resp, "headers", {})).items()} if resp else {}
+
+
+def is_managed_challenge(exc: BaseException) -> bool:
+    """True when ``exc`` is a handshake rejection caused by Cloudflare's
+    managed challenge (the datacenter-IP block). Detected by the
+    ``cf-mitigated: challenge`` response header — the same marker the
+    live probes observed on Quotex — or by the challenge page body."""
+    headers = challenge_headers(exc)
+    if headers.get("cf-mitigated", "").lower() == "challenge":
+        return True
+    body = str(getattr(getattr(exc, "response", None), "body", b""))
+    return "Just a moment" in body and "challenge-platform" in body
+
 # Process-wide memory of the last websocket host that produced a working
 # session, keyed by the broker's primary site domain ("qxbroker.com").
 #
@@ -183,6 +215,11 @@ class WebsocketClient:
         HTTP 4xx) is rotated past immediately.
         """
         passed = kwargs.pop("candidates", None)
+        proxy = kwargs.pop("proxy", None) or (
+            getattr(self.api, "proxies", None)
+            if isinstance(getattr(self.api, "proxies", None), str)
+            else None
+        )
         candidates = list(passed) if passed else [
             {"url": url, "domain": getattr(self.api, "host", "")}
         ]
@@ -195,15 +232,33 @@ class WebsocketClient:
         idx = 0
         attempt = 0
         failures_on_current = 0
+        # One full lap over every candidate blocked by the managed
+        # challenge means the EGRESS is blocked, not a single zone —
+        # stop cycling and surface it (the connect() wait window then
+        # reports the honest reason instead of silently grinding).
+        challenge_rejections = 0
         while True:
             candidate = ordered[idx]
             self._active_candidate = candidate
             try:
-                await self._connect_once(candidate, extra_headers, ssl)
+                await self._connect_once(candidate, extra_headers, ssl, proxy=proxy)
                 if self._closing:
                     return
                 attempt = 0  # successful run resets the backoff
                 failures_on_current = 0
+                challenge_rejections = 0
+            except HandshakeChallenge as e:
+                logger.error("WebSocket blocked by Cloudflare challenge on %s", candidate.get("domain"))
+                self.api._on_error(e)
+                challenge_rejections += 1
+                if challenge_rejections >= len(ordered):
+                    logger.error(
+                        "Every websocket candidate is behind the Cloudflare "
+                        "managed challenge — this egress IP is blocked. "
+                        "Stopping the rotation (solver already tried)."
+                    )
+                    return
+                failures_on_current = 2  # rotate to the next zone now
             except ConnectionClosed as e:
                 self._handle_close_exception(e)
                 failures_on_current += 1
@@ -262,12 +317,113 @@ class WebsocketClient:
             candidate: dict[str, str],
             extra_headers: dict[str, str] | None,
             ssl: Any,
+            proxy: str | None = None,
     ) -> None:
         """One ``connect()`` cycle to ONE candidate endpoint. Returns
-        when the connection ends."""
-        url = candidate["url"]
+        when the connection ends.
+
+        Three-tier escalation when the endpoint answers with a
+        Cloudflare managed challenge:
+
+        1. plain python dial (works on unblocked networks / proxies);
+        2. solve the challenge with a real browser, retry the python
+           dial carrying the earned ``cf_clearance`` + the solver's
+           exact User-Agent (works where python TLS is still accepted);
+        3. open the websocket INSIDE the browser (browser-bridged
+           transport) — the only path that survives a TLS-fingerprint
+           check, because the connection IS Chrome's own.
+
+        Without a solver (or when it fails), the challenge surfaces as
+        an honest ``HandshakeChallenge`` instead of burning backoff
+        cycles on a door that cannot open from this egress IP."""
         domain = candidate.get("domain") or getattr(self.api, "host", "")
+        blocked_exc: Exception | None = None
+
+        # --- Tier 1: plain python dial ---------------------------------
+        try:
+            await self._dial(candidate, domain, extra_headers, ssl, proxy)
+            return
+        except Exception as first_exc:
+            if not is_managed_challenge(first_exc):
+                raise
+            blocked_exc = first_exc
+            self.api.last_handshake_block = "challenge"
+
+        # --- Tier 2: solved cookie + UA on the python dial -------------
+        solver = getattr(self.api, "cf_solver", None)
+        solved: dict[str, str] | None = None
+        if solver is not None:
+            logger.warning(
+                "Cloudflare managed challenge on %s — solving it with a "
+                "real browser before retrying the handshake",
+                domain,
+            )
+            try:
+                solved = await solver(domain)
+            except Exception as solver_exc:
+                logger.warning("Challenge solver failed: %s", solver_exc)
+                solved = None
+            if isinstance(solved, str):
+                solved = {"cookie": solved}  # backward-compatible return
+        if solved and solved.get("cookie"):
+            try:
+                await self._dial(
+                    candidate, domain, extra_headers, ssl, proxy,
+                    solved_cookie=solved.get("cookie"),
+                    solved_user_agent=solved.get("user_agent"),
+                )
+                return
+            except Exception as second_exc:
+                if not is_managed_challenge(second_exc):
+                    raise
+                logger.warning(
+                    "Solved cf_clearance was rejected on the python TLS "
+                    "fingerprint — escalating to the browser transport"
+                )
+
+        # --- Tier 3: the browser-hosted websocket ----------------------
+        factory = getattr(self.api, "browser_transport_factory", None)
+        if factory is not None:
+            try:
+                ws = await factory(candidate["url"], domain)
+            except Exception as factory_exc:
+                raise HandshakeChallenge(
+                    f"Cloudflare managed challenge on {domain}; browser "
+                    f"transport unavailable: {factory_exc}"
+                ) from blocked_exc
+            await self._run_ws(candidate, domain, ws)
+            return
+
+        raise HandshakeChallenge(
+            f"Cloudflare managed challenge on {domain} — datacenter "
+            "egress is blocked and no solver/transport is configured; "
+            "enable the browser solver or route through a residential "
+            "proxy (QUOTEX_PROXY)"
+        ) from blocked_exc
+
+    async def _dial(
+            self,
+            candidate: dict[str, str],
+            domain: str,
+            extra_headers: dict[str, str] | None,
+            ssl: Any,
+            proxy: str | None,
+            solved_cookie: str | None = None,
+            solved_user_agent: str | None = None,
+    ) -> None:
+        """Dials ONE websocket endpoint with the given headers.
+
+        ``solved_cookie`` (a cf_clearance earned by the browser solver)
+        overrides the warm-up cookie path entirely — it IS the answer to
+        the challenge that blocked the previous dial — and
+        ``solved_user_agent`` pins the handshake to the exact UA the
+        challenge was solved under."""
+        url = candidate["url"]
         headers = dict(extra_headers) if extra_headers else {}
+        if solved_cookie:
+            headers["Cookie"] = solved_cookie
+        if solved_user_agent:
+            headers["User-Agent"] = solved_user_agent
 
         # DNS bootstrap: make sure this host CAN be reached from this
         # network before spending a handshake on it. On DNS-blocking
@@ -291,19 +447,22 @@ class WebsocketClient:
         # Cloudflare. The refresh is domain-aware: each candidate zone
         # needs its OWN cookie (a qxbroker.com __cf_bm is worthless on
         # quotex.io), so the fallback hosts warm their own domain.
-        refresher = getattr(self.api, "refresh_handshake_cookies", None)
-        if refresher is not None:
-            try:
-                fresh = await refresher(domain)
-                if fresh:
-                    headers["Cookie"] = fresh
-                elif domain != getattr(self.api, "host", ""):
-                    # Never ship the primary zone's cookies to a different
-                    # zone — Cloudflare reads mismatched cookies as a bot
-                    # fingerprint. No Cookie header beats a wrong one.
-                    headers.pop("Cookie", None)
-            except Exception as e:  # never block a reconnect on this
-                logger.debug("Handshake cookie refresh skipped: %s", e)
+        # A cookie freshly solved by the browser solver beats every
+        # warm-up cookie and must NOT be overwritten by one.
+        if not solved_cookie:
+            refresher = getattr(self.api, "refresh_handshake_cookies", None)
+            if refresher is not None:
+                try:
+                    fresh = await refresher(domain)
+                    if fresh:
+                        headers["Cookie"] = fresh
+                    elif domain != getattr(self.api, "host", ""):
+                        # Never ship the primary zone's cookies to a different
+                        # zone — Cloudflare reads mismatched cookies as a bot
+                        # fingerprint. No Cookie header beats a wrong one.
+                        headers.pop("Cookie", None)
+                except Exception as e:  # never block a reconnect on this
+                    logger.debug("Handshake cookie refresh skipped: %s", e)
 
         # Origin/Referer must match the zone of the host actually dialed
         # (ws2.quotex.io is quotex.io's zone, NOT qxbroker.com's).
@@ -326,45 +485,56 @@ class WebsocketClient:
             ping_timeout=20,
             max_size=2 ** 23,
             compression=None,
+            proxy=proxy,
         ) as ws:
-            self._ws = ws
-            self.api.last_message_at = time.monotonic()
-            logger.info(
-                "WebSocket handshake accepted by %s (zone %s)",
-                url.split("/")[2] if "//" in url else url,
-                domain,
-            )
-            await self.api._on_open()
-            # This endpoint let us through — remember it process-wide so
-            # future connects (including full get_client() rebuilds after
-            # a watchdog teardown) dial it first.
-            remember_sticky_host(getattr(self.api, "host", ""), domain)
-            self._open_count += 1
-            # EVERY fresh open is a brand-new engine.io session the
-            # server considers UNAUTHORIZED until the SSID is presented —
-            # on the first open too, not just after reconnects. (The
-            # first-open send normally happens in connect(); but when
-            # host rotation opens the socket later than connect()'s own
-            # wait window, that send never ran — the session then sat
-            # open but permanently unauthorized: silent feed,
-            # "connecting…" forever. Sending it here on every open makes
-            # authorization a property of the SESSION, not of the call
-            # that happened to win the race. Duplicates are harmless —
-            # the server just re-accepts and re-replies.)
-            await self._reauthorize()
-            if self._open_count > 1:
-                # Reconnect path: replay the subscriptions that were
-                # active on the previous socket — AFTER the re-authorization
-                # above, so they land on an authorized session, in-order
-                # on the same socket.
-                asyncio.create_task(self._replay_subscriptions())
+            await self._run_ws(candidate, domain, ws)
 
-            self._start_watchdog()
-            try:
-                async for raw in ws:
-                    await self.api._on_message(raw)
-            finally:
-                self._stop_watchdog()
+    async def _run_ws(self, candidate: dict[str, str], domain: str, ws: Any) -> None:
+        """Drives one ESTABLISHED websocket-like connection (either a
+        ``websockets`` protocol object or a browser-bridged transport)
+        through the session lifecycle: open hook, sticky-host memory,
+        SSID re-authorization, subscription replay, stale watchdog and
+        the inbound frame loop."""
+        url = candidate["url"]
+        self._ws = ws
+        self.api.last_message_at = time.monotonic()
+        logger.info(
+            "WebSocket handshake accepted by %s (zone %s, transport %s)",
+            url.split("/")[2] if "//" in url else url,
+            domain,
+            "browser" if getattr(ws, "_is_browser_transport", False) else "python",
+        )
+        await self.api._on_open()
+        # This endpoint let us through — remember it process-wide so
+        # future connects (including full get_client() rebuilds after
+        # a watchdog teardown) dial it first.
+        remember_sticky_host(getattr(self.api, "host", ""), domain)
+        self._open_count += 1
+        # EVERY fresh open is a brand-new engine.io session the
+        # server considers UNAUTHORIZED until the SSID is presented —
+        # on the first open too, not just after reconnects. (The
+        # first-open send normally happens in connect(); but when
+        # host rotation opens the socket later than connect()'s own
+        # wait window, that send never ran — the session then sat
+        # open but permanently unauthorized: silent feed,
+        # "connecting…" forever. Sending it here on every open makes
+        # authorization a property of the SESSION, not of the call
+        # that happened to win the race. Duplicates are harmless —
+        # the server just re-accepts and re-replies.)
+        await self._reauthorize()
+        if self._open_count > 1:
+            # Reconnect path: replay the subscriptions that were
+            # active on the previous socket — AFTER the re-authorization
+            # above, so they land on an authorized session, in-order
+            # on the same socket.
+            asyncio.create_task(self._replay_subscriptions())
+
+        self._start_watchdog()
+        try:
+            async for raw in ws:
+                await self.api._on_message(raw)
+        finally:
+            self._stop_watchdog()
 
     def _handle_close_exception(self, exc: ConnectionClosed) -> None:
         rcvd = getattr(exc, "rcvd", None)

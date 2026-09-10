@@ -310,6 +310,11 @@ class FeedManager:
                     "entry_ts": entry_ts,
                     "target_close_ts": target_close_ts,
                     "result": "PENDING",
+                    # Payout economics with every signal: what a win pays,
+                    # the breakeven the strategy must beat, and the gate
+                    # the engine actually demanded (per pair, not a global
+                    # guess) — so a follower can size the trade honestly.
+                    "payout": decision.payout_context(state.display_name),
                 },
             )
 

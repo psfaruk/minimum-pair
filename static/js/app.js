@@ -153,10 +153,24 @@ async function pollStatus() {
       );
     } else if (s.error) {
       setConnUI(false, "সংযোগ বিচ্ছিন্ন");
-      setFeedAlert(
-        `Quotex সংযোগ কাজ করছে না: ${shortReason(s.last_connect_detail || s.error)} — <a href="#" data-goto-settings>Settings-এ ডায়াগনোসিস চালান</a> সঠিক সমাধান দেখতে।`,
-        "error"
-      );
+      const detail = String(s.last_connect_detail || s.error);
+      const solving = s.cf_solver && String(s.cf_solver.last_result || "") === "solving…";
+      if (detail.toLowerCase().includes("challenge")) {
+        // The broker's Cloudflare is blocking this server's datacenter
+        // IP; the app is either solving it right now or has a concrete
+        // fix (proxy) — say that instead of a generic "broken".
+        setFeedAlert(
+          solving
+            ? `Cloudflare চ্যালেঞ্জ ধরা পড়েছে — ব্রাউজার সলভার এখন সলভ করছে (~১ মিনিট লাগতে পারে)… চ্যালেঞ্জ পাস হলেই ডেটা আসবে।`
+            : `Cloudflare এই সার্ভারের IP ব্লক করছে (ব্রোকারের বট-প্রোটেকশন)। সমাধান: <b>QUOTEX_PROXY</b> ভেরিয়েবলে রেসিডেনশিয়াল প্রক্সি সেট করুন, বা ব্রাউজার সলভার চালু রাখুন (Settings-এ অবস্থা দেখুন)। <a href="#" data-goto-settings>Settings-এ ডায়াগনোসিস চালান</a>।`,
+          "error"
+        );
+      } else {
+        setFeedAlert(
+          `Quotex সংযোগ কাজ করছে না: ${shortReason(detail)} — <a href="#" data-goto-settings>Settings-এ ডায়াগনোসিস চালান</a> সঠিক সমাধান দেখতে।`,
+          "error"
+        );
+      }
     } else {
       setConnUI(null, "সংযোগ হচ্ছে…");
       setFeedAlert(null);

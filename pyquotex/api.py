@@ -165,8 +165,25 @@ class QuotexAPI:
         self.candle_generated_all_size_check = defaultdict(dict)
         self.top_list_leader: dict[str, Any] = {}
         self.session_data: dict[str, Any] = {}
-        self.browser = Browser()
+        # The Browser must egress through the same proxy as the websocket:
+        # Cloudflare binds __cf_bm/cf_clearance to the egress IP, so a
+        # cookie earned from a different IP than the handshake is worse
+        # than no cookie at all. The old code accepted a ``proxies``
+        # argument and then built ``Browser()`` without it — the proxy
+        # silently reached neither the HTTP warm-up nor the handshake.
+        self.browser = Browser(
+            proxies=(proxies if isinstance(proxies, str) else (proxies or {}).get("https") or (proxies or {}).get("http")) or None
+        )
         self.browser.set_headers()
+        # Challenge-solver hook: async callable (domain) -> str|None that
+        # returns a fresh Cookie header (containing cf_clearance) earned
+        # by a REAL browser solving Cloudflare's managed challenge on
+        # this same egress. Set by app.quotex_client; when unset the
+        # client treats a challenge as an ordinary handshake rejection.
+        self.cf_solver: Any = None
+        # Last handshake classification ("challenge" | "rejected" | ...) —
+        # surfaced through /api/status so the deployed state is visible.
+        self.last_handshake_block: str = ""
         self.settings = Settings(self)
         self.event_registry = EventRegistry()
         from pyquotex._api._waits import SlotRegistry
@@ -1103,7 +1120,13 @@ class QuotexAPI:
         # CONNECTED. (The old code returned on the FIRST ERROR tick —
         # with fallback rotation that aborted the connect while the
         # working host was still being dialed.)
-        for _ in range(100):
+        # When a Cloudflare challenge solver / browser transport is
+        # attached, the first successful path can legitimately take a
+        # minute or more (launch Chromium, click the Turnstile, land the
+        # transport page, authorize) — extend the wait accordingly so a
+        # solvable block is not reported as an instant timeout.
+        wait_cycles = 3000 if getattr(self, "browser_transport_factory", None) else 100
+        for _ in range(wait_cycles):
             if self.state.status == WebsocketStatus.CONNECTED:
                 return True, "Connected"
             await asyncio.sleep(0.1)

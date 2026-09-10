@@ -42,18 +42,26 @@ async def main() -> None:
         print(json.dumps(rows, indent=2))
         return
 
+    def fmt(key, spec, gen):
+        v = agg(gen, key)
+        if v is None:
+            width = int(spec.split(".")[0]) if "." in spec else int(spec)
+            return "-".rjust(width)
+        return format(v, spec)
+
     print(f"[{args.engine}] learn={args.learn} seeds={SEEDS} bars={BARS}")
     print(f"{'generator':<14}{'all':>8}{'conf':>8}{'n_conf':>9}{'fall':>8}{'n_fall':>9}")
     for gen in GENS:
         print(
             f"{gen:<14}"
-            f"{agg(gen, 'win_rate_all'):>8.4f}"
-            f"{agg(gen, 'win_rate_confirmed'):>8.4f}"
-            f"{agg(gen, 'n_confirmed'):>9.0f}"
-            f"{agg(gen, 'win_rate_fallback'):>8.4f}"
-            f"{agg(gen, 'n_fallback'):>9.0f}"
+            f"{fmt('win_rate_all', '8.4f', gen)}"
+            f"{fmt('win_rate_confirmed', '8.4f', gen)}"
+            f"{fmt('n_confirmed', '9.0f', gen)}"
+            f"{fmt('win_rate_fallback', '8.4f', gen)}"
+            f"{fmt('n_fallback', '9.0f', gen)}"
         )
-    overall_all = sum(r["win_rate_all"] for r in rows) / len(rows)
+    scored = [r["win_rate_all"] for r in rows if r["win_rate_all"] is not None]
+    overall_all = sum(scored) / len(scored) if scored else float("nan")
     print(f"\noverall mean win_rate_all = {overall_all:.4f}")
     # save detailed rows for comparison
     out = Path(f"/tmp/ab_{args.engine}_{'learn' if args.learn else 'raw'}.json")

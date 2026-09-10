@@ -1093,6 +1093,28 @@ async def latest_signals() -> list[dict[str, Any]]:
     return await asyncio.to_thread(_latest_signals_sync)
 
 
+def _graded_signals_sync(limit: int) -> list[dict[str, Any]]:
+    """Newest-first graded signals (WIN/LOSS/DRAW) — the psychology
+    endpoint's raw material for streak/drawdown math."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT pair, direction, result, confidence, entry_ts,
+                   target_close_ts, entry_price, close_price, created_at
+            FROM signals
+            WHERE result IN ('WIN', 'LOSS', 'DRAW')
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def graded_signals(limit: int = 500) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_graded_signals_sync, limit)
+
+
 def _prune_old_data_sync(candle_cutoff_ts: int, signal_cutoff_ts: int) -> tuple[int, int]:
     with _connect() as conn:
         candles_deleted = conn.execute(

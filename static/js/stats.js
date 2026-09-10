@@ -27,6 +27,36 @@ App.tabs.stats = {
     await App.refreshWinRates(this.days);
     this.renderSummary();
     this.renderTable();
+    this.loadPsychology();
+  },
+
+  async loadPsychology() {
+    // ট্রেডিং সাইকোলজি প্যানেল — অ্যাপের নিজের গ্রেডেড ইতিহাস থেকে
+    // মানি-ম্যানেজমেন্ট গাইডরেল হিসেব করে (স্টেক সাইজ, লস-স্ট্রিক,
+    // পজ রেকমেন্ডেশন)।
+    const el = document.getElementById("psychologyBody");
+    if (!el) return;
+    try {
+      const p = await App.api("/api/psychology");
+      const rate = p.win_rate === null ? "--" : (p.win_rate * 100).toFixed(1) + "%";
+      const stake = (p.recommended_stake_pct * 100).toFixed(2) + "%";
+      const g = p.graded || {};
+      const pause = p.pause_recommended
+        ? `<div class="diag-line bad">⚠ এখন বিরতি নেওয়ার সময় — পরপর ${p.current_loss_streak}টি লস, যা ইতিহাসের সবচেয়ে খারাপ স্ট্রিকের সমান। আজকের সেশন বন্ধ করুন।</div>`
+        : "";
+      el.innerHTML = `
+        <div class="psych-grid">
+          <div><span class="k">উইন রেট</span><span class="v">${rate}</span></div>
+          <div><span class="k">রেকমেন্ডেড স্টেক</span><span class="v">${stake}</span></div>
+          <div><span class="k">বর্তমান লস-স্ট্রিক</span><span class="v">${p.current_loss_streak}</span></div>
+          <div><span class="k">সবচেয়ে খারাপ স্ট্রিক</span><span class="v">${p.worst_loss_streak}</span></div>
+          <div><span class="k">স্যাম্পল</span><span class="v">${g.sample || 0} (${g.wins || 0}W/${g.losses || 0}L)</span></div>
+        </div>
+        ${pause}
+        <ul class="psych-rules">${(p.rules_bn || []).map((r) => `<li>${r}</li>`).join("")}</ul>`;
+    } catch (e) {
+      el.textContent = "সাইকোলজি ডেটা লোড করা যায়নি: " + (e.message || "");
+    }
   },
 
   renderSummary() {

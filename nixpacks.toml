@@ -1,0 +1,36 @@
+# Nixpacks build recipe — Playwright's Chromium needs its system
+# libraries present at runtime; pip alone does not install them.
+# The browser binary itself is downloaded during the install phase
+# (~150MB, cached in the image) so cold deploys do not re-download it
+# while the container boots.
+#
+# If Chromium cannot be installed in a given environment, the app still
+# boots and works normally — the Cloudflare challenge solver simply
+# reports "unavailable" and /api/status says so; the QUOTEX_PROXY
+# escape hatch remains fully functional without any browser.
+
+[phases.setup]
+aptPkgs = [
+  "libnss3",
+  "nspr",
+  "libatk1.0-0",
+  "libatk-bridge2.0-0",
+  "libcups2",
+  "libdrm2",
+  "libxkbcommon0",
+  "libxcomposite1",
+  "libxdamage1",
+  "libxfixes3",
+  "libxrandr2",
+  "libgbm1",
+  "libpango-1.0-0",
+  "libcairo2",
+  "libasound2",
+  "libatspi2.0-0",
+]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "python -m playwright install chromium || echo 'WARN: chromium install failed — challenge solver will be unavailable; use QUOTEX_PROXY'",
+]
